@@ -41,7 +41,7 @@ Each bone stores:
 - Rotation limits: min/max per axis
 - Rest length
 
-Stored as a flat `Vec<Bone>` with parent indices — same pattern as the existing `TreeSkeleton` but with joint constraints added.
+Stored as a flat `Vec<Bone>` with parent indices — same parent-index addressing pattern as `TreeSkeleton`, but `Bone` is a new type with no shared code. `TreeSkeleton` nodes store position + radius with no rotation; humanoid bones store full local-space transforms, joint types, and rotation limits.
 
 ### Body Parameters
 
@@ -69,7 +69,16 @@ Each vertex gets up to 4 bone influences (bone index + weight). These are stored
 
 ### Material
 
-A new `MATERIAL_SKIN` constant (ID 3). The material resolve shader gets a new branch for skin shading. Existing `semantic_channels` packed field encodes muscle definition, joint crease, surface curvature.
+A new `MATERIAL_SKIN` constant (ID 3). The material resolve shader gets a new branch for skin shading with these placeholder PBR parameters:
+
+- Base color: warm tone derived from `HumanoidParams` (default ~`(0.76, 0.57, 0.45)`, remappable via art direction palette)
+- Roughness: 0.5 (matte skin)
+- Metallic: 0.0
+- No subsurface scattering in v1 — approximate with a slight ambient boost
+
+The skin material hooks into the existing `apply_palette_remap` as a fourth branch alongside trunk, foliage, and ground, so the Demon Slayer style palette affects the humanoid's color grading consistently.
+
+The `semantic_channels` packed field encodes: muscle definition (byte 0), joint crease (byte 1), surface curvature (byte 2), importance (byte 3). In v1, these modulate roughness and AO — muscle definition increases roughness contrast, joint crease darkens AO, surface curvature affects normal perturbation for painterly detail.
 
 ---
 
@@ -84,12 +93,6 @@ Evaluation: walk the hierarchy multiplying parent transforms — standard forwar
 ### Walk Controller
 
 ```rust
-struct WalkIntent {
-    target: Vec3,
-    speed: f32,
-    style: WalkStyle,
-}
-
 struct WalkStyle {
     stride_length: f32,
     arm_swing: f32,       // 0.0 stiff → 1.0 relaxed
@@ -101,9 +104,11 @@ struct WalkStyle {
 
 The walk cycle is procedurally generated, not keyframed. The `WalkController` maintains a phase clock (0.0→1.0 per stride cycle) and computes bone rotations from sinusoidal basis functions modulated by style parameters. This is the core research question: how much of a believable walk can you get from parameterized functions vs. authored keyframes?
 
+The `WalkController` consumes `Action` variants directly. `Action::WalkTo { target, speed }` provides the goal; `WalkStyle` (stored on the `AnimationDirective`) provides the stylistic modulation. The controller derives per-frame locomotion state (heading, phase advance, stride geometry) internally.
+
 ### Per-Frame Pipeline
 
-1. `WalkController::update(dt, intent)` → `Pose` (bone local rotations)
+1. `WalkController::update(dt, action, style)` → `Pose` (bone local rotations)
 2. `Pose::evaluate(skeleton)` → `Vec<Mat4>` (world-space bone matrices)
 3. **IK correction** — two-bone IK on each leg to plant feet on terrain. Query ground height at each foot's projected position, adjust knee/ankle to match.
 4. **Root motion** — pelvis translates forward along walk direction, with vertical bob derived from gait phase.
@@ -130,19 +135,65 @@ Each vertex's position and normal transformed by the weighted blend of its bone 
 
 ### Re-Upload
 
-Deformed vertices replace the humanoid's region in the GPU vertex buffer each frame via `queue.write_buffer`. New method on `RuntimeSceneGpu`: `update_animated_vertices(prototype_id, &[Vertex])` that writes into the correct buffer offset.
+Deformed vertices replace the humanoid's region in the GPU vertex buffer each frame via `queue.write_buffer`.
+
+**Vertex offset tracking:** During `merge_meshlet_dags` in `runtime_scene.rs`, the humanoid's meshlet DAG is merged into the flat vertex buffer alongside all other geometry. The merge produces a `vertex_offset` for each prototype's contribution. A new `AnimatedRegion` struct records the humanoid's `(vertex_offset, vertex_count)` within the merged buffer, stored on `RuntimeSceneGpu`. The `update_animated_vertices` method takes an `AnimatedRegion` and writes deformed vertices at the correct buffer offset.
+
+```rust
+struct AnimatedRegion {
+    vertex_offset: u64,  // byte offset into merged vertex buffer
+    vertex_count: u32,
+}
+```
+
+The meshlet vertex buffer (`GpuMeshletBuffers::vertex_buffer`) already has `STORAGE | COPY_DST` usage, so `queue.write_buffer` works directly.
 
 Meshlet topology (index buffers, meshlet descriptors, group DAG) stays fixed. Only vertex positions and normals change.
 
-### Bounding Sphere Staleness
-
-Meshlet bounding spheres are computed from rest-pose vertices. A walking humanoid moves limbs ~0.5-1m from rest.
-
-**v1 solution: conservative inflation.** Expand each meshlet's bounding sphere by a fixed skin radius at build time. The humanoid has maybe 8-15 meshlets — slight over-draw during culling is invisible.
-
 ### Shadow Pass
 
-Shadow mesh also needs deformed vertices. Same skinning, same re-upload into shadow vertex buffer. One extra `write_buffer` call per frame.
+Shadow mesh also needs deformed vertices. Same skinning, same re-upload into the shadow vertex buffer. **Important:** the shadow `GpuMesh` buffers are currently created with `BufferUsages::VERTEX` only (in `src/gpu/upload.rs`). The shadow vertex buffer for animated meshes must be created with `BufferUsages::VERTEX | BufferUsages::COPY_DST` to allow `queue.write_buffer`. This is a one-line change in the upload path, conditioned on whether the mesh is flagged as animated.
+
+A new `AnimatedRegion` is tracked for the shadow buffer as well.
+
+### Bounding Sphere Staleness
+
+Meshlet bounding spheres are computed from rest-pose vertices during `build_meshlet_dag` in `SceneCompiler::compile()`. A walking humanoid moves limbs ~0.5-1m from rest.
+
+**v1 solution: conservative inflation.** After the meshlet DAG is built for the humanoid prototype, inflate each meshlet's bounding sphere radius by the maximum bone-to-rest displacement across all bones — approximately `0.3 * height` (for a 1.8m figure, ~0.54m). This is applied as a post-processing step on the DAG's `MeshletBounds` before upload.
+
+The cull pass uses these bounds for screen-space error checks. The inflation means the cull pass will slightly over-accept meshlets (drawing a few extra that are technically off-screen), but for 8-15 meshlets on a single character this is negligible. LOD transitions are unaffected — the screen-space error thresholds are independent of bounding sphere size.
+
+---
+
+### Frame Integration
+
+The animation loop hooks into the existing `RuntimeState::redraw()` method in `src/app.rs`. A new `HumanoidAnimator` struct owns all per-character animation state:
+
+```rust
+struct HumanoidAnimator {
+    skeleton: HumanoidSkeleton,
+    rest_vertices: Vec<Vertex>,
+    skin_weights: Vec<SkinWeights>,
+    walk_controller: WalkController,
+    directive: AnimationDirective,
+    meshlet_region: AnimatedRegion,   // offset into merged vertex buffer
+    shadow_region: AnimatedRegion,    // offset into shadow vertex buffer
+}
+```
+
+`HumanoidAnimator` lives on `RuntimeState` alongside the existing `RuntimeSceneGpu`. The per-frame calling sequence inside `redraw()`:
+
+1. Compute `dt` from `frame_delta_secs()`
+2. `animator.walk_controller.update(dt, &directive.action, &directive.style)` → `Pose`
+3. `pose.evaluate(&animator.skeleton)` → `Vec<Mat4>` bone matrices
+4. `ik::correct_feet(&mut bone_matrices, &skeleton, ground_height)` → adjusted matrices
+5. `skin_mesh(&animator.rest_vertices, &animator.skin_weights, &bone_matrices)` → `Vec<Vertex>`
+6. `queue.write_buffer(vertex_buf, meshlet_region.vertex_offset, &deformed_vertices)`
+7. `queue.write_buffer(shadow_buf, shadow_region.vertex_offset, &deformed_vertices)`
+8. `renderer.render(...)` — pipeline sees updated vertices, proceeds as normal
+
+Steps 2-7 are encapsulated as `HumanoidAnimator::tick(dt, &queue, &vertex_buf, &shadow_buf)`. The renderer itself stays immutable and stateless.
 
 ---
 
@@ -163,6 +214,8 @@ enum Action {
 }
 ```
 
+`AnimationDirective` is the top-level declaration — what actor exists, how it moves, and with what style. The `WalkController` consumes the `action` and `style` fields directly each frame. There is no separate `WalkIntent` struct; the `Action` enum carries the goal, and `WalkStyle` carries the modulation.
+
 Constructed in Rust code, passed to the runtime. The struct's shape is the proto-DSL — if the fields feel right after experimentation, parsing them from a file later is mechanical.
 
 ### New Files
@@ -172,7 +225,7 @@ Constructed in Rust code, passed to the runtime. The struct's shape is the proto
 | `src/subjects/humanoid.rs` | `HumanoidParams`, skeleton definition, body mesh generation |
 | `src/subjects/humanoid_skin.rs` | `SkinWeights`, `skin_mesh()`, conservative bounding inflation |
 | `src/animation/mod.rs` | `Pose`, `BoneTransform`, FK evaluation |
-| `src/animation/walk.rs` | `WalkController`, `WalkIntent`, `WalkStyle`, procedural walk cycle |
+| `src/animation/walk.rs` | `WalkController`, `WalkStyle`, procedural walk cycle |
 | `src/animation/ik.rs` | Two-bone IK solver for foot placement |
 
 ### Modified Files
@@ -182,10 +235,22 @@ Constructed in Rust code, passed to the runtime. The struct's shape is the proto
 | `src/source_scene.rs` | Add `ProceduralSubject::Humanoid` variant |
 | `src/compiler/mod.rs` | Handle humanoid realization (mesh + weights) |
 | `src/runtime_scene.rs` | Store skinning weights, expose `update_animated_vertices` |
-| `src/renderer.rs` | Run walk controller + skinning each frame before render |
+| `src/app.rs` | Add `HumanoidAnimator` to `RuntimeState`, call `tick()` in `redraw()` before `renderer.render()` |
 | `src/scene/mod.rs` | Add `MATERIAL_SKIN` constant |
 | `shaders/material_resolve.wgsl` | Add skin material branch (shading params) |
 | `src/soundstage/redwood_stage.rs` | Place a humanoid in the scene |
+
+---
+
+## Done Criteria
+
+The vertical slice is complete when:
+
+1. A procedural humanoid figure is visible in the redwood scene, rendered through the full visbuf pipeline with Demon Slayer art direction (outlines, palette, exaggeration)
+2. The humanoid walks from a start point to a target point with a procedural gait cycle — legs alternate, arms swing, torso sways
+3. Feet plant on the ground slab via IK correction (no sliding, no floating above or sinking below the surface)
+4. The walk completes at interactive frame rate (< 2ms added CPU time for skinning + re-upload on a single character)
+5. The humanoid casts shadows and receives SSAO consistently with the rest of the scene
 
 ---
 
