@@ -330,6 +330,70 @@ pub const DEMON_SLAYER: StyleSnapshot = StyleSnapshot {
 };
 ```
 
+## Quality Budget — Style-Driven Performance Scaling
+
+Stylization hides rendering shortcuts. When outlines cover silhouette edges, LOD pops become invisible. When lighting is banded to 3-4 steps, shadow map precision is wasted. When normals are smoothed, bark texture detail is redundant work.
+
+The art direction system exploits this by computing a `QualityBudget` from current style axis values. The renderer reads these hints and reduces quality in ways that are *invisible* under the active stylization — spending less GPU time to produce a visually identical result.
+
+```rust
+pub struct QualityBudget {
+    /// Positive = use coarser meshlets sooner. Driven by outline_presence + shadow_graphicness.
+    /// Outlines mask silhouette LOD pops; banded shading masks surface LOD pops.
+    pub lod_bias: f32,
+
+    /// 1.0 = full resolution, 0.25 = quarter. Driven by shadow_graphicness.
+    /// Banded shadows (3-4 steps) look identical at 512x512 vs 2048x2048.
+    pub shadow_resolution_scale: f32,
+
+    /// 1.0 = full samples, 0.5 = half. Driven by shadow_graphicness.
+    /// Banded lighting makes subtle AO invisible.
+    pub ssao_sample_scale: f32,
+
+    /// Skip both bark texture fetches when bark_detail_blend < threshold.
+    /// Two fewer texture samples per trunk pixel.
+    pub skip_bark_texture: bool,
+
+    /// Skip tangent-space normal computation when normal_smoothing is high.
+    /// Saves tangent basis construction + texture fetch per trunk pixel.
+    pub skip_normal_perturbation: bool,
+
+    /// Use simplified leaf alpha shape (circle/ellipse) instead of full procedural outline.
+    /// Saves ~30 lines of shader math per foliage pixel. Driven by softness.
+    pub simplify_foliage_alpha: bool,
+}
+```
+
+**How it's computed:** `ArtDirection::update()` derives the quality budget alongside the GPU uniforms. Example mappings:
+
+```rust
+fn compute_quality_budget(axes: &StyleAxes) -> QualityBudget {
+    QualityBudget {
+        // Outlines + banding both hide LOD artifacts
+        lod_bias: axes.outline_presence * 1.5 + axes.shadow_graphicness * 0.5,
+
+        // Banded shadows don't need precision
+        shadow_resolution_scale: 1.0 - axes.shadow_graphicness * 0.75, // 1.0 → 0.25
+
+        // Banded lighting hides subtle AO
+        ssao_sample_scale: 1.0 - axes.shadow_graphicness * 0.5,       // 1.0 → 0.5
+
+        // No point sampling bark texture if it's being flattened to solid color
+        skip_bark_texture: axes.surface_detail < 0.2,
+
+        // No point computing normal perturbation if normals are fully smoothed
+        skip_normal_perturbation: axes.softness > 0.8,
+
+        // Stylized looks don't need complex procedural leaf shapes
+        simplify_foliage_alpha: axes.softness > 0.6,
+    }
+}
+```
+
+**Key property:** At identity (all axes zero), the quality budget is `{ lod_bias: 0, shadow_resolution_scale: 1.0, ssao_sample_scale: 1.0, skip_*: false }` — no quality reduction, identical to current behavior. Quality savings scale proportionally with stylization intensity.
+
+**Performance impact estimate:** At full Demon Slayer stylization, the combined savings from LOD bias, shadow map reduction, SSAO reduction, and texture skip could reduce per-frame GPU cost by 20-40% compared to the same scene at photorealistic quality — while producing output that is visually indistinguishable under the stylization.
+
 ## Scope
 
 ### In Stage 1
@@ -344,6 +408,7 @@ pub const DEMON_SLAYER: StyleSnapshot = StyleSnapshot {
 - Bloom tint + tonemap color grading
 - Transition API with ease curves and weighted blending
 - Harness controls (F5/F6/brackets/0/CLI)
+- Quality budget system (style-driven LOD bias, shadow/SSAO scaling, texture skipping)
 - One complete style: Demon Slayer
 
 ### Stage 1b (Near-Term Follow-Up)
