@@ -38,8 +38,10 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
         position: [0.0, ground_height_sample(0.0, 0.0), 0.0],
         normal: ground_normal_sample(0.0, 0.0),
         material: MATERIAL_GROUND,
+        feature_id: 0,
         uv: [0.5, 0.5],
         ao: 0.55,
+        semantic_channels: 0,
     });
 
     for &frac in ring_fractions {
@@ -56,11 +58,13 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
                 position: [x, y, z],
                 normal: ground_normal_sample(x, z),
                 material: MATERIAL_GROUND,
+                feature_id: 0,
                 uv: [
                     0.5 + angle.cos() * 0.5 * frac,
                     0.5 + angle.sin() * 0.5 * frac,
                 ],
                 ao,
+                semantic_channels: 0,
             });
         }
     }
@@ -92,8 +96,10 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
         position: [0.0, -thickness, 0.0],
         normal: [0.0, -1.0, 0.0],
         material: MATERIAL_GROUND,
+        feature_id: 0,
         uv: [0.5, 0.5],
         ao: 0.95,
+        semantic_channels: 0,
     });
 
     for &frac in ring_fractions {
@@ -106,11 +112,13 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
                 position: [x, -thickness, z],
                 normal: [0.0, -1.0, 0.0],
                 material: MATERIAL_GROUND,
+                feature_id: 0,
                 uv: [
                     0.5 + angle.cos() * 0.5 * frac,
                     0.5 + angle.sin() * 0.5 * frac,
                 ],
                 ao: 0.95,
+                semantic_channels: 0,
             });
         }
     }
@@ -156,15 +164,19 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
             position: [x_top, top_y, z_top],
             normal,
             material: MATERIAL_GROUND,
+            feature_id: 0,
             uv: [u, 0.0],
             ao: 0.92,
+            semantic_channels: 0,
         });
         vertices.push(Vertex {
             position: [x_bottom, -thickness, z_bottom],
             normal,
             material: MATERIAL_GROUND,
+            feature_id: 0,
             uv: [u, 1.0],
             ao: 0.95,
+            semantic_channels: 0,
         });
     }
 

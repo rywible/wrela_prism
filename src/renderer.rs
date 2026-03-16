@@ -1,8 +1,10 @@
-use crate::camera::CameraState;
 use crate::gpu::GpuContext;
 use crate::material::procedural::BarkParams;
-use crate::pipeline::{visbuf_pipeline::VisbufPipeline, DebugOverlay};
+use crate::pipeline::visbuf_pipeline::VisbufPipeline;
 use crate::runtime_scene::RuntimeSceneGpu;
+
+use crate::camera::CameraState;
+use crate::pipeline::DebugOverlay;
 use crate::scene::SceneSettings;
 
 #[derive(Clone, Copy)]
@@ -14,40 +16,21 @@ pub struct FrameInputs<'a> {
     pub debug_overlay: DebugOverlay,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameGraphContext {
-    pub surface_size: (u32, u32),
-    pub debug_overlay: DebugOverlay,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct FrameVisibilityState {
-    pub visible_chunks: Vec<crate::runtime_scene::ChunkId>,
-    pub visible_instance_count: usize,
-}
-
 pub struct Renderer {
     pipeline: VisbufPipeline,
-    frame_graph: FrameGraphContext,
-    visibility_state: FrameVisibilityState,
 }
 
 impl Renderer {
     pub fn new(gpu: &GpuContext) -> Self {
         Self {
             pipeline: VisbufPipeline::new(gpu),
-            frame_graph: FrameGraphContext {
-                surface_size: (gpu.width(), gpu.height()),
-                debug_overlay: DebugOverlay::None,
-            },
-            visibility_state: FrameVisibilityState::default(),
         }
     }
 
     pub fn resize(&mut self, gpu: &GpuContext, scene: &RuntimeSceneGpu) {
-        self.frame_graph.surface_size = (gpu.width(), gpu.height());
         self.pipeline.resize(gpu);
-        self.pipeline.sync_scene_resources(&gpu.device, scene);
+        self.pipeline
+            .sync_scene_resources(&gpu.device, &gpu.queue, scene);
     }
 
     pub fn configure_shadow(
@@ -74,21 +57,6 @@ impl Renderer {
         scene: &RuntimeSceneGpu,
         frame: &FrameInputs<'_>,
     ) -> std::result::Result<(), wgpu::SurfaceError> {
-        self.frame_graph.surface_size = (frame.gpu.width(), frame.gpu.height());
-        self.frame_graph.debug_overlay = frame.debug_overlay;
-        self.visibility_state.visible_chunks = scene.runtime_scene.spatial_index.visible_chunks(
-            frame.camera,
-            frame.gpu.width(),
-            frame.gpu.height(),
-        );
-        self.visibility_state.visible_instance_count = scene
-            .runtime_scene
-            .instances
-            .iter()
-            .filter(|instance| self.visibility_state.visible_chunks.contains(&instance.chunk_id))
-            .count();
-
-        self.pipeline.sync_scene_resources(&frame.gpu.device, scene);
         self.pipeline.render(
             frame.gpu,
             scene,
@@ -98,15 +66,43 @@ impl Renderer {
         )
     }
 
-    pub fn visibility_state(&self) -> &FrameVisibilityState {
-        &self.visibility_state
-    }
-
     pub fn capture_frame(
         &self,
         gpu: &GpuContext,
         elapsed_secs: f32,
     ) -> anyhow::Result<crate::pipeline::CapturedFrame> {
         self.pipeline.capture_frame(gpu, elapsed_secs)
+    }
+
+    /// Return a reference to the art direction uniform buffer for CPU-side upload.
+    pub fn art_direction_buffer(&self) -> &wgpu::Buffer {
+        &self.pipeline.art_direction_buffer
+    }
+
+    /// Return a reference to the art direction palette buffer for CPU-side upload.
+    pub fn art_direction_palette_buffer(&self) -> &wgpu::Buffer {
+        &self.pipeline.art_direction_palette_buffer
+    }
+
+    /// Set whether the outline pass should be skipped (when outline_strength is ~0).
+    pub fn set_outline_skip(&mut self, skip: bool) {
+        self.pipeline.art_direction_outline_skip = skip;
+    }
+
+    /// Set LOD bias from art direction quality budget.
+    pub fn set_lod_bias(&mut self, bias: f32) {
+        self.pipeline.art_direction_lod_bias = bias;
+    }
+
+    /// Set art direction post-processing parameters for bloom and tonemap.
+    pub fn set_art_direction_post(
+        &mut self,
+        bloom_tint: [f32; 3],
+        bloom_softness: f32,
+        color_grade: [f32; 4],
+    ) {
+        self.pipeline.art_direction_bloom_tint = bloom_tint;
+        self.pipeline.art_direction_bloom_softness = bloom_softness;
+        self.pipeline.art_direction_color_grade = color_grade;
     }
 }

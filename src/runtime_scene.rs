@@ -9,8 +9,8 @@ use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
 use crate::scene::bounds::{Aabb, BoundingSphere};
 use crate::scene::Vertex;
 use crate::scene_data::DEFAULT_FOLIAGE_ALPHA_SEED;
-use crate::source_scene::{SourceNodeId, SourceTransform};
 use crate::solver::projection::screen_diameter;
+use crate::source_scene::{SourceNodeId, SourceTransform};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkId(pub u32);
@@ -79,7 +79,11 @@ pub struct MaterialTable {
 
 impl MaterialTable {
     pub fn register(&mut self, entry: MaterialEntry) {
-        if self.materials.iter().any(|existing| existing.id == entry.id) {
+        if self
+            .materials
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
             return;
         }
         self.materials.push(entry);
@@ -153,7 +157,8 @@ impl SceneResidencyManager {
     }
 
     pub fn evict_chunk(&mut self, chunk_id: ChunkId) {
-        self.chunk_states.insert(chunk_id, ChunkResidentState::Unloaded);
+        self.chunk_states
+            .insert(chunk_id, ChunkResidentState::Unloaded);
     }
 
     pub fn request_chunk(&mut self, chunk_id: ChunkId) {
@@ -164,7 +169,9 @@ impl SceneResidencyManager {
     pub fn loaded_chunks(&self) -> Vec<ChunkId> {
         self.chunk_states
             .iter()
-            .filter_map(|(chunk_id, state)| (*state == ChunkResidentState::LoadedCpu).then_some(*chunk_id))
+            .filter_map(|(chunk_id, state)| {
+                (*state == ChunkResidentState::LoadedCpu).then_some(*chunk_id)
+            })
             .collect()
     }
 }
@@ -178,6 +185,7 @@ pub struct RuntimeSceneGpu {
     pub shadow_transparent_list: Vec<usize>,
     pub alpha_mask_texture: wgpu::Texture,
     pub alpha_mask_view: wgpu::TextureView,
+    pub bark_textures: crate::material::bark_bake::BarkTextures,
     pub resident_chunks: Vec<ChunkId>,
 }
 
@@ -186,10 +194,16 @@ impl RuntimeSceneGpu {
         gpu: &GpuContext,
         compiled: &crate::compiler::CompiledScene,
         residency: &SceneResidencyManager,
+        bark_params: &crate::material::procedural::BarkParams,
     ) -> Self {
         let mut resident_chunks = residency.loaded_chunks();
         if resident_chunks.is_empty() {
-            resident_chunks = compiled.runtime_scene.chunks.iter().map(|chunk| chunk.id).collect();
+            resident_chunks = compiled
+                .runtime_scene
+                .chunks
+                .iter()
+                .map(|chunk| chunk.id)
+                .collect();
         }
 
         let mut dags = Vec::new();
@@ -242,6 +256,9 @@ impl RuntimeSceneGpu {
                 DEFAULT_FOLIAGE_ALPHA_SEED,
             );
 
+        let bark_textures =
+            crate::material::bark_bake::create_bark_textures(&gpu.device, &gpu.queue, bark_params);
+
         Self {
             runtime_scene: compiled.runtime_scene.clone(),
             dag,
@@ -251,6 +268,7 @@ impl RuntimeSceneGpu {
             shadow_transparent_list,
             alpha_mask_texture,
             alpha_mask_view,
+            bark_textures,
             resident_chunks,
         }
     }
@@ -287,25 +305,10 @@ pub(crate) fn expand_surface_with_transform(
     surface: &PrototypeSurface,
     transform: Affine3A,
 ) -> (Vec<Vertex>, Vec<u32>) {
-    let normal_transform = glam::Mat3::from_cols(
-        transform.matrix3.x_axis.into(),
-        transform.matrix3.y_axis.into(),
-        transform.matrix3.z_axis.into(),
-    );
     let vertices = surface
         .vertices
         .iter()
-        .map(|vertex| {
-            let mut transformed = *vertex;
-            transformed.position = transform
-                .transform_point3(glam::Vec3::from_array(vertex.position))
-                .to_array();
-            transformed.normal = normal_transform
-                .mul_vec3(glam::Vec3::from_array(vertex.normal))
-                .normalize_or_zero()
-                .to_array();
-            transformed
-        })
+        .map(|vertex| crate::scene::transform_vertex(vertex, transform))
         .collect();
     (vertices, surface.indices.clone())
 }
@@ -345,21 +348,27 @@ fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
         merged
             .meshlet_vertices
             .extend(dag.meshlet_vertices.iter().map(|index| index + vertex_base));
-        merged.meshlet_triangles.extend_from_slice(&dag.meshlet_triangles);
+        merged
+            .meshlet_triangles
+            .extend_from_slice(&dag.meshlet_triangles);
 
-        merged.meshlets.extend(dag.meshlets.iter().cloned().map(|mut meshlet| {
-            meshlet.vertex_offset += meshlet_vertex_base;
-            meshlet.triangle_offset += tri_base;
-            meshlet
-        }));
+        merged
+            .meshlets
+            .extend(dag.meshlets.iter().cloned().map(|mut meshlet| {
+                meshlet.vertex_offset += meshlet_vertex_base;
+                meshlet.triangle_offset += tri_base;
+                meshlet
+            }));
 
-        merged.groups.extend(dag.groups.iter().cloned().map(|mut group| {
-            group.meshlet_start += meshlet_base;
-            if group.child_count > 0 {
-                group.child_start += group_base;
-            }
-            group
-        }));
+        merged
+            .groups
+            .extend(dag.groups.iter().cloned().map(|mut group| {
+                group.meshlet_start += meshlet_base;
+                if group.child_count > 0 {
+                    group.child_start += group_base;
+                }
+                group
+            }));
     }
 
     merged
@@ -367,7 +376,11 @@ fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_mesh_bounds, expand_surface_with_transform, transform_aabb, ChunkId, RuntimeInstanceId, RuntimePrototype, RuntimePrototypeId, SceneResidencyManager, RuntimeScene, RuntimeChunk, SceneSpatialIndex, MaterialTable, PrototypeSurface};
+    use super::{
+        compute_mesh_bounds, expand_surface_with_transform, transform_aabb, ChunkId, MaterialTable,
+        PrototypeSurface, RuntimeChunk, RuntimeInstanceId, RuntimePrototype, RuntimePrototypeId,
+        RuntimeScene, SceneResidencyManager, SceneSpatialIndex,
+    };
     use crate::scene::{Vertex, MATERIAL_TRUNK};
     #[test]
     fn transform_aabb_moves_bounds() {
@@ -375,10 +388,15 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             normal: [0.0, 1.0, 0.0],
             material: MATERIAL_TRUNK,
+            feature_id: 0,
             uv: [0.0, 0.0],
             ao: 1.0,
+            semantic_channels: 0,
         }]);
-        let moved = transform_aabb(&bounds, glam::Affine3A::from_translation(glam::Vec3::X * 4.0));
+        let moved = transform_aabb(
+            &bounds,
+            glam::Affine3A::from_translation(glam::Vec3::X * 4.0),
+        );
         assert!((moved.center().x - 4.0).abs() < 0.01);
     }
 
@@ -388,7 +406,10 @@ mod tests {
             label: "test".into(),
             chunks: vec![RuntimeChunk {
                 id: ChunkId(0),
-                bounds: crate::scene::bounds::Aabb::from_center_half_extents(glam::Vec3::ZERO, glam::Vec3::ONE),
+                bounds: crate::scene::bounds::Aabb::from_center_half_extents(
+                    glam::Vec3::ZERO,
+                    glam::Vec3::ONE,
+                ),
                 instance_ids: vec![RuntimeInstanceId(0)],
                 prototype_ids: vec![RuntimePrototypeId(0)],
             }],
@@ -403,7 +424,10 @@ mod tests {
                     material_id: crate::material::MaterialId(MATERIAL_TRUNK),
                     casts_shadows: true,
                     alpha_tested: false,
-                    local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(glam::Vec3::ZERO, glam::Vec3::ONE),
+                    local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
+                        glam::Vec3::ZERO,
+                        glam::Vec3::ONE,
+                    ),
                 }],
             }],
             material_table: MaterialTable::default(),
@@ -424,14 +448,19 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 normal: [0.0, 1.0, 0.0],
                 material: MATERIAL_TRUNK,
+                feature_id: 0,
                 uv: [0.0, 0.0],
                 ao: 1.0,
+                semantic_channels: 0,
             }],
             indices: vec![0],
             material_id: crate::material::MaterialId(MATERIAL_TRUNK),
             casts_shadows: true,
             alpha_tested: false,
-            local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(glam::Vec3::new(1.0, 2.0, 3.0), glam::Vec3::ZERO),
+            local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
+                glam::Vec3::new(1.0, 2.0, 3.0),
+                glam::Vec3::ZERO,
+            ),
         };
         let (vertices, _) = expand_surface_with_transform(
             &surface,

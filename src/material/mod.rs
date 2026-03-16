@@ -1,3 +1,4 @@
+pub mod bark_bake;
 pub mod procedural;
 
 /// Material identifier.

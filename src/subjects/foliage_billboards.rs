@@ -63,6 +63,8 @@ pub fn build_foliage_billboards(
                     material: MATERIAL_FOLIAGE,
                     uv: *uv,
                     ao,
+                    feature_id: 0,
+                    semantic_channels: 0,
                 });
             }
 

@@ -31,8 +31,10 @@ pub fn leaf_card_vertices(
             position: world_pos.to_array(),
             normal: world_normal.to_array(),
             material: MATERIAL_FOLIAGE,
+            feature_id: 0,
             uv: uvs[i],
             ao: 0.85,
+            semantic_channels: 0,
         }
     });
 

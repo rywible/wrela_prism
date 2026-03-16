@@ -84,9 +84,9 @@ mod tests {
 
     fn make_triangle() -> (Vec<Vertex>, Vec<u32>) {
         let verts = vec![
-            Vertex { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, uv: [0.0, 0.0], ao: 1.0 },
-            Vertex { position: [1.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, uv: [1.0, 0.0], ao: 1.0 },
-            Vertex { position: [0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, uv: [0.0, 1.0], ao: 1.0 },
+            Vertex { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [0.0, 0.0], ao: 1.0, semantic_channels: 0 },
+            Vertex { position: [1.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [1.0, 0.0], ao: 1.0, semantic_channels: 0 },
+            Vertex { position: [0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [0.0, 1.0], ao: 1.0, semantic_channels: 0 },
         ];
         let indices = vec![0, 1, 2];
         (verts, indices)

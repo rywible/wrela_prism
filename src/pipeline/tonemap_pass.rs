@@ -5,6 +5,7 @@ use crate::gpu::GpuContext;
 struct TonemapUniforms {
     screen_size: [f32; 4],
     time_params: [f32; 4],
+    color_grade: [f32; 4], // xyz = tint, w = strength (0 = no grading)
 }
 
 pub struct TonemapPass {
@@ -106,12 +107,13 @@ impl TonemapPass {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            std::num::NonZeroU64::new(
-                                std::mem::size_of::<TonemapUniforms>() as u64,
-                            )
-                            .unwrap(),
-                        ),
+                        min_binding_size:
+                            Some(
+                                std::num::NonZeroU64::new(
+                                    std::mem::size_of::<TonemapUniforms>() as u64
+                                )
+                                .unwrap(),
+                            ),
                     },
                     count: None,
                 },
@@ -120,9 +122,7 @@ impl TonemapPass {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prism-tonemap-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/tonemap.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/tonemap.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -177,10 +177,12 @@ impl TonemapPass {
         width: u32,
         height: u32,
         elapsed_secs: f32,
+        color_grade: [f32; 4],
     ) {
         let uniforms = TonemapUniforms {
             screen_size: [width as f32, height as f32, 0.0, 0.0],
             time_params: [elapsed_secs, 0.0, 0.0, 0.0],
+            color_grade,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 

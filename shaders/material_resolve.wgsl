@@ -17,8 +17,8 @@ struct FrameUniforms {
     sky_zenith: vec4<f32>,
     sky_horizon: vec4<f32>,
     fog_params: vec4<f32>,          // (density, height_falloff, start, end)
-    lighting_params: vec4<f32>,     // (exposure, tonemap_strength, contact_shadow, 0)
-    light_vp: mat4x4<f32>,
+    lighting_params: vec4<f32>,     // (exposure, tonemap_strength, contact_shadow, gi_intensity)
+    light_vp: mat4x4<f32>,         // cascade 0
     ambient_up: vec4<f32>,
     ambient_down: vec4<f32>,
     ambient_right: vec4<f32>,
@@ -30,6 +30,10 @@ struct FrameUniforms {
     time_params: vec4<f32>,
     screen_size: vec4<f32>,
     wind_params: vec4<f32>,
+    light_vp_1: mat4x4<f32>,       // cascade 1
+    light_vp_2: mat4x4<f32>,       // cascade 2
+    light_vp_3: mat4x4<f32>,       // cascade 3
+    cascade_splits: vec4<f32>,      // view-space split distances
 };
 
 @group(0) @binding(0) var<uniform> uniforms: FrameUniforms;
@@ -46,8 +50,10 @@ struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
     nor_x: f32, nor_y: f32, nor_z: f32,
     material: u32,
+    feature_id: u32,
     uv_x: f32, uv_y: f32,
     ao: f32,
+    semantic_channels: u32,
 };
 
 struct MeshletDescriptor {
@@ -65,13 +71,193 @@ struct MeshletDescriptor {
 // Visibility buffer (R32Uint texture)
 @group(2) @binding(0) var vis_texture: texture_2d<u32>;
 
-// Shadow map
-@group(2) @binding(1) var shadow_map: texture_depth_2d;
+// Shadow map (2D array for CSM cascades)
+@group(2) @binding(1) var shadow_map: texture_depth_2d_array;
 @group(2) @binding(2) var shadow_sampler: sampler_comparison;
 
 // Alpha mask for foliage
 @group(2) @binding(3) var alpha_mask: texture_2d<f32>;
 @group(2) @binding(4) var alpha_sampler: sampler;
+
+// Baked bark textures
+@group(2) @binding(5) var bark_albedo_rough: texture_2d<f32>;
+@group(2) @binding(6) var bark_normal_ao: texture_2d<f32>;
+@group(2) @binding(7) var bark_sampler: sampler;
+@group(2) @binding(8) var bark_height: texture_2d<f32>;
+
+// Depth buffer (R32Float, for contact shadows)
+@group(2) @binding(9) var depth_float: texture_2d<f32>;
+
+// Sky-view LUT for aerial perspective (must match sky_pass.wgsl parameterization)
+@group(2) @binding(10) var sky_view_lut: texture_2d<f32>;
+@group(2) @binding(11) var sky_lut_sampler: sampler;
+
+// -- Art Direction Uniforms (bind group 3) --
+
+struct ArtDirectionUniforms {
+    // Tier 1: Geometry Deformation
+    silhouette_inflate: f32,
+    normal_smoothing: f32,
+    detail_suppression: f32,
+    color_discipline: f32,
+
+    // Tier 2: Shading Transforms
+    shading_bands: f32,
+    band_softness: f32,
+    specular_flattening: f32,
+    rim_light_strength: f32,
+
+    shadow_color_shift: vec4<f32>,
+    rim_light_color: vec4<f32>,
+
+    palette_saturation: f32,
+    palette_hue_shift: f32,
+    palette_value_contrast: f32,
+    transmission_boost: f32,
+
+    // Tier 3: Post-Processing
+    outline_strength: f32,
+    outline_thickness: f32,
+    outline_depth_sensitivity: f32,
+    outline_normal_sensitivity: f32,
+
+    outline_color: vec4<f32>,
+    color_grade_tint: vec4<f32>,
+    bloom_tint: vec4<f32>,
+
+    detail_fade_distance: f32,
+    skip_bark_texture: f32,
+    skip_normal_perturbation: f32,
+    _pad3c: f32,
+};
+
+struct StylePalette {
+    shadow: vec4<f32>,
+    dark: vec4<f32>,
+    mid: vec4<f32>,
+    light: vec4<f32>,
+    accent: vec4<f32>,
+    bark: vec4<f32>,
+    foliage: vec4<f32>,
+    earth: vec4<f32>,
+    sky_tint: vec4<f32>,
+};
+
+@group(3) @binding(0) var<uniform> art: ArtDirectionUniforms;
+@group(3) @binding(1) var<uniform> palette: StylePalette;
+
+// -- Art Direction Helper Functions --
+
+// Quantize lighting into discrete bands via luminance remapping.
+// Preserves hue — only the light/dark relationship is banded.
+// Clamps luminance to [0,1] for banding, then rescales, so HDR values
+// don't produce blown-out jumps.
+// No-op when bands < 0.01.
+fn apply_light_banding(color: vec3<f32>, bands: f32, softness: f32) -> vec3<f32> {
+    if bands < 0.01 {
+        return color;
+    }
+    let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if lum < 0.0001 {
+        return color;
+    }
+    // Clamp to [0,1] for banding, preserve HDR headroom
+    let clamped_lum = min(lum, 1.0);
+    let scaled = clamped_lum * bands;
+    let band_idx = floor(scaled);
+    let frac = scaled - band_idx;
+    // Soft transition between bands (softness controls width of gradient)
+    let t = smoothstep(0.5 - softness, 0.5 + softness, frac);
+    let banded = (band_idx + t) / bands;
+    // Blend between original and banded luminance
+    let final_lum = mix(lum, banded + max(lum - 1.0, 0.0), 0.75);
+    return color * (max(final_lum, 0.0) / lum);
+}
+
+// Shift shadow regions toward a target color.
+// `shift` is the target shadow hue (e.g. cool blue-violet for ufotable).
+// Shadow areas blend toward shift; lit areas untouched.
+// No-op when shift == vec3(0).
+fn apply_shadow_color_shift(color: vec3<f32>, NdotL: f32, shadow: f32, shift: vec3<f32>) -> vec3<f32> {
+    if dot(shift, shift) < 0.0001 {
+        return color;
+    }
+    let shadow_factor = 1.0 - NdotL * shadow;
+    // Only shift when solidly in shadow — the squared factor keeps lit areas clean
+    let shift_amount = shadow_factor * shadow_factor * shadow_factor;
+    // Preserve luminance: shift the chrominance, not the brightness
+    let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let shift_lum = max(dot(shift, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.001);
+    let relit_shift = shift * max(lum / shift_lum, 0.0);
+    return mix(color, relit_shift, shift_amount * 0.55);
+}
+
+// Fresnel-based edge glow. No-op when strength < 0.01.
+// Wide, bright anime-style rim light.
+fn compute_rim_light(normal: vec3<f32>, view_dir: vec3<f32>, strength: f32, rim_color: vec3<f32>) -> vec3<f32> {
+    if strength < 0.01 {
+        return vec3<f32>(0.0);
+    }
+    let NdotV = max(dot(normal, view_dir), 0.0);
+    // Wide rim (power 1.5) that's visible across more of the surface
+    let fresnel = pow(1.0 - NdotV, 1.5);
+    // Boost to make it clearly visible
+    return rim_color * fresnel * strength * 0.08;
+}
+
+// Palette-based hue shift. Preserves the original value (light/dark) and
+// shifts the chrominance toward the palette's material hint + tonal slot.
+// This gives ufotable's "curated color family" look without crushing detail.
+// No-op when discipline < 0.01.
+fn apply_palette_remap(base_color: vec3<f32>, material: u32, discipline: f32) -> vec3<f32> {
+    if discipline < 0.01 {
+        return base_color;
+    }
+    let lum = dot(base_color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if lum < 0.001 {
+        return base_color;
+    }
+
+    // Select tonal slot based on luminance (for hue reference only)
+    var tonal: vec3<f32>;
+    if lum < 0.12 {
+        tonal = palette.shadow.rgb;
+    } else if lum < 0.3 {
+        tonal = mix(palette.dark.rgb, palette.mid.rgb, (lum - 0.12) / 0.18);
+    } else if lum < 0.6 {
+        tonal = mix(palette.mid.rgb, palette.light.rgb, (lum - 0.3) / 0.3);
+    } else {
+        tonal = palette.light.rgb;
+    }
+
+    // Select material hint — this preserves material identity
+    var hint: vec3<f32>;
+    if material == MATERIAL_TRUNK {
+        hint = palette.bark.rgb;
+    } else if material == MATERIAL_FOLIAGE {
+        hint = palette.foliage.rgb;
+    } else {
+        hint = palette.earth.rgb;
+    }
+
+    // Compute target chrominance: blend tonal hue with material hint
+    // Ground uses more material hint to stay earthy, trunk/foliage use more tonal
+    let hint_weight = select(0.45, 0.70, material == MATERIAL_GROUND);
+    let target_chroma = mix(tonal, hint, hint_weight);
+    let target_lum = max(dot(target_chroma, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.001);
+
+    // Normalize target to unit luminance, then reapply original luminance
+    // This shifts HUE toward palette while preserving VALUE
+    let relit = target_chroma * (lum / target_lum);
+
+    // Discipline controls how far we shift toward palette
+    return mix(base_color, relit, discipline * 0.85);
+}
+
+// Flatten specular contribution. No-op when flattening == 0.
+fn apply_specular_flatten(specular: vec3<f32>, flattening: f32) -> vec3<f32> {
+    return specular * (1.0 - flattening);
+}
 
 // -- Vertex output --
 
@@ -155,8 +341,25 @@ fn six_face_ambient(normal: vec3<f32>) -> vec3<f32> {
          + uniforms.ambient_back.rgb * max(-nz, 0.0);
 }
 
-fn sample_shadow(world_pos: vec3<f32>) -> f32 {
-    let light_clip = uniforms.light_vp * vec4<f32>(world_pos, 1.0);
+// Get cascade light VP matrix by index
+fn get_cascade_vp(idx: i32) -> mat4x4<f32> {
+    if idx == 0 { return uniforms.light_vp; }
+    if idx == 1 { return uniforms.light_vp_1; }
+    if idx == 2 { return uniforms.light_vp_2; }
+    return uniforms.light_vp_3;
+}
+
+// 4-tap rotated Poisson disk offsets (normalized, scale by texel size)
+const POISSON_DISK: array<vec2<f32>, 4> = array<vec2<f32>, 4>(
+    vec2<f32>(-0.94201624, -0.39906216),
+    vec2<f32>( 0.94558609, -0.76890725),
+    vec2<f32>(-0.09418410, -0.92938870),
+    vec2<f32>( 0.34495938,  0.29387760),
+);
+
+fn sample_shadow_cascade(world_pos: vec3<f32>, cascade_idx: i32) -> f32 {
+    let vp = get_cascade_vp(cascade_idx);
+    let light_clip = vp * vec4<f32>(world_pos, 1.0);
     let light_ndc = light_clip.xyz / light_clip.w;
     let shadow_uv = light_ndc.xy * 0.5 + 0.5;
     let shadow_uv_flipped = vec2<f32>(shadow_uv.x, 1.0 - shadow_uv.y);
@@ -167,12 +370,165 @@ fn sample_shadow(world_pos: vec3<f32>) -> f32 {
     }
 
     let depth = light_ndc.z;
-    return textureSampleCompare(shadow_map, shadow_sampler, shadow_uv_flipped, depth);
+    let texel_size = 1.0 / 2048.0;
+
+    // 4-tap rotated Poisson PCF
+    var shadow = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let offset = POISSON_DISK[i] * texel_size * 1.5;
+        shadow += textureSampleCompareLevel(
+            shadow_map, shadow_sampler,
+            shadow_uv_flipped + offset,
+            cascade_idx,
+            depth
+        );
+    }
+    return shadow * 0.25;
 }
 
-fn sky_color_dir(dir: vec3<f32>) -> vec3<f32> {
-    let horizon_mix = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(uniforms.sky_horizon.rgb, uniforms.sky_zenith.rgb, horizon_mix);
+fn sample_shadow(world_pos: vec3<f32>) -> f32 {
+    // Compute view-space depth for cascade selection
+    let view_pos = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    let view_depth = view_pos.w; // w = -view_z for perspective RH
+
+    // Select cascade based on view-space depth
+    var cascade_idx = 3;
+    if view_depth < uniforms.cascade_splits.x {
+        cascade_idx = 0;
+    } else if view_depth < uniforms.cascade_splits.y {
+        cascade_idx = 1;
+    } else if view_depth < uniforms.cascade_splits.z {
+        cascade_idx = 2;
+    }
+
+    let shadow = sample_shadow_cascade(world_pos, cascade_idx);
+
+    // Blend at cascade boundaries to avoid hard seams
+    let blend_range = 0.1; // 10% of cascade range for blending
+    var blend_factor = 0.0;
+    if cascade_idx < 3 {
+        var split_dist: f32;
+        if cascade_idx == 0 { split_dist = uniforms.cascade_splits.x; }
+        else if cascade_idx == 1 { split_dist = uniforms.cascade_splits.y; }
+        else { split_dist = uniforms.cascade_splits.z; }
+
+        let blend_start = split_dist * (1.0 - blend_range);
+        if view_depth > blend_start {
+            blend_factor = (view_depth - blend_start) / (split_dist - blend_start);
+            blend_factor = clamp(blend_factor, 0.0, 1.0);
+        }
+    }
+
+    if blend_factor > 0.01 && cascade_idx < 3 {
+        let next_shadow = sample_shadow_cascade(world_pos, cascade_idx + 1);
+        return mix(shadow, next_shadow, blend_factor);
+    }
+
+    return shadow;
+}
+
+// Screen-space contact shadows: 16-step ray march along sun direction.
+// Returns 0.0 (shadowed) to 1.0 (lit).
+fn contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    let screen_size = uniforms.screen_size.xy;
+
+    // Project start position to screen space
+    let clip_start = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    let ndc_start = clip_start.xyz / clip_start.w;
+    let screen_start = vec2<f32>(
+        (ndc_start.x * 0.5 + 0.5) * screen_size.x,
+        (1.0 - (ndc_start.y * 0.5 + 0.5)) * screen_size.y
+    );
+    let depth_start = ndc_start.z;
+
+    // Project a point offset along sun direction
+    let ray_length = 0.5; // world-space ray length
+    let end_pos = world_pos + sun_dir * ray_length;
+    let clip_end = uniforms.view_proj * vec4<f32>(end_pos, 1.0);
+    let ndc_end = clip_end.xyz / clip_end.w;
+    let screen_end = vec2<f32>(
+        (ndc_end.x * 0.5 + 0.5) * screen_size.x,
+        (1.0 - (ndc_end.y * 0.5 + 0.5)) * screen_size.y
+    );
+    let depth_end = ndc_end.z;
+
+    // Clamp max screen-space ray length
+    let screen_delta = screen_end - screen_start;
+    let screen_len = length(screen_delta);
+    let max_screen_len = 0.15 * max(screen_size.x, screen_size.y);
+    if screen_len < 1.0 {
+        return 1.0;
+    }
+    let scale = min(1.0, max_screen_len / screen_len);
+
+    let step_screen = screen_delta * scale / 16.0;
+    let step_depth = (depth_end - depth_start) * scale / 16.0;
+
+    var ray_screen = screen_start;
+    var ray_depth = depth_start;
+
+    // Adaptive thickness based on depth (thicker when further away)
+    let base_thickness = 0.0005;
+
+    for (var i = 1; i <= 16; i++) {
+        ray_screen += step_screen;
+        ray_depth += step_depth;
+
+        let pixel = vec2<i32>(ray_screen);
+        if pixel.x < 0 || pixel.y < 0 ||
+           pixel.x >= i32(screen_size.x) || pixel.y >= i32(screen_size.y) {
+            break;
+        }
+
+        let scene_depth = textureLoad(depth_float, vec2<u32>(vec2<i32>(pixel)), 0).r;
+        let thickness = base_thickness * (1.0 + ray_depth * 5.0);
+
+        if ray_depth > scene_depth && (ray_depth - scene_depth) < thickness {
+            // Fade out shadow for samples near the end of the ray
+            let fade = 1.0 - f32(i) / 16.0;
+            return 1.0 - fade;
+        }
+    }
+
+    return 1.0;
+}
+
+// Sample sky-view LUT for physically consistent aerial perspective.
+// CANONICAL: UV mapping must match sky_lut.wgsl compute_sky_view AND sky_pass.wgsl dir_to_sky_view_uv.
+fn sample_sky_lut(dir: vec3<f32>) -> vec3<f32> {
+    let elevation = asin(clamp(dir.y, -1.0, 1.0));
+    var v: f32;
+    if elevation < 0.0 {
+        let t = sqrt(-elevation / (PI * 0.5));
+        v = 0.5 - t * 0.5;
+    } else {
+        let t = sqrt(elevation / (PI * 0.5));
+        v = 0.5 + t * 0.5;
+    }
+    let azimuth = atan2(dir.x, dir.z);
+    var u = azimuth / (2.0 * PI);
+    u = select(u + 1.0, u, u >= 0.0);
+    let sun_color = uniforms.sun_color.rgb * uniforms.sun_color.w;
+    return textureSampleLevel(sky_view_lut, sky_lut_sampler, vec2<f32>(u, v), 0.0).rgb * sun_color;
+}
+
+fn sample_aerial_sky(dir: vec3<f32>) -> vec3<f32> {
+    // Art-directed gradient matching sky_pass.wgsl for seamless horizon transition.
+    let sky_horizon_color = uniforms.sky_horizon.rgb;
+    let sky_zenith_color = uniforms.sky_zenith.rgb;
+    let sky_str = uniforms.sky_zenith.w;
+
+    let elevation = max(dir.y, 0.0);
+    let t = pow(smoothstep(-0.02, 0.50, elevation), 0.45);
+    var gradient = mix(sky_horizon_color, sky_zenith_color, t) * sky_str;
+
+    // Golden horizon warmth (must match sky_pass.wgsl)
+    let horizon_warmth = pow(1.0 - smoothstep(0.0, 0.18, elevation), 2.5);
+    let golden_tint = vec3<f32>(1.30, 1.08, 0.65);
+    gradient *= mix(vec3<f32>(1.0), golden_tint, horizon_warmth * 0.55);
+
+    let sun_color = uniforms.sun_color.rgb * uniforms.sun_color.w;
+    return gradient * sun_color;
 }
 
 // -- PBR Functions --
@@ -217,6 +573,98 @@ fn specular_brdf(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32, F0: v
     return D * G * F;
 }
 
+// -- Parallax Occlusion Mapping --
+
+fn parallax_occlusion_map(
+    uv: vec2<f32>,
+    view_ts: vec3<f32>,
+    height_scale: f32,
+) -> vec2<f32> {
+    // Clamp view_ts.z to prevent extreme stepping at grazing angles
+    let safe_z = max(view_ts.z, 0.15);
+    // Adaptive layer count: more at grazing angles
+    let num_layers = mix(32.0, 8.0, safe_z);
+    let layer_depth = 1.0 / num_layers;
+    let delta_uv = view_ts.xy * height_scale / (safe_z * num_layers);
+
+    var current_uv = uv;
+    var current_depth = 0.0;
+    var current_height = textureSample(bark_height, bark_sampler, current_uv).r;
+
+    // Linear march
+    for (var i = 0u; i < 32u; i++) {
+        if current_depth >= current_height { break; }
+        current_uv -= delta_uv;
+        current_height = textureSample(bark_height, bark_sampler, current_uv).r;
+        current_depth += layer_depth;
+    }
+
+    // Binary refinement (2 steps)
+    var prev_uv = current_uv + delta_uv;
+    for (var j = 0u; j < 2u; j++) {
+        let mid_uv = (current_uv + prev_uv) * 0.5;
+        let mid_height = textureSample(bark_height, bark_sampler, mid_uv).r;
+        let mid_depth = current_depth - layer_depth * 0.5;
+        if mid_depth < mid_height { prev_uv = mid_uv; }
+        else { current_uv = mid_uv; current_depth = mid_depth; }
+    }
+    return current_uv;
+}
+
+// -- Fiber Sheen (Charlie distribution) --
+
+fn D_Charlie(NdotH: f32, roughness: f32) -> f32 {
+    let alpha = roughness * roughness;
+    let inv_alpha = 1.0 / alpha;
+    let sin2h = 1.0 - NdotH * NdotH;
+    return (2.0 + inv_alpha) * pow(max(sin2h, 0.0), inv_alpha * 0.5) / TWO_PI;
+}
+
+fn sheen_brdf(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
+              fiber_dir: vec3<f32>, sheen_roughness: f32) -> f32 {
+    let H = normalize(V + L);
+    let NdotH = max(dot(N, H), 0.0);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 1e-4);
+    // Peak perpendicular to fiber direction
+    let FdotH = abs(dot(fiber_dir, H));
+    let fiber_factor = 1.0 - FdotH * FdotH;
+    let D = D_Charlie(NdotH, sheen_roughness);
+    let V_sheen = 1.0 / (4.0 * (NdotL + NdotV - NdotL * NdotV));
+    return D * V_sheen * fiber_factor;
+}
+
+// -- Runtime Procedural Micro-Detail --
+
+fn hash_2d(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(hash_2d(i), hash_2d(i + vec2(1.0, 0.0)), u.x),
+        mix(hash_2d(i + vec2(0.0, 1.0)), hash_2d(i + vec2(1.0, 1.0)), u.x),
+        u.y
+    );
+}
+
+fn micro_fiber_noise(uv: vec2<f32>, detail_fade: f32) -> vec2<f32> {
+    // Stretch 8:1 along V for fine vertical fiber striations
+    var perturbation = vec2<f32>(0.0);
+    // Three octaves at fine scales — subtle normal perturbation only
+    let freqs = array<f32, 3>(180.0, 420.0, 900.0);
+    let amps = array<f32, 3>(0.006, 0.003, 0.0015);
+    for (var i = 0u; i < 3u; i++) {
+        let sample_uv = vec2<f32>(uv.x * freqs[i], uv.y * freqs[i] * 0.125);
+        let n = value_noise(sample_uv) * 2.0 - 1.0;
+        perturbation.x += n * amps[i];  // perpendicular to fiber
+    }
+    return perturbation * detail_fade;
+}
+
 // -- Procedural Materials (ported from tree_lab) --
 
 fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
@@ -226,12 +674,15 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
             0.5 + 0.5 * sin(position.x * 4.8 + position.z * 5.9 + position.y * 3.1)
             + 0.25 * sin(position.y * 10.0 + position.x * 8.0);
         let tuft_shadow = 0.5 + 0.5 * sin(position.y * 15.0 + position.x * 6.0 - position.z * 7.0);
-        let deep = vec3<f32>(0.012, 0.040, 0.020);
-        let mid = vec3<f32>(0.030, 0.078, 0.036);
-        let lit = vec3<f32>(0.055, 0.112, 0.050);
-        let shadow_mix = clamp(tuft_shadow * 0.68 + canopy_noise * 0.18, 0.0, 1.0);
-        let lit_mix = clamp(canopy_noise * 0.24 + normal.y * 0.10, 0.0, 1.0);
-        return mix(mix(deep, mid, shadow_mix), lit, lit_mix);
+        let sun_tip_noise = 0.5 + 0.5 * sin(position.x * 2.1 - position.z * 2.7 + position.y * 1.4);
+        let deep = vec3<f32>(0.018, 0.042, 0.022);
+        let mid = vec3<f32>(0.034, 0.074, 0.036);
+        let lit = vec3<f32>(0.080, 0.118, 0.048);
+        let warm_tip = vec3<f32>(0.140, 0.150, 0.055);
+        let shadow_mix = clamp(tuft_shadow * 0.62 + canopy_noise * 0.16, 0.0, 1.0);
+        let lit_mix = clamp(canopy_noise * 0.18 + normal.y * 0.16, 0.0, 1.0);
+        let tip_mix = clamp(sun_tip_noise * 0.28 + normal.y * 0.24, 0.0, 1.0);
+        return mix(mix(mix(deep, mid, shadow_mix), lit, lit_mix), warm_tip, tip_mix * 0.45);
     }
 
     // Ground
@@ -239,18 +690,27 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
     let soil_band = 0.5 + 0.5 * sin(radial * 0.85 + position.x * 0.18);
     let moss_patch = 0.5 + 0.5 * sin(position.x * 0.42 + position.z * 0.58 + soil_band * 2.0);
     let moss_patch2 = 0.5 + 0.5 * sin(position.x * 0.71 - position.z * 0.34 + soil_band * 1.4);
-    let cool_soil = vec3<f32>(0.14, 0.12, 0.11);
-    let dark_soil = vec3<f32>(0.08, 0.07, 0.065);
-    let muted_moss = vec3<f32>(0.060, 0.075, 0.060);
-    let soil = mix(dark_soil, cool_soil, soil_band * 0.38 + 0.16);
+    let warm_soil = vec3<f32>(0.23, 0.16, 0.10);
+    let dark_soil = vec3<f32>(0.10, 0.065, 0.038);
+    let muted_moss = vec3<f32>(0.078, 0.098, 0.068);
+    let soil = mix(dark_soil, warm_soil, soil_band * 0.42 + 0.22);
 
     // Needle litter
     let needle_noise = sin(position.x * 18.0 + position.z * 22.0) * sin(position.z * 14.0 - position.x * 9.0);
-    let needle_litter = vec3<f32>(0.12, 0.08, 0.05);
-    var ground = mix(soil, needle_litter, clamp(needle_noise * 0.5 + 0.5, 0.0, 1.0) * 0.22);
+    let needle_litter = vec3<f32>(0.24, 0.15, 0.07);
+    let duff_patch = 0.5 + 0.5 * sin(position.x * 0.23 - position.z * 0.17 + moss_patch * 1.8);
+    var ground = mix(
+        soil,
+        needle_litter,
+        clamp(needle_noise * 0.5 + 0.5, 0.0, 1.0) * 0.20 + duff_patch * 0.08
+    );
 
     // Moss patches
-    ground = mix(ground, muted_moss, moss_patch * 0.28 + moss_patch2 * 0.14);
+    ground = mix(ground, muted_moss, moss_patch * 0.24 + moss_patch2 * 0.12);
+
+    // Dry clearings catch a bit more warm duff color.
+    let dry_patch = 0.5 + 0.5 * sin(position.x * 0.31 + position.z * 0.19 + soil_band * 2.4);
+    ground = mix(ground, vec3<f32>(0.19, 0.12, 0.065), dry_patch * 0.08);
 
     // Root zone shadow
     let root_shadow = 1.0 - (1.0 - smoothstep(0.5, 3.0, radial)) * 0.15;
@@ -260,27 +720,11 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
 }
 
 fn foliage_alpha_mask(uv: vec2<f32>, position: vec3<f32>) -> f32 {
-    let centered_x = abs(uv.x * 2.0 - 1.0);
-    let stem_profile = smoothstep(0.01, 0.08, uv.y) * (1.0 - smoothstep(0.93, 1.0, uv.y));
-    let taper = mix(0.44, 0.09, smoothstep(0.04, 0.98, uv.y));
-    let width_noise =
-        0.055 * sin(uv.y * 10.0 + position.x * 5.0)
-        + 0.030 * sin(uv.y * 21.0 + position.z * 8.0)
-        + 0.018 * sin(uv.y * 37.0 + position.y * 4.0);
-    let lobe_shift =
-        0.10 * sin(uv.y * 7.0 + position.x * 4.0)
-        + 0.04 * sin(uv.y * 15.0 + position.z * 6.0);
-    let outer_width = max(taper + width_noise, 0.06);
-    let outer = 1.0 - smoothstep(outer_width, outer_width + 0.34, centered_x);
-    let inner = 1.0
-        - smoothstep(
-            outer_width * 0.56,
-            outer_width * 0.56 + 0.24,
-            abs((uv.x * 2.0 - 1.0) * 0.82 - lobe_shift),
-        );
-    let tip_cluster = 1.0 - smoothstep(0.76, 1.0, uv.y) * 0.28;
-    let alpha = max(outer * 0.74, inner) * stem_profile * tip_cluster;
-    return smoothstep(0.06, 0.90, alpha);
+    let sampled = textureSample(alpha_mask, alpha_sampler, uv).r;
+    let edge_noise =
+        0.015 * sin(position.x * 7.0 + position.y * 3.0)
+        + 0.012 * sin(position.z * 9.0 - position.y * 2.0);
+    return clamp(sampled + edge_noise, 0.0, 1.0);
 }
 
 // -- Height fog with per-material attenuation --
@@ -292,7 +736,7 @@ fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
     let fog_end = uniforms.fog_params.w;
 
     let distance_factor = clamp((dist - fog_start) / max(fog_end - fog_start, 0.001), 0.0, 1.0);
-    let distance_fog = 1.0 - exp(-distance_factor * density * 8.0);
+    let distance_fog = 1.0 - exp(-pow(distance_factor, 3.0) * density * 4000.0);
     let ground_mist = exp(-max(world_pos.y, 0.0) * falloff);
     var fog = clamp(distance_fog * (0.18 + ground_mist * 0.82), 0.0, 1.0);
 
@@ -302,223 +746,13 @@ fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
     } else if material == MATERIAL_TRUNK {
         fog *= 0.90;
     }
-    // Ground: 100% (no attenuation)
+    // Ground: force full fog near edge to hide geometric boundary
+    if material == MATERIAL_GROUND {
+        let edge_fade = smoothstep(fog_end * 0.7, fog_end, dist);
+        fog = max(fog, edge_fade);
+    }
 
     return fog;
-}
-
-// -- Noise Primitives --
-
-fn hash11(seed_val: u32, n: u32) -> f32 {
-    var h = seed_val ^ (n * 747796405u + 2891336453u);
-    h = ((h >> 16u) ^ h) * 2654435769u;
-    h = ((h >> 16u) ^ h);
-    return f32(h) / 2147483648.0 - 1.0;
-}
-
-fn mod_positive(x: f32, m: f32) -> f32 {
-    return ((x % m) + m) % m;
-}
-
-fn hash_smooth(seed_val: u32, x: f32) -> f32 {
-    let xi = floor(x);
-    let xf = fract(x);
-    let t = xf * xf * (3.0 - 2.0 * xf);
-    let ia = u32(bitcast<i32>(i32(xi)) & 0x7FFFFFFF);
-    let ib = u32(bitcast<i32>(i32(xi) + 1) & 0x7FFFFFFF);
-    return mix(hash11(seed_val, ia), hash11(seed_val, ib), t);
-}
-
-fn fbm(seed_val: u32, x: f32) -> f32 {
-    var value = 0.0;
-    var amp = 0.5;
-    var freq = 1.0;
-    for (var i = 0u; i < 3u; i++) {
-        value += amp * hash_smooth(seed_val + i * 17u, x * freq);
-        amp *= 0.5;
-        freq *= 2.0;
-    }
-    return value;
-}
-
-fn hash21(seed_val: u32, p: vec2<f32>) -> f32 {
-    let px = u32(bitcast<i32>(i32(floor(p.x))) & 0x7FFFFFFF);
-    let py = u32(bitcast<i32>(i32(floor(p.y))) & 0x7FFFFFFF);
-    var h = seed_val ^ (px * 747796405u + py * 2891336453u);
-    h = ((h >> 16u) ^ h) * 2654435769u;
-    h = ((h >> 16u) ^ h);
-    return f32(h) / 2147483648.0 - 1.0;
-}
-
-struct CrackResult {
-    furrow_depth: f32,
-    ridge_u: f32,
-    nearest_crack_theta: f32,
-    crack_spacing: f32,
-};
-
-fn bark_cracks(theta: f32, h: f32, height_t: f32, R_h: f32, t_h: f32,
-               stiffness_ratio: f32, seed_val: u32) -> CrackResult {
-    let s_h = PI * t_h * sqrt(stiffness_ratio);
-    let widened_spacing = s_h * mix(1.35, 0.94, sqrt(height_t));
-    let n = max(floor(TWO_PI * R_h / widened_spacing), 3.0);
-    let crack_spacing = TWO_PI / n;
-
-    let i_center = round(theta / crack_spacing);
-    var min_dist = 1e9;
-    var nearest_crack = theta;
-    var second_dist = 1e9;
-
-    for (var di = -1i; di <= 1i; di++) {
-        let i = i_center + f32(di);
-        let crack_seed = seed_val + u32(abs(i32(i)));
-        // Keep the channels tall and continuous, with only modest wandering.
-        let jitter_scale = mix(0.18, 0.08, height_t);
-        let jitter_slow = fbm(crack_seed, h / 5.5) * jitter_scale * crack_spacing;
-        let jitter_kink = hash_smooth(crack_seed + 31u, h * 0.45) * jitter_scale * 0.38 * crack_spacing;
-        let jitter_fast = hash_smooth(crack_seed + 67u, h * 1.4) * jitter_scale * 0.12 * crack_spacing;
-        let theta_crack = i * crack_spacing + jitter_slow + jitter_kink + jitter_fast;
-        let d = abs(mod_positive(theta - theta_crack + PI, TWO_PI) - PI);
-        if d < min_dist {
-            second_dist = min_dist;
-            min_dist = d;
-            nearest_crack = theta_crack;
-        } else if d < second_dist {
-            second_dist = d;
-        }
-    }
-
-    // Wide fissured furrows — real redwood has deep wide channels
-    let crack_id = nearest_crack * 2.3 + h * 0.15;
-    let width_vary = 0.72 + 0.56 * (hash_smooth(seed_val + 90u, crack_id) * 0.5 + 0.5);
-    let depth_vary = 0.55 + 0.45 * (hash_smooth(seed_val + 95u, crack_id * 1.7) * 0.5 + 0.5);
-    // Wider at base (height_t near 0), narrower at crown
-    let height_width = mix(0.36, 0.15, pow(height_t, 0.58));
-    let furrow_width = crack_spacing * height_width * width_vary;
-    let furrow_depth = smoothstep(furrow_width, furrow_width * 0.26, min_dist)
-        * depth_vary
-        * mix(1.18, 0.72, pow(height_t, 0.75));
-    let ridge_span = min_dist + second_dist;
-    let ridge_u = clamp(min_dist / max(ridge_span * 0.5, 0.001), 0.0, 1.0);
-
-    var result: CrackResult;
-    result.furrow_depth = furrow_depth;
-    result.ridge_u = ridge_u;
-    result.nearest_crack_theta = nearest_crack;
-    result.crack_spacing = crack_spacing;
-    return result;
-}
-
-struct RidgeResult {
-    profile: f32,
-    normal_perturbation: f32,
-};
-
-fn bark_ridge_profile(ridge_u: f32, depth_h: f32) -> RidgeResult {
-    let w = 0.12; // Steeper edge
-    let c = 0.08;
-    let edge = smoothstep(0.0, w, ridge_u) * smoothstep(0.0, w, 1.0 - ridge_u);
-    // Plateau crown instead of continuous sine
-    let crown = 1.0 + c * (smoothstep(0.1, 0.9, ridge_u) * smoothstep(0.1, 0.9, 1.0 - ridge_u));
-    let profile = edge * crown * depth_h;
-
-    let d_edge_left = (1.0 / w) * smoothstep(0.0, w, 1.0 - ridge_u);
-    let d_edge_right = -(1.0 / w) * smoothstep(0.0, w, ridge_u);
-    let d_edge = select(select(0.0, d_edge_right, ridge_u > 1.0 - w), d_edge_left, ridge_u < w);
-    let d_crown = 0.0; // Negligible derivative on the plateau
-    let d_profile = (d_edge * crown + edge * d_crown) * depth_h;
-
-    var result: RidgeResult;
-    result.profile = profile;
-    result.normal_perturbation = d_profile;
-    return result;
-}
-
-fn perp2d(v: vec2<f32>) -> vec2<f32> { return vec2<f32>(-v.y, v.x); }
-
-fn bark_fiber_flow(theta: f32, h: f32, nearest_crack: f32,
-                   crack_spacing: f32, seed_val: u32) -> vec2<f32> {
-    let dist = abs(mod_positive(theta - nearest_crack + PI, TWO_PI) - PI);
-    let fan_width = 0.3 * crack_spacing;
-    let proximity = 1.0 - smoothstep(0.0, fan_width, dist);
-    let fan_angle = atan2(theta - nearest_crack, 2.0);
-    let fan_dir = normalize(vec2<f32>(sin(fan_angle), cos(fan_angle)));
-    let base_flow = normalize(mix(vec2<f32>(0.0, 1.0), fan_dir, proximity * 0.5));
-
-    // Burl swirls (Idea 3)
-    let burl_uv = vec2<f32>(theta * 6.0, h * 0.15);
-    let burl_center = floor(burl_uv) + 0.5;
-    let burl_local = fract(burl_uv) - 0.5;
-    let burl_dist = length(burl_local);
-    let burl_hash = hash21(seed_val + 300u, burl_center);
-    let is_burl = step(0.85, burl_hash + 0.5); // 15% chance
-    let swirl_dir = vec2<f32>(-burl_local.y, burl_local.x);
-    let swirl_amount = is_burl * smoothstep(0.5, 0.1, burl_dist) * 2.5;
-
-    return normalize(base_flow + swirl_dir * swirl_amount);
-}
-
-struct FiberBundleResult { bundle: f32, normal_perturbation: f32, };
-
-fn bark_fiber_bundles(theta: f32, h: f32, radius: f32, fiber_dir: vec2<f32>,
-                      density: f32, seed_val: u32) -> FiberBundleResult {
-    // Keep the bundle count periodic around the circumference so the wrap seam disappears.
-    let radius_scale = sqrt(max(radius, 0.25));
-    let bundle_count = max(6.0, floor(density * (1.35 + radius_scale)));
-    let modulation_count = max(1.0, floor(bundle_count * 0.25));
-    let along = h * (0.70 + 0.30 * abs(fiber_dir.y));
-    let cross_shear = fiber_dir.x * 0.22;
-    let bundle_phase = theta * bundle_count + along * cross_shear;
-    let bundle = sin(bundle_phase) * 0.5 + 0.5;
-    let modulation_phase =
-        theta * modulation_count + along * 0.06 + hash11(seed_val + 7u, 19u) * PI;
-    let modulation = 0.72 + 0.28 * (0.5 + 0.5 * sin(modulation_phase));
-    let bundle_mod = bundle * modulation;
-    let d_bundle = cos(bundle_phase) * bundle_count;
-    var r: FiberBundleResult;
-    r.bundle = bundle_mod; r.normal_perturbation = d_bundle;
-    return r;
-}
-
-// -- Bark shedding layer --
-
-struct SheddingResult {
-    exposed: f32,       // 0 = intact outer bark, 1 = fully exposed inner bark
-    edge_shadow: f32,   // dark undercut at peel boundary
-    edge_lift: f32,     // bright catch-light on curled lip
-};
-
-fn bark_shedding(theta: f32, h: f32, nearest_crack: f32,
-                 crack_spacing: f32, height_t: f32, seed_val: u32) -> SheddingResult {
-    // Elongated strip noise — stretched 6:1 along height (bark sheds in long strips)
-    let strip_theta = theta * 3.0;
-    let strip_h = h * 0.5;
-    let strip_noise = fbm(seed_val + 200u, strip_theta * 2.7 + strip_h * 0.3)
-                    + 0.5 * fbm(seed_val + 213u, strip_theta * 1.1 - strip_h * 0.7);
-
-    // Height-band modulator — shedding concentrates mid-trunk
-    let band = smoothstep(0.08, 0.25, height_t) * smoothstep(0.95, 0.7, height_t);
-
-    // Crack-aligned tearing — strips tend to detach along existing furrows
-    let crack_dist = abs(mod_positive(theta - nearest_crack + PI, TWO_PI) - PI);
-    let crack_proximity = 1.0 - smoothstep(0.0, crack_spacing * 0.35, crack_dist);
-
-    // Combine: higher values = more likely to have shed
-    let shed_probability = strip_noise * 0.5 + 0.5;
-    let shed_threshold = 0.57 - band * 0.10 - crack_proximity * 0.06;
-    let raw_exposed = smoothstep(shed_threshold, shed_threshold + 0.14, shed_probability)
-        * band
-        * 0.65;
-
-    // Edge detection: visible peel boundary
-    let edge_band = smoothstep(shed_threshold - 0.04, shed_threshold, shed_probability)
-                  * (1.0 - smoothstep(shed_threshold, shed_threshold + 0.04, shed_probability));
-
-    var result: SheddingResult;
-    result.exposed = raw_exposed;
-    result.edge_shadow = edge_band * 0.65;
-    result.edge_lift = edge_band * raw_exposed * 0.18;
-    return result;
 }
 
 // -- Fragment shader --
@@ -583,7 +817,7 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     // -- Foliage alpha test with sky fallback --
     if material == MATERIAL_FOLIAGE {
         let alpha = foliage_alpha_mask(uv, world_pos);
-        if alpha < 0.001 {
+        if alpha < 0.14 {
             // Output transparent black — sky pass will fill
             var out: MaterialOutput;
             out.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -601,177 +835,167 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     let view_dir = normalize(camera_pos - world_pos);
     let cam_dist = distance(world_pos, camera_pos);
 
-    let NdotL = max(dot(normal, sun_dir), 0.0);
+    var NdotL = max(dot(normal, sun_dir), 0.0);
     let NdotV = max(dot(normal, view_dir), 1e-4);
-    let shadow = sample_shadow(world_pos);
+    var shadow = sample_shadow(world_pos);
+
+    // Art direction: band the NdotL * shadow term for cel-shading
+    // This creates the discrete light-to-shadow transition ufotable is known for
+    if art.shading_bands > 0.01 {
+        let light_factor = NdotL * shadow;
+        let bands = art.shading_bands;
+        let softness = art.band_softness;
+        let scaled = light_factor * bands;
+        let band_idx = floor(scaled);
+        let frac = scaled - band_idx;
+        let t = smoothstep(0.5 - softness, 0.5 + softness, frac);
+        let banded = (band_idx + t) / bands;
+        // Split banded result back into NdotL and shadow
+        // Keep shadow as-is for shadow color shift, adjust NdotL
+        if NdotL > 0.001 {
+            NdotL = banded / max(shadow, 0.001);
+            NdotL = clamp(NdotL, 0.0, 1.0);
+        }
+    }
+
+    // Screen-space contact shadows
+    let contact_strength = uniforms.lighting_params.z;
+    if contact_strength > 0.001 {
+        let cs = contact_shadow(world_pos, sun_dir);
+        shadow *= mix(1.0, cs, contact_strength);
+    }
 
     var final_normal = normal;
     var color: vec3<f32>;
 
     if material == MATERIAL_TRUNK {
-        // === Procedural bark evaluation ===
-        let theta = uv.x * TWO_PI;
-        let h = uv.y * bark.trunk_height;
-        let height_t = clamp(uv.y, 0.0, 1.0);
-        let R_h = mix(bark.trunk_radius_base, bark.trunk_radius_tip, height_t);
-        let t_h = mix(bark.bark_thickness_base, bark.bark_thickness_tip, height_t);
-
-        let cracks = bark_cracks(theta, h, height_t, R_h, t_h, bark.stiffness_ratio, bark.seed);
-
-        // Distance LOD (swap to DAG-level when GPU cull is activated)
-        // (cam_dist computed above, shared with fog)
-        // Wider transition bands prevent visible LOD pops
-        let lod_weight_fiber = 1.0 - smoothstep(3.0, 12.0, cam_dist);
-        let lod_weight_flow  = 1.0 - smoothstep(8.0, 25.0, cam_dist);
-        let lod_weight_ridge = 1.0 - smoothstep(20.0, 55.0, cam_dist);
-        // Shared noise (used by both distant and close bark paths)
-        let age = 1.0 - height_t;
-        let patch_noise = fbm(bark.seed + 77u, theta * 1.8 + h * 0.4) * 0.5 + 0.5;
-        let micro_a = hash_smooth(bark.seed + 100u, theta * 18.0 + h * 3.2);
-
-        // Distant bark baseline; we blend this with the close bark path to avoid
-        // a visible LOD seam across the trunk.
-        var distant_color = mix(vec3<f32>(0.42, 0.18, 0.07), vec3<f32>(0.30, 0.13, 0.05), age * 0.46 + patch_noise * 0.22);
-        distant_color = mix(distant_color, vec3<f32>(0.11, 0.06, 0.04), age * age * 0.48);
-        distant_color = mix(distant_color, vec3<f32>(0.12, 0.08, 0.07), cracks.furrow_depth * 0.16);
-        distant_color *= (1.0 - cracks.furrow_depth * 0.62) * (1.0 + micro_a * 0.10);
-        let distant_base_ndotl = max(dot(normal, sun_dir), 0.0);
-        let distant_wrap_dot = dot(normal, sun_dir) * 0.4 + 0.6;
-        let distant_lit = distant_color * (six_face_ambient(normal) * ao * 1.3
-            + sun_color * sun_strength * distant_base_ndotl * shadow
-            + sun_color * sun_strength * 0.12 * max(distant_wrap_dot, 0.0));
-
-        // Full bark evaluation (Layers 2-5)
-
-        // Ridge profile
-        let depth_h = mix(1.0, 0.3, height_t);
-        let ridge = bark_ridge_profile(cracks.ridge_u, depth_h);
+        // === Texture-based bark (baked from procedural) ===
 
         // Tangent basis (trunk ≈ world Y)
         let trunk_up = vec3<f32>(0.0, 1.0, 0.0);
-        var tangent_theta = cross(normal, trunk_up);
-        if length(tangent_theta) < 0.01 { tangent_theta = vec3<f32>(1.0, 0.0, 0.0); }
-        tangent_theta = normalize(tangent_theta);
-        let tangent_h = normalize(cross(tangent_theta, normal));
+        var T = normalize(cross(normal, trunk_up));
+        if length(T) < 0.01 { T = vec3<f32>(1.0, 0.0, 0.0); }
+        let B = normalize(cross(T, normal));
 
-        let perturbed = normalize(normal
-            + tangent_theta * ridge.normal_perturbation * 0.50 * lod_weight_ridge);
+        // Quality budget: skip bark texture sampling when stylized
+        var bark_a: vec4<f32>;
+        var bark_b: vec4<f32>;
+        var bark_h: f32;
+        var pom_uv = uv;
 
-        // Fiber flow and bundles (LOD-gated)
-        let fiber_dir_full = bark_fiber_flow(theta, h, cracks.nearest_crack_theta,
-                                              cracks.crack_spacing, bark.seed);
-        let fiber_dir = mix(vec2<f32>(0.0, 1.0), fiber_dir_full, lod_weight_flow);
-        let bundles = bark_fiber_bundles(theta, h, R_h, fiber_dir, bark.fiber_density, bark.seed);
+        if art.skip_bark_texture > 0.5 {
+            // Use palette bark color directly — no texture reads
+            bark_a = vec4<f32>(palette.bark.rgb * 0.8 + 0.1, 0.85);
+            bark_b = vec4<f32>(0.5, 0.5, 1.0, 0.0); // neutral normal, no AO baked
+            bark_h = 0.5; // flat height
+        } else {
+            // POM: offset UVs based on view direction through height field
+            let view_world = normalize(camera_pos - world_pos);
+            let view_ts = vec3<f32>(dot(view_world, T), dot(view_world, B), dot(view_world, normal));
+            let pom_dist_fade = 1.0 - smoothstep(8.0, 25.0, cam_dist);
+            // Fade out POM at grazing angles to prevent stepping artifacts
+            let pom_angle_fade = smoothstep(0.2, 0.5, view_ts.z);
+            let pom_fade = pom_dist_fade * pom_angle_fade;
+            if pom_fade > 0.01 {
+                pom_uv = parallax_occlusion_map(uv, view_ts, 0.018 * pom_fade);
+            }
 
-        // Fiber micro-normal (LOD-gated)
-        let fiber_perp = normalize(tangent_theta * perp2d(fiber_dir).x
-                                 + tangent_h * perp2d(fiber_dir).y);
-        var accumulated_normal = normalize(perturbed
-            + fiber_perp * bundles.normal_perturbation * 0.04 * lod_weight_fiber);
+            bark_a = textureSample(bark_albedo_rough, bark_sampler, pom_uv);
+            bark_b = textureSample(bark_normal_ao, bark_sampler, pom_uv);
+            bark_h = textureSample(bark_height, bark_sampler, pom_uv).r;
+        }
 
-        // Surface roughness normals — grit/weathering at high frequency
-        // Two overlapping scales of hash noise perturb the normal everywhere
-        let grit_u1 = hash_smooth(bark.seed + 160u, theta * 45.0 + h * 12.0);
-        let grit_v1 = hash_smooth(bark.seed + 170u, theta * 38.0 - h * 15.0);
-        let grit_u2 = hash_smooth(bark.seed + 180u, theta * 90.0 + h * 28.0);
-        let grit_v2 = hash_smooth(bark.seed + 190u, theta * 75.0 - h * 35.0);
-        // Grit fades slower than fibers — stays visible at mid range
-        let lod_weight_grit = 1.0 - smoothstep(5.0, 35.0, cam_dist);
-        let grit_strength = 0.18 * lod_weight_grit;
-        accumulated_normal = normalize(accumulated_normal
-            + tangent_theta * (grit_u1 * 0.6 + grit_u2 * 0.4) * grit_strength
-            + tangent_h * (grit_v1 * 0.6 + grit_v2 * 0.4) * grit_strength);
+        // Height-driven furrow darkening: deep furrows nearly black, ridges warm
+        // detail_suppression flattens this contrast for stylized looks
+        let ds = art.detail_suppression;
+        let furrow_darken = mix(
+            mix(0.16, 1.0, smoothstep(0.10, 0.42, bark_h)),
+            mix(0.65, 1.0, smoothstep(0.30, 0.55, bark_h)),
+            ds
+        );
+        // Blend textured bark toward flat painted color for stylized looks
+        let textured_bark = bark_a.rgb * furrow_darken;
+        let flat_bark = palette.bark.rgb * 0.85 + 0.12;
+        let bark_color = mix(textured_bark, flat_bark, smoothstep(0.15, 0.6, ds));
+        // Furrows are rougher (more matte), ridges slightly smoother
+        let bark_roughness = bark_a.a + (1.0 - bark_h) * 0.08 * (1.0 - ds);
+        // Height-driven AO: furrows trap light aggressively (flatten when stylized)
+        let height_ao = mix(
+            mix(0.15, 1.0, smoothstep(0.06, 0.30, bark_h)),
+            mix(0.5, 1.0, smoothstep(0.06, 0.30, bark_h)),
+            ds
+        );
+        let bark_ao = bark_b.b * ao * height_ao;
 
-        // Shedding layer (LOD-gated with fiber flow)
-        let shedding = bark_shedding(theta, h, cracks.nearest_crack_theta,
-                                      cracks.crack_spacing, height_t, bark.seed);
-        let shed_amount = shedding.exposed * lod_weight_flow * 0.28;
+        // Unpack tangent-space normal from baked texture
+        var perturbed_normal = normal;
+        if art.skip_normal_perturbation < 0.5 {
+            let tn = bark_b.rg * 2.0 - 1.0;
+            let tn_z = sqrt(max(1.0 - tn.x * tn.x - tn.y * tn.y, 0.0));
+            perturbed_normal = normalize(T * tn.x + B * tn.y + normal * tn_z);
 
-            // --- Multi-scale noise for organic variation (micro_a and patch_noise hoisted above) ---
-            let micro_b = hash_smooth(bark.seed + 117u, theta * 7.3 - h * 5.1);
-            let micro_c = hash_smooth(bark.seed + 131u, theta * 42.0 + h * 11.0);
-            let micro = micro_a * 0.10 + micro_b * 0.07 + micro_c * 0.04;
+            // Runtime micro-detail: fiber noise below texture resolution
+            // Tight distance fade (only visible <8m) + angle fade to prevent banding
+            let detail_dist_fade = smoothstep(10.0, 3.0, cam_dist);
+            let detail_angle_fade = smoothstep(0.15, 0.4, max(dot(normal, view_dir), 0.0));
+            let detail_fade = detail_dist_fade * detail_angle_fade;
+            if detail_fade > 0.01 {
+                let micro = micro_fiber_noise(pom_uv, detail_fade);
+                perturbed_normal = normalize(perturbed_normal + T * micro.x + B * micro.y);
+            }
+        }
 
-            // --- Color palette: warm cinnamon bark with cool, shadowed fissures ---
-            let SUNLIT_OCHRE    = vec3<f32>(0.56, 0.32, 0.14);
-            let REDWOOD_HEART   = vec3<f32>(0.41, 0.18, 0.07);
-            let WARM_BROWN      = vec3<f32>(0.30, 0.13, 0.05);
-            let DEEP_FISSURE    = vec3<f32>(0.10, 0.06, 0.04);
-            let COOL_SOOT       = vec3<f32>(0.14, 0.10, 0.09);
-            let INNER_FIBER     = vec3<f32>(0.47, 0.22, 0.10);
-            let INNER_RUST      = vec3<f32>(0.37, 0.15, 0.07);
+        // Normal map influence — aggressively reduced for cel-shading
+        // At full suppression, normals are nearly geometric (smooth bands)
+        let base_normal_blend = select(0.78, 0.0, art.skip_normal_perturbation > 0.5);
+        let normal_blend = base_normal_blend * (1.0 - ds) * (1.0 - ds);
+        let lighting_normal = normalize(mix(normal, perturbed_normal, normal_blend));
 
-            let age_factor = 1.0 - height_t;
+        // Diffuse with wrap lighting for porous bark
+        let base_NdotL = max(dot(lighting_normal, sun_dir), 0.0);
+        let diffuse_term = sun_color * sun_strength * base_NdotL * shadow;
+        let wrap_dot = dot(lighting_normal, sun_dir) * 0.5 + 0.5;
+        // Suppress wrap fill in deep furrows — they should stay dark
+        let furrow_fill_mask = smoothstep(0.15, 0.50, bark_h);
+        let wrap_fill = sun_color * sun_strength * 0.16 * max(wrap_dot, 0.0) * (1.0 - shadow * 0.5) * furrow_fill_mask;
 
-            // Outer bark — redwood orange in light, deeper brown low on the trunk
-            var outer_color = mix(REDWOOD_HEART, WARM_BROWN, age_factor * 0.36 + patch_noise * 0.18);
-            outer_color = mix(outer_color, DEEP_FISSURE, age_factor * age_factor * 0.34);
-            outer_color = mix(outer_color, SUNLIT_OCHRE, ridge.profile * (0.20 + (1.0 - height_t) * 0.16));
-            outer_color = mix(outer_color, COOL_SOOT, patch_noise * 0.08 * age_factor);
-            outer_color *= (1.0 + micro);
+        // Micro-cavity self-shadowing: normals facing away from light get extra darkening
+        let cavity_shadow = smoothstep(-0.1, 0.3, dot(perturbed_normal, sun_dir));
 
-            // Inner bark (freshly exposed, warmer/redder)
-            let inner_vary = hash_smooth(bark.seed + 50u, theta * 4.0 + h * 0.8) * 0.5 + 0.5;
-            var inner_color = mix(INNER_FIBER, INNER_RUST, inner_vary);
-            inner_color *= (1.0 + micro * 0.5);
+        // Anisotropic specular: fiber-aligned Kajiya-Kay approximation
+        // Tangent direction is approximately trunk_up (vertical fibers)
+        let fiber_tangent = normalize(trunk_up - normal * dot(trunk_up, normal));
+        let TdotH = dot(fiber_tangent, normalize(view_dir + sun_dir));
+        let aniso_spec = pow(sqrt(max(1.0 - TdotH * TdotH, 0.0)), 1.0 / max(bark_roughness * 0.7, 0.05));
+        let aniso_term = aniso_spec * 0.015 * sun_color * sun_strength * base_NdotL * shadow;
 
-            var bark_color = mix(outer_color, inner_color, shed_amount * 0.65);
+        // Isotropic GGX specular (reduced, complementing aniso)
+        let bark_f0 = vec3<f32>(0.04);
+        let spec = specular_brdf(lighting_normal, view_dir, sun_dir, bark_roughness, bark_f0);
+        let specular_term = spec * base_NdotL * sun_color * sun_strength * shadow * 0.6 + aniso_term;
 
-            // Furrow color — darken and cool the deep channels.
-            bark_color = mix(bark_color, DEEP_FISSURE, cracks.furrow_depth * 0.70);
-            bark_color = mix(bark_color, COOL_SOOT, cracks.furrow_depth * 0.22);
+        // Fiber sheen: very subtle warm glow perpendicular to fiber direction
+        let sheen_rough = bark_roughness * 0.85 + 0.15;
+        let sheen_tint = bark_color * 0.3 + vec3<f32>(0.18, 0.08, 0.03);
+        let sheen = sheen_brdf(lighting_normal, view_dir, sun_dir, fiber_tangent, sheen_rough);
+        let sheen_term = sheen_tint * sheen * base_NdotL * sun_color * sun_strength * shadow * 0.03;
 
-            // Keep peeled areas subtle so the bark stays fibrous instead of papery.
-            bark_color *= (1.0 - shedding.edge_shadow * lod_weight_flow * 0.35);
+        // Subsurface scattering — bark is porous, light penetrates ridges
+        let shedding_mask = bark_b.a;
+        let back_scatter = pow(max(dot(view_dir, -sun_dir), 0.0), 3.0);
+        let sss_color = vec3<f32>(0.9, 0.25, 0.04);
+        // SSS suppressed in deep furrows (light can't penetrate there)
+        let sss_height_mask = smoothstep(0.15, 0.45, bark_h);
+        let sss_base = sss_color * 0.04 * (0.3 + 0.7 * back_scatter) * sun_strength * sss_height_mask;
+        let sss_shed = sss_color * shedding_mask * 0.16 * (0.2 + 0.8 * back_scatter) * sun_strength * sss_height_mask;
+        let edge_sss = sss_base + sss_shed;
 
-            // Subsurface Scattering / Translucency on Peeling Edges (Idea 6)
-            let back_scatter = pow(max(dot(view_dir, -sun_dir), 0.0), 4.0);
-            let sss_color = vec3<f32>(1.0, 0.4, 0.05); // Luminous fiery orange
-            let edge_sss = sss_color * shedding.edge_lift * (0.25 + 0.75 * back_scatter) * lod_weight_flow;
-            bark_color += edge_sss;
+        // Ambient with strong AO — deep darks in crevices
+        let bark_ambient = six_face_ambient(perturbed_normal) * bark_ao * bark_ao * 1.18;
 
-            // Fiber color modulation — visible everywhere via color, not just specular
-            let effective_bundle = mix(0.5, bundles.bundle, lod_weight_fiber);
-            bark_color *= (0.96 + 0.09 * effective_bundle);
-
-            // --- Roughness: narrow range, mostly rough ---
-            let outer_roughness = mix(0.78, 0.96, cracks.furrow_depth);
-            let bark_roughness = mix(outer_roughness, 0.70, shed_amount * 0.18);
-
-            // --- Procedural AO — strong in narrow crevices ---
-            let ao_noise = hash_smooth(bark.seed + 140u, theta * 5.0 + h * 1.3) * 0.1;
-            let furrow_ao = 1.0 - cracks.furrow_depth * (0.70 + ao_noise);
-            let ridge_cavity = 1.0 - (1.0 - cracks.ridge_u) * 0.08;
-            let bundle_ao_raw = bundles.bundle * 0.2 + 0.8;
-            let bundle_ao = mix(1.0, bundle_ao_raw, lod_weight_fiber);
-            let bark_ao = ao * furrow_ao * ridge_cavity * bundle_ao;
-
-            // --- Lighting ---
-            let lighting_normal = normalize(mix(normal, accumulated_normal, 0.34));
-            let base_NdotL = max(dot(lighting_normal, sun_dir), 0.0);
-            let diffuse_term = sun_color * sun_strength * base_NdotL * shadow;
-            // Wrap lighting: fills shadow side with warm scattered light
-            let wrap_dot = dot(lighting_normal, sun_dir) * 0.4 + 0.6;
-            let wrap_fill = sun_color * sun_strength * 0.15 * max(wrap_dot, 0.0);
-
-            // Specular: Anisotropic Kajiya-Kay highlights along fibers (Idea 4)
-            let spec_power = mix(36.0, 10.0, bark_roughness);
-            let spec_intensity = mix(0.032, 0.007, bark_roughness) * 2.0;
-            let half_dir = normalize(sun_dir + view_dir);
-            let fiber_tangent = normalize(tangent_theta * fiber_dir.x + tangent_h * fiber_dir.y);
-            let dot_TH = dot(fiber_tangent, half_dir);
-            let sin_TH = sqrt(max(1.0 - dot_TH * dot_TH, 0.0));
-            let spec = pow(max(sin_TH, 0.0), spec_power) * spec_intensity;
-
-            // Ambient: perturbed normal for subtle directional variation
-        let bark_ambient = six_face_ambient(accumulated_normal) * bark_ao * 1.3;
-
-        let full_lit = bark_color * (bark_ambient + diffuse_term + wrap_fill)
-            + sun_color * spec * shadow;
-
-        let bark_lod_blend = clamp(lod_weight_ridge, 0.0, 1.0);
-        color = mix(distant_lit, full_lit, bark_lod_blend);
-        final_normal = normalize(mix(normal, accumulated_normal, bark_lod_blend));
+        color = bark_color * (bark_ambient + (diffuse_term + wrap_fill) * cavity_shadow)
+            + apply_specular_flatten(specular_term + sheen_term, art.specular_flattening) + edge_sss;
+        final_normal = perturbed_normal;
     } else {
         // === Standard PBR pipeline (foliage + ground) ===
         var roughness: f32;
@@ -780,9 +1004,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         var sss_strength: f32;
 
         if material == MATERIAL_FOLIAGE {
-            roughness = 0.55;
+            roughness = 0.74;
             metallic = 0.0;
-            f0 = vec3<f32>(0.04);
+            f0 = vec3<f32>(0.025);
             sss_strength = 0.35;
         } else {
             // Ground
@@ -798,23 +1022,49 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         let kD = (1.0 - metallic) * base_color / PI;
         let diffuse = kD * NdotL * sun_color * sun_strength * shadow;
 
-        // Specular: Cook-Torrance GGX
+        // Specular: Cook-Torrance GGX (art direction can flatten)
         let spec = specular_brdf(normal, view_dir, sun_dir, roughness, f0);
-        let specular = spec * NdotL * sun_color * sun_strength * shadow;
+        let specular = apply_specular_flatten(
+            spec * NdotL * sun_color * sun_strength * shadow,
+            art.specular_flattening
+        );
 
         // Ambient: 6-face directional probe x AO
         let ambient = six_face_ambient(normal) * ao * base_color;
 
-        // Sky fill: hemisphere-weighted sky tint
-        let sky = sky_color_dir(reflect(-view_dir, normal));
+        // Sky fill: hemisphere-weighted sky tint (LUT-based for consistency)
+        let sky = sample_sky_lut(reflect(-view_dir, normal));
         let sky_fill = sky * 0.04 * ao;
 
-        // Subsurface scattering for foliage
+        // Two-sided foliage transmission
         var sss = vec3<f32>(0.0);
-        if sss_strength > 0.0 {
-            let sss_dot = max(dot(-normal, sun_dir), 0.0);
-            let sss_term = pow(sss_dot, 3.0) * sss_strength;
-            sss = sss_term * vec3<f32>(0.15, 0.25, 0.05) * sun_color * sun_strength * (1.0 - shadow * 0.7);
+        var diffuse_term = diffuse;
+        var ambient_term = ambient;
+        var sky_fill_term = sky_fill;
+        if material == MATERIAL_FOLIAGE {
+            // Flip normal for back-facing fragments
+            var foliage_normal = normal;
+            if dot(normal, view_dir) < 0.0 {
+                foliage_normal = -normal;
+            }
+
+            // View-dependent transmission (NOT gated by shadow map)
+            let subsurface_color = vec3<f32>(0.46, 0.60, 0.16);
+            let transmission = subsurface_color
+                * pow(max(dot(view_dir, -sun_dir), 0.0), 4.0)
+                * sun_color * sun_strength * 0.75;
+
+            // Translucent shadow — foliage doesn't fully block light
+            let thin_shadow = max(shadow, 0.55);
+
+            // Diffuse with wrap lighting
+            let wrap_NdotL = dot(foliage_normal, sun_dir) * 0.3 + 0.7;
+            let foliage_diffuse = kD * max(wrap_NdotL, 0.0) * sun_color * sun_strength * thin_shadow;
+
+            diffuse_term = mix(diffuse, foliage_diffuse, 0.92);
+            ambient_term = ambient * (1.10 + max(normal.y, 0.0) * 0.38);
+            sky_fill_term = sky_fill * 2.20;
+            sss = transmission * sss_strength;
         }
 
         // Ground contact shadow & root zone
@@ -830,16 +1080,47 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         var extra = vec3<f32>(0.0);
         if material == MATERIAL_FOLIAGE {
             let rim = pow(1.0 - max(dot(normal, view_dir), 0.0), 2.0);
-            extra = rim * vec3<f32>(0.001, 0.002, 0.0015);
+            extra = rim * vec3<f32>(0.010, 0.014, 0.006);
         }
 
+        // Ground bounce: sunlit earth scatters warm light upward
+        let ground_bounce_color = vec3<f32>(0.06, 0.045, 0.025);
+        let ground_facing = max(-normal.y, 0.0);
+        let ground_bounce = ground_bounce_color * ground_facing * sun_strength;
+
+        // Canopy scatter: filtered green light under tree
+        let canopy_top = bark.trunk_height * 0.9;
+        let under_canopy = smoothstep(canopy_top, canopy_top - 12.0, world_pos.y);
+        let canopy_scatter = vec3<f32>(0.012, 0.020, 0.008) * under_canopy * sun_strength;
+
         // Compose lighting
-        color = (ambient + diffuse + specular + sky_fill + sss + extra) * ground_darken;
+        color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra) * ground_darken
+              + (ground_bounce + canopy_scatter) * ao;
     }
 
-    // -- Fog with aerial perspective --
+    // -- Art Direction Style Transforms --
+    // Applied after PBR lighting, before fog. All no-ops at identity (default values).
+    // (Light banding is applied earlier, to NdotL, for correct cel-shading)
+
+    // 1. Shadow color shift — only on trunk/foliage (ground keeps warm shadow)
+    if material != MATERIAL_GROUND {
+        color = apply_shadow_color_shift(color, NdotL, shadow, art.shadow_color_shift.rgb);
+    }
+
+    // 2. Rim lighting
+    color += compute_rim_light(final_normal, view_dir, art.rim_light_strength, art.rim_light_color.rgb);
+
+    // 4. Palette remap
+    color = apply_palette_remap(color, material, art.color_discipline);
+
+    // -- Aerial perspective from shared atmosphere model --
+    // Height fog provides the distance-based opacity curve.
+    // The inscatter color comes from the same sky LUT as the sky pass.
+    // Lift sub-horizon directions gradually so distant ground converges toward
+    // lower-sky haze instead of a hard horizon-color band.
     let fog_factor = height_fog(world_pos, cam_dist, material);
-    let aerial = mix(uniforms.fog_color.rgb, sky_color_dir(normalize(world_pos - camera_pos)), 0.3);
+    let fog_dir = normalize(world_pos - camera_pos);
+    let aerial = sample_aerial_sky(fog_dir);
     color = mix(color, aerial, fog_factor);
 
     // -- Apply exposure --

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod art_direction;
 pub mod camera;
 pub mod compiler;
 pub mod gpu;

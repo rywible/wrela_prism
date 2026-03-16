@@ -10,15 +10,17 @@ struct FrameUniforms {
 };
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 
-// Vertex with scalar fields to match Rust's 40-byte #[repr(C)] layout.
+// Vertex with scalar fields to match Rust's 48-byte #[repr(C)] layout.
 // WGSL vec3<f32> has 16-byte alignment in storage buffers, which would
 // add padding and mismatch the Rust struct. Scalar fields avoid this.
 struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
     nor_x: f32, nor_y: f32, nor_z: f32,
     material: u32,
+    feature_id: u32,
     uv_x: f32, uv_y: f32,
     ao: f32,
+    semantic_channels: u32,
 };
 
 struct MeshletDescriptor {

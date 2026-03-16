@@ -5,6 +5,7 @@
 
 use glam::Vec3;
 
+use crate::art_direction::pack_semantic_channels;
 use crate::scene::{Vertex, MATERIAL_TRUNK};
 use crate::subjects::redwood_growth::{BranchKind, RedwoodParams, SkeletonNode, TreeSkeleton};
 use crate::util::hash01;
@@ -143,11 +144,7 @@ struct TubeFrame {
 }
 
 /// Build twist-free reference frames along a path of skeleton nodes.
-fn build_tube_frames(
-    nodes: &[SkeletonNode],
-    path: &[usize],
-    trunk_height: f32,
-) -> Vec<TubeFrame> {
+fn build_tube_frames(nodes: &[SkeletonNode], path: &[usize], trunk_height: f32) -> Vec<TubeFrame> {
     if path.is_empty() {
         return Vec::new();
     }
@@ -236,8 +233,7 @@ fn bark_profile(seed: u32, frame: &TubeFrame, around_t: f32, is_main_trunk: bool
         .wrapping_add((around_t * 100.0) as u32);
     let noise = signed_hash(noise_seed) * if is_main_trunk { 0.008 } else { 0.010 };
 
-    let scale =
-        1.0 + macro_wave + primary_furrow + secondary_furrow + noise;
+    let scale = 1.0 + macro_wave + primary_furrow + secondary_furrow + noise;
     scale.clamp(0.84, 1.20)
 }
 
@@ -273,7 +269,32 @@ fn append_tube_along_path(
     let base_vert = verts.len() as u32;
 
     // Emit rings.
-    for frame in frames.iter() {
+    for (fi, frame) in frames.iter().enumerate() {
+        // Compute curvature from radius change between adjacent frames
+        let curvature = if frames.len() >= 2 {
+            let prev_r = if fi > 0 {
+                frames[fi - 1].radius
+            } else {
+                frame.radius
+            };
+            let next_r = if fi + 1 < frames.len() {
+                frames[fi + 1].radius
+            } else {
+                frame.radius
+            };
+            ((prev_r - next_r).abs() / max_radius.max(0.01)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let edge_sharpness = if fi == 0 || fi == frames.len() - 1 {
+            0.9 // High at junctions/tips
+        } else {
+            0.3 + curvature * 0.4
+        };
+        let surface_noise = 0.5; // Moderate — bark is textured
+        let importance = (frame.radius / max_radius.max(0.01)).clamp(0.0, 1.0);
+        let sc = pack_semantic_channels(curvature, edge_sharpness, surface_noise, importance);
+
         for s in 0..=sides {
             let around_t = s as f32 / sides as f32;
             let theta = around_t * std::f32::consts::TAU;
@@ -293,8 +314,10 @@ fn append_tube_along_path(
                 position: position.into(),
                 normal: [normal.x, normal.y, normal.z],
                 material: MATERIAL_TRUNK,
+                feature_id: 0,
                 uv: [u, v],
                 ao,
+                semantic_channels: sc,
             });
         }
     }
@@ -332,11 +355,7 @@ fn append_branch_collar(
         return;
     }
 
-    let arbitrary = if dir.y.abs() > 0.9 {
-        Vec3::X
-    } else {
-        Vec3::Y
-    };
+    let arbitrary = if dir.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
     let right = dir.cross(arbitrary).normalize();
     let up = right.cross(dir).normalize();
 
@@ -358,6 +377,10 @@ fn append_branch_collar(
         0.0
     };
 
+    // Collar semantic channels: high edge_sharpness at branch junction
+    let collar_importance = (branch_radius / parent_radius.max(0.01)).clamp(0.0, 1.0);
+    let collar_sc = pack_semantic_channels(0.6, 0.9, 0.5, collar_importance);
+
     // Ring 0: at root, flared radius.
     for s in 0..=sides {
         let around_t = s as f32 / sides as f32;
@@ -372,8 +395,10 @@ fn append_branch_collar(
             position: position.into(),
             normal: [normal.x, normal.y, normal.z],
             material: MATERIAL_TRUNK,
+            feature_id: 0,
             uv: [around_t, height_ratio_root],
             ao,
+            semantic_channels: collar_sc,
         });
     }
 
@@ -391,8 +416,10 @@ fn append_branch_collar(
             position: position.into(),
             normal: [normal.x, normal.y, normal.z],
             material: MATERIAL_TRUNK,
+            feature_id: 0,
             uv: [around_t, height_ratio_end],
             ao,
+            semantic_channels: collar_sc,
         });
     }
 
@@ -422,11 +449,7 @@ fn append_cap_disk(
         return;
     }
 
-    let arbitrary = if axis.y.abs() > 0.9 {
-        Vec3::X
-    } else {
-        Vec3::Y
-    };
+    let arbitrary = if axis.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
     let right = axis.cross(arbitrary).normalize();
     let up = right.cross(axis).normalize();
 
@@ -437,14 +460,18 @@ fn append_cap_disk(
         0.0
     };
     let ao = 1.0;
+    // Cap disk: low importance, high edge at tip
+    let cap_sc = pack_semantic_channels(0.1, 0.7, 0.3, 0.2);
 
     let center_idx = verts.len() as u32;
     verts.push(Vertex {
         position: center.into(),
         normal: [axis.x, axis.y, axis.z],
         material: MATERIAL_TRUNK,
+        feature_id: 0,
         uv: [0.5, height_ratio],
         ao,
+        semantic_channels: cap_sc,
     });
 
     for s in 0..sides {
@@ -455,8 +482,10 @@ fn append_cap_disk(
             position: position.into(),
             normal: [axis.x, axis.y, axis.z],
             material: MATERIAL_TRUNK,
+            feature_id: 0,
             uv: [0.5 + theta.cos() * 0.5, height_ratio],
             ao,
+            semantic_channels: cap_sc,
         });
     }
 
@@ -481,7 +510,10 @@ pub fn build_trunk_mesh(params: &RedwoodParams) -> (Vec<Vertex>, Vec<u32>) {
 }
 
 /// Build trunk mesh from a pre-built skeleton (avoids rebuilding when skeleton is shared).
-pub(crate) fn build_trunk_mesh_from_skeleton(params: &RedwoodParams, skeleton: &TreeSkeleton) -> (Vec<Vertex>, Vec<u32>) {
+pub(crate) fn build_trunk_mesh_from_skeleton(
+    params: &RedwoodParams,
+    skeleton: &TreeSkeleton,
+) -> (Vec<Vertex>, Vec<u32>) {
     let children = build_children_index(skeleton);
 
     let mut verts = Vec::new();
@@ -549,20 +581,20 @@ pub(crate) fn build_trunk_mesh_from_skeleton(params: &RedwoodParams, skeleton: &
         let first_node = &skeleton.nodes[path[0]];
         if !matches!(first_node.kind, BranchKind::Buttress) {
             if let Some(parent_idx) = first_node.parent {
-            let parent_pos = skeleton.nodes[parent_idx].position;
-            let parent_radius = skeleton.nodes[parent_idx].radius;
-            let branch_radius = first_node.radius;
-            append_branch_collar(
-                &mut verts,
-                &mut indices,
-                parent_pos,
-                first_node.position,
-                parent_radius,
-                branch_radius,
-                branch_seed,
-                path_i as u32,
-                params.trunk_height,
-            );
+                let parent_pos = skeleton.nodes[parent_idx].position;
+                let parent_radius = skeleton.nodes[parent_idx].radius;
+                let branch_radius = first_node.radius;
+                append_branch_collar(
+                    &mut verts,
+                    &mut indices,
+                    parent_pos,
+                    first_node.position,
+                    parent_radius,
+                    branch_radius,
+                    branch_seed,
+                    path_i as u32,
+                    params.trunk_height,
+                );
             }
         }
 
@@ -690,11 +722,21 @@ mod tests {
         // 2 rings * (sides + 1) columns (extra column for UV seam wrap)
         let sides = segment_sides(1.0);
         let ring_columns = sides + 1;
-        assert_eq!(verts.len(), 2 * ring_columns, "expected 2 rings of {} vertices", ring_columns);
+        assert_eq!(
+            verts.len(),
+            2 * ring_columns,
+            "expected 2 rings of {} vertices",
+            ring_columns
+        );
 
         // (ring_count - 1) * sides * 6 indices (2 triangles per quad, 3 indices per tri)
         let expected_indices = 1 * sides * 6;
-        assert_eq!(indices.len(), expected_indices, "expected {} indices", expected_indices);
+        assert_eq!(
+            indices.len(),
+            expected_indices,
+            "expected {} indices",
+            expected_indices
+        );
 
         // All indices in bounds.
         for &idx in &indices {
@@ -708,16 +750,16 @@ mod tests {
 
         // All materials are MATERIAL_TRUNK.
         for v in &verts {
-            assert_eq!(v.material, MATERIAL_TRUNK, "all vertices should be trunk material");
+            assert_eq!(
+                v.material, MATERIAL_TRUNK,
+                "all vertices should be trunk material"
+            );
         }
 
         // All normals are finite and roughly unit length.
         for v in &verts {
             let n = Vec3::from(v.normal);
-            assert!(
-                n.is_finite(),
-                "normal should be finite"
-            );
+            assert!(n.is_finite(), "normal should be finite");
             assert!(
                 (n.length() - 1.0).abs() < 0.1,
                 "normal should be roughly unit length, got {}",

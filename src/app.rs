@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tracing::{error, info};
@@ -14,6 +14,7 @@ use winit::{
     window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
+use crate::art_direction::ArtDirection;
 use crate::camera::CameraState;
 use crate::compiler::{CompiledScene, SceneCompiler};
 use crate::gpu::GpuContext;
@@ -31,10 +32,12 @@ pub struct App {
 #[derive(Debug)]
 struct AppOptions {
     capture_on_launch: Option<PathBuf>,
-    capture_size: Option<(u32, u32)>,
+    warmup_frames: Option<u32>,
     preset: LookDevPreset,
     camera_overrides: CameraOverrides,
     seed: Option<u64>,
+    style: Option<String>,
+    style_blend: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,9 +62,10 @@ struct RuntimeState {
     start_time: Instant,
     last_frame_instant: Instant,
     pending_capture_path: Option<PathBuf>,
-    _pending_capture_size: Option<(u32, u32)>,
     exit_after_capture: bool,
+    warmup_remaining: u32,
     debug_overlay: crate::pipeline::DebugOverlay,
+    art_direction: ArtDirection,
 }
 
 impl RuntimeState {
@@ -103,11 +107,14 @@ impl RuntimeState {
         let bark_params = crate::material::procedural::BarkParams::from_redwood(&redwood_params);
         renderer.write_bark_params(&gpu.queue, &bark_params);
 
-        let source_scene =
-            crate::source_scene::SourceSceneBuilder::redwood_soundstage(&stage_config.layout, options.seed);
+        let source_scene = crate::source_scene::SourceSceneBuilder::redwood_soundstage(
+            &stage_config.layout,
+            options.seed,
+        );
         let compiled_scene = SceneCompiler::new().compile(&source_scene);
         let residency = SceneResidencyManager::new(&compiled_scene.runtime_scene);
-        let runtime_scene_gpu = RuntimeSceneGpu::upload(&gpu, &compiled_scene, &residency);
+        let runtime_scene_gpu =
+            RuntimeSceneGpu::upload(&gpu, &compiled_scene, &residency, &bark_params);
         renderer.resize(&gpu, &runtime_scene_gpu);
 
         info!(
@@ -119,8 +126,38 @@ impl RuntimeState {
             runtime_scene_gpu.dag.meshlets.len(),
         );
 
+        // Initialize art direction from CLI --style flag
+        let art_direction = if let Some(ref style_name) = options.style {
+            if let Some(snapshot) = ArtDirection::find_style(style_name) {
+                let blend = options.style_blend.unwrap_or(1.0);
+                let blended = crate::art_direction::blend_snapshots(
+                    &crate::art_direction::IDENTITY,
+                    snapshot,
+                    blend,
+                );
+                info!("art direction: style '{}' (blend={:.2})", style_name, blend);
+                ArtDirection::from_snapshot(&blended)
+            } else {
+                error!("unknown style '{}', using identity", style_name);
+                ArtDirection::new()
+            }
+        } else {
+            ArtDirection::new()
+        };
+
         let now = Instant::now();
         info!("wrela_prism initialized — {}x{}", size.width, size.height);
+
+        // Warmup frames: 48 default for captures gives ~99.5% cloud temporal convergence
+        // (0.9^48 ≈ 0.005 remaining from initial frame). Override with --warmup-frames.
+        let warmup_remaining =
+            options
+                .warmup_frames
+                .unwrap_or(if options.capture_on_launch.is_some() {
+                    48
+                } else {
+                    0
+                });
 
         Ok(Self {
             window,
@@ -137,10 +174,20 @@ impl RuntimeState {
             start_time: now,
             last_frame_instant: now,
             pending_capture_path: options.capture_on_launch.clone(),
-            _pending_capture_size: options.capture_size,
             exit_after_capture: options.capture_on_launch.is_some(),
+            warmup_remaining,
             debug_overlay: crate::pipeline::DebugOverlay::default(),
+            art_direction,
         })
+    }
+
+    fn toggle_debug_overlay(&mut self, target: crate::pipeline::DebugOverlay) {
+        self.debug_overlay = if self.debug_overlay == target {
+            crate::pipeline::DebugOverlay::None
+        } else {
+            target
+        };
+        info!("debug overlay: {:?}", self.debug_overlay);
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -221,6 +268,24 @@ impl RuntimeState {
         let dt = self.frame_delta_secs();
         self.apply_camera_input(dt);
 
+        // Update art direction (advance transitions, upload uniforms to GPU)
+        self.art_direction.update(
+            Duration::from_secs_f32(dt),
+            &self.gpu.queue,
+            self.renderer.art_direction_buffer(),
+            self.renderer.art_direction_palette_buffer(),
+        );
+        self.renderer
+            .set_outline_skip(self.art_direction.should_skip_outline());
+        let post = self.art_direction.post_params();
+        self.renderer.set_art_direction_post(
+            post.bloom_tint,
+            post.bloom_softness,
+            post.color_grade,
+        );
+        self.renderer
+            .set_lod_bias(self.art_direction.quality_budget.lod_bias);
+
         let elapsed = self.elapsed_secs();
         let frame_inputs = FrameInputs {
             gpu: &self.gpu,
@@ -231,13 +296,25 @@ impl RuntimeState {
         };
         match self.renderer.render(&self.runtime_scene_gpu, &frame_inputs) {
             Ok(()) => {
+                // Warmup frames: render normally but defer capture
+                if self.warmup_remaining > 0 {
+                    self.warmup_remaining -= 1;
+                    if self.warmup_remaining > 0 {
+                        return; // keep rendering warmup frames
+                    }
+                }
                 if let Some(path) = self.pending_capture_path.take() {
                     match self.renderer.capture_frame(&self.gpu, elapsed) {
                         Ok(captured) => {
                             if let Err(e) = write_png(&path, &captured) {
                                 error!("capture failed: {e:#}");
                             } else {
-                                info!("captured {}x{} → {}", captured.width, captured.height, path.display());
+                                info!(
+                                    "captured {}x{} → {}",
+                                    captured.width,
+                                    captured.height,
+                                    path.display()
+                                );
                             }
                         }
                         Err(e) => error!("capture failed: {e:#}"),
@@ -301,45 +378,72 @@ impl ApplicationHandler for App {
                     if event.state == ElementState::Pressed {
                         match code {
                             KeyCode::Escape => runtime.release_cursor(),
-                            KeyCode::F1 => {
-                                runtime.debug_overlay = if runtime.debug_overlay
-                                    == crate::pipeline::DebugOverlay::StructureOnly
-                                {
-                                    crate::pipeline::DebugOverlay::None
-                                } else {
-                                    crate::pipeline::DebugOverlay::StructureOnly
-                                };
-                                info!("debug overlay: {:?}", runtime.debug_overlay);
+                            KeyCode::F1 => runtime
+                                .toggle_debug_overlay(crate::pipeline::DebugOverlay::StructureOnly),
+                            KeyCode::F2 => runtime
+                                .toggle_debug_overlay(crate::pipeline::DebugOverlay::CanopyOnly),
+                            KeyCode::F3 => runtime
+                                .toggle_debug_overlay(crate::pipeline::DebugOverlay::WindMagnitude),
+                            KeyCode::F4 => runtime
+                                .toggle_debug_overlay(crate::pipeline::DebugOverlay::LodHeatmap),
+                            KeyCode::F5 => {
+                                let styles = ArtDirection::named_styles();
+                                runtime.art_direction.named_style_index =
+                                    (runtime.art_direction.named_style_index + 1) % styles.len();
+                                let (name, snapshot) =
+                                    &styles[runtime.art_direction.named_style_index];
+                                runtime.art_direction.transition_to(
+                                    snapshot,
+                                    Duration::from_millis(500),
+                                    crate::art_direction::EaseCurve::EaseInOut,
+                                );
+                                info!("art direction: transitioning to '{}'", name);
                             }
-                            KeyCode::F2 => {
-                                runtime.debug_overlay = if runtime.debug_overlay
-                                    == crate::pipeline::DebugOverlay::CanopyOnly
-                                {
-                                    crate::pipeline::DebugOverlay::None
-                                } else {
-                                    crate::pipeline::DebugOverlay::CanopyOnly
-                                };
-                                info!("debug overlay: {:?}", runtime.debug_overlay);
+                            KeyCode::F6 => {
+                                let axes = runtime.art_direction.current_axes();
+                                info!(
+                                    "art direction axes: soft={:.2} exag={:.2} shadow={:.2} warm={:.2} atmo={:.2} detail={:.2} outline={:.2} palette={:.2}",
+                                    axes.softness, axes.exaggeration, axes.shadow_graphicness,
+                                    axes.palette_warmth, axes.atmospheric_depth, axes.surface_detail,
+                                    axes.outline_presence, axes.color_discipline
+                                );
                             }
-                            KeyCode::F3 => {
-                                runtime.debug_overlay = if runtime.debug_overlay
-                                    == crate::pipeline::DebugOverlay::WindMagnitude
-                                {
-                                    crate::pipeline::DebugOverlay::None
-                                } else {
-                                    crate::pipeline::DebugOverlay::WindMagnitude
-                                };
-                                info!("debug overlay: {:?}", runtime.debug_overlay);
+                            KeyCode::BracketLeft | KeyCode::BracketRight => {
+                                let styles = ArtDirection::named_styles();
+                                let idx = runtime.art_direction.named_style_index;
+                                if idx > 0 {
+                                    let (name, target) = &styles[idx];
+                                    let delta = if code == KeyCode::BracketRight {
+                                        0.1
+                                    } else {
+                                        -0.1
+                                    };
+                                    let axes = runtime.art_direction.current_axes();
+                                    // Use outline_presence as a proxy for overall blend level
+                                    let current_blend = axes.outline_presence
+                                        / target.axes.outline_presence.max(0.01);
+                                    let new_blend = (current_blend + delta).clamp(0.0, 1.0);
+                                    let blended = crate::art_direction::blend_snapshots(
+                                        &crate::art_direction::IDENTITY,
+                                        target,
+                                        new_blend,
+                                    );
+                                    runtime.art_direction.transition_to(
+                                        &blended,
+                                        Duration::from_millis(100),
+                                        crate::art_direction::EaseCurve::Linear,
+                                    );
+                                    info!("art direction: blend '{}' = {:.1}", name, new_blend);
+                                }
                             }
-                            KeyCode::F4 => {
-                                runtime.debug_overlay = if runtime.debug_overlay
-                                    == crate::pipeline::DebugOverlay::LodHeatmap
-                                {
-                                    crate::pipeline::DebugOverlay::None
-                                } else {
-                                    crate::pipeline::DebugOverlay::LodHeatmap
-                                };
-                                info!("debug overlay: {:?}", runtime.debug_overlay);
+                            KeyCode::Digit0 => {
+                                runtime.art_direction.transition_to(
+                                    &crate::art_direction::IDENTITY,
+                                    Duration::from_millis(300),
+                                    crate::art_direction::EaseCurve::EaseOut,
+                                );
+                                runtime.art_direction.named_style_index = 0;
+                                info!("art direction: resetting to identity");
                             }
                             _ => {}
                         }
@@ -450,17 +554,6 @@ impl AppOptions {
                     };
                     options.seed = Some(value.parse()?);
                 }
-                "--capture-size" => {
-                    let Some(size) = args.next() else {
-                        bail!("--capture-size requires WIDTHxHEIGHT");
-                    };
-                    let Some((w, h)) = size.split_once('x') else {
-                        bail!("invalid capture size '{size}', expected WIDTHxHEIGHT");
-                    };
-                    let w: u32 = w.parse()?;
-                    let h: u32 = h.parse()?;
-                    options.capture_size = Some((w, h));
-                }
                 "--camera-yaw" => {
                     let Some(value) = args.next() else {
                         bail!("--camera-yaw requires degrees");
@@ -480,6 +573,24 @@ impl AppOptions {
                         bail!("--camera-position requires x,y,z");
                     };
                     options.camera_overrides.position = Some(parse_camera_position(&value)?);
+                }
+                "--style" => {
+                    let Some(name) = args.next() else {
+                        bail!("--style requires a style name (identity, demon_slayer)");
+                    };
+                    options.style = Some(name);
+                }
+                "--warmup-frames" => {
+                    let Some(value) = args.next() else {
+                        bail!("--warmup-frames requires a u32 value");
+                    };
+                    options.warmup_frames = Some(value.parse()?);
+                }
+                "--style-blend" => {
+                    let Some(value) = args.next() else {
+                        bail!("--style-blend requires a float (0.0-1.0)");
+                    };
+                    options.style_blend = Some(value.parse()?);
                 }
                 other => bail!("unrecognized argument: {other}"),
             }
@@ -509,10 +620,12 @@ impl Default for AppOptions {
     fn default() -> Self {
         Self {
             capture_on_launch: None,
-            capture_size: None,
+            warmup_frames: None,
             preset: LookDevPreset::hero_default(),
             camera_overrides: CameraOverrides::default(),
             seed: None,
+            style: None,
+            style_blend: None,
         }
     }
 }
@@ -562,5 +675,4 @@ mod tests {
                 < 0.0001
         );
     }
-
 }

@@ -18,8 +18,10 @@ struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
     nor_x: f32, nor_y: f32, nor_z: f32,
     material: u32,
+    feature_id: u32,
     uv_x: f32, uv_y: f32,
     ao: f32,
+    semantic_channels: u32,
 };
 
 struct MeshletDescriptor {

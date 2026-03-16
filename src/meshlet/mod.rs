@@ -19,8 +19,10 @@ pub(crate) fn make_grid(n: usize) -> (Vec<crate::scene::Vertex>, Vec<u32>) {
                 position: [x as f32, 0.0, z as f32],
                 normal: [0.0, 1.0, 0.0],
                 material: MATERIAL_TRUNK,
+                feature_id: 0,
                 uv: [x as f32 / n as f32, z as f32 / n as f32],
                 ao: 1.0,
+                semantic_channels: 0,
             });
         }
     }

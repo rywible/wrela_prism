@@ -1,17 +1,23 @@
+use crate::art_direction::{ArtDirectionUniforms, StylePalette};
 use crate::camera::CameraState;
-use crate::gpu::GpuContext;
+use crate::gpu::{GpuContext, GpuTimingContext};
 use crate::runtime_scene::RuntimeSceneGpu;
-use crate::scene::shadow::{compute_light_vp, ShadowMap};
+use crate::scene::shadow::{compute_all_cascade_vps, ShadowMap};
 use crate::scene::{LightingUniforms, SceneSettings};
 
 use super::bloom_pass::BloomPass;
+use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
 use super::hw_raster_pass::{DispatchLists, HwRasterPass, VisbufFrameUniforms, VisibilityBuffer};
 use super::hzb_pass::HzbPass;
 use super::material_pass::MaterialPass;
+use super::noise_textures::NoiseTextures;
+use super::outline_pass::OutlinePass;
 use super::shadow_pass::ShadowPass;
+use super::sky_lut_pass::SkyLutPass;
 use super::sky_pass::SkyPass;
 use super::ssao_pass::SsaoPass;
+use super::ssgi_pass::SsgiPass;
 use super::sun_shaft_pass::SunShaftPass;
 use super::sw_raster_pass::SwRasterPass;
 use super::tonemap_pass::TonemapPass;
@@ -32,9 +38,13 @@ pub struct VisbufPipeline {
 
     // Existing passes (kept)
     pub shadow_pass: ShadowPass,
+    pub sky_lut_pass: SkyLutPass,
     pub sky_pass: SkyPass,
+    pub cloud_pass: CloudPass,
+    pub ssgi_pass: Option<SsgiPass>,
     pub ssao_pass: Option<SsaoPass>,
     pub sun_shaft_pass: SunShaftPass,
+    pub outline_pass: OutlinePass,
     pub bloom_pass: Option<BloomPass>,
     pub tonemap_pass: TonemapPass,
 
@@ -66,10 +76,32 @@ pub struct VisbufPipeline {
     // Bark params uniform buffer (procedural bark material)
     pub bark_uniform_buffer: wgpu::Buffer,
 
+    // Art direction uniform buffers + bind group
+    pub art_direction_buffer: wgpu::Buffer,
+    pub art_direction_palette_buffer: wgpu::Buffer,
+    pub art_direction_bgl: wgpu::BindGroupLayout,
+    pub art_direction_bg: wgpu::BindGroup,
+    pub art_direction_outline_skip: bool,
+    pub art_direction_bloom_tint: [f32; 3],
+    pub art_direction_bloom_softness: f32,
+    pub art_direction_color_grade: [f32; 4],
+    pub art_direction_lod_bias: f32,
+
     // Depth copy (Depth32Float → R32Float via compute)
     depth_copy_pipeline: wgpu::ComputePipeline,
     depth_copy_bgl: wgpu::BindGroupLayout,
     depth_copy_bg: Option<wgpu::BindGroup>,
+
+    // Alpha fixup (clear vis_buffer for alpha-failed pixels)
+    alpha_fixup_pipeline: wgpu::ComputePipeline,
+    alpha_fixup_bgl: wgpu::BindGroupLayout,
+    alpha_fixup_bg: Option<wgpu::BindGroup>,
+
+    // 3D noise textures for volumetric clouds
+    pub noise_textures: NoiseTextures,
+
+    // GPU timing (None if TIMESTAMP_QUERY unsupported)
+    pub timing: Option<GpuTimingContext>,
 }
 
 impl VisbufPipeline {
@@ -88,16 +120,14 @@ impl VisbufPipeline {
             hw_raster.frame_bind_group_layout(),
             hw_raster.mesh_bind_group_layout(),
         );
-        let material_pass = MaterialPass::new(
-            &gpu.device,
-            hw_raster.mesh_bind_group_layout(),
-            gpu.width(),
-            gpu.height(),
-        );
         let mut hzb_pass = HzbPass::new(&gpu.device);
         hzb_pass.resize(&gpu.device, gpu.width(), gpu.height());
 
         let sky_pass = SkyPass::new(&gpu.device);
+        let sky_lut_pass = SkyLutPass::new(&gpu.device);
+        let noise_textures = NoiseTextures::new(&gpu.device);
+        let cloud_pass = CloudPass::new(&gpu.device, gpu.width(), gpu.height());
+        let ssgi_pass = Some(SsgiPass::new(&gpu.device, gpu.width(), gpu.height()));
         let ssao_pass = Some(SsaoPass::new(&gpu.device, gpu.width(), gpu.height()));
         let sun_shaft_pass = SunShaftPass::new(gpu);
         let bloom_pass = Some(BloomPass::new(&gpu.device, gpu.width(), gpu.height()));
@@ -125,6 +155,70 @@ impl VisbufPipeline {
             mapped_at_creation: false,
         });
 
+        // Art direction uniform buffers
+        let art_direction_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visbuf-art-direction-uniforms"),
+            size: std::mem::size_of::<ArtDirectionUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let art_direction_palette_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visbuf-art-direction-palette"),
+            size: std::mem::size_of::<StylePalette>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let art_direction_bgl =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("art-direction-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let art_direction_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("art-direction-bg"),
+            layout: &art_direction_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: art_direction_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: art_direction_palette_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let material_pass = MaterialPass::new(
+            &gpu.device,
+            hw_raster.mesh_bind_group_layout(),
+            gpu.width(),
+            gpu.height(),
+            &art_direction_bgl,
+        );
+        let outline_pass = OutlinePass::new(&gpu.device, &art_direction_bgl);
+
         let material_frame_bg = Some(material_pass.create_frame_bind_group(
             &gpu.device,
             &lighting_uniform_buffer,
@@ -135,56 +229,128 @@ impl VisbufPipeline {
             &gpu.device,
             &lighting_uniform_buffer,
             &vis_buffer,
+            &sky_lut_pass,
         ));
 
         // Depth copy compute pipeline (Depth32Float → R32Float)
-        let depth_copy_bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("depth-copy-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let depth_copy_shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("depth-copy-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/depth_to_float.wgsl").into()),
-        });
-        let depth_copy_layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("depth-copy-layout"),
-            bind_group_layouts: &[&depth_copy_bgl],
-            immediate_size: 0,
-        });
-        let depth_copy_pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("depth-copy-pipeline"),
-            layout: Some(&depth_copy_layout),
-            module: &depth_copy_shader,
-            entry_point: Some("depth_copy"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let depth_copy_bgl =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("depth-copy-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Depth,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: wgpu::TextureFormat::R32Float,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let depth_copy_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("depth-copy-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../../shaders/depth_to_float.wgsl").into(),
+                ),
+            });
+        let depth_copy_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("depth-copy-layout"),
+                    bind_group_layouts: &[&depth_copy_bgl],
+                    immediate_size: 0,
+                });
+        let depth_copy_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("depth-copy-pipeline"),
+                    layout: Some(&depth_copy_layout),
+                    module: &depth_copy_shader,
+                    entry_point: Some("depth_copy"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
         let depth_copy_bg = Some(create_depth_copy_bind_group(
             &gpu.device,
             &depth_copy_bgl,
             &vis_buffer,
+        ));
+
+        // Alpha fixup compute pipeline (clear vis_buffer for alpha-failed pixels)
+        let alpha_fixup_bgl =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("alpha-fixup-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: wgpu::TextureFormat::R32Uint,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let alpha_fixup_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("alpha-fixup-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../../shaders/alpha_fixup.wgsl").into(),
+                ),
+            });
+        let alpha_fixup_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("alpha-fixup-layout"),
+                    bind_group_layouts: &[&alpha_fixup_bgl],
+                    immediate_size: 0,
+                });
+        let alpha_fixup_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("alpha-fixup-pipeline"),
+                    layout: Some(&alpha_fixup_layout),
+                    module: &alpha_fixup_shader,
+                    entry_point: Some("alpha_fixup"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        let alpha_fixup_bg = Some(create_alpha_fixup_bind_group(
+            &gpu.device,
+            &alpha_fixup_bgl,
+            &scene_color.view,
+            &vis_buffer.view,
         ));
 
         Self {
@@ -194,9 +360,13 @@ impl VisbufPipeline {
             material_pass,
             hzb_pass,
             shadow_pass,
+            sky_lut_pass,
             sky_pass,
+            cloud_pass,
+            ssgi_pass,
             ssao_pass,
             sun_shaft_pass,
+            outline_pass,
             bloom_pass,
             tonemap_pass,
             shadow_map,
@@ -217,29 +387,69 @@ impl VisbufPipeline {
             shadow_depth: 140.0,
             lighting_uniform_buffer,
             bark_uniform_buffer,
+            art_direction_buffer,
+            art_direction_palette_buffer,
+            art_direction_bgl,
+            art_direction_bg,
+            art_direction_outline_skip: true,
+            art_direction_bloom_tint: [1.0, 1.0, 1.0],
+            art_direction_bloom_softness: 0.0,
+            art_direction_color_grade: [1.0, 1.0, 1.0, 0.0],
+            art_direction_lod_bias: 0.0,
             depth_copy_pipeline,
             depth_copy_bgl,
             depth_copy_bg,
+            alpha_fixup_pipeline,
+            alpha_fixup_bgl,
+            alpha_fixup_bg,
+            noise_textures,
+            timing: if gpu.timestamp_supported {
+                Some(GpuTimingContext::new(&gpu.device, &gpu.queue))
+            } else {
+                None
+            },
         }
     }
 
     pub fn sync_scene_resources(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         scene: &RuntimeSceneGpu,
     ) {
-        self.mesh_bg = Some(self.hw_raster.create_mesh_bind_group(device, &scene.meshlet_buffers));
-        self.cull_bg = Some(self.cull_pass.create_cull_bind_group(device, &scene.meshlet_buffers));
+        self.mesh_bg = Some(
+            self.hw_raster
+                .create_mesh_bind_group(device, &scene.meshlet_buffers),
+        );
+        self.cull_bg = Some(
+            self.cull_pass
+                .create_cull_bind_group(device, &scene.meshlet_buffers),
+        );
         self.dispatch_bg = Some(
-            self.cull_pass.create_dispatch_bind_group(device, &self.dispatch_lists),
+            self.cull_pass
+                .create_dispatch_bind_group(device, &self.dispatch_lists),
         );
-        self.sw_dispatch_bg = Some(
-            self.sw_raster.create_dispatch_bind_group(device, &self.dispatch_lists, &self.vis_buffer),
-        );
+        self.sw_dispatch_bg = Some(self.sw_raster.create_dispatch_bind_group(
+            device,
+            &self.dispatch_lists,
+            &self.vis_buffer,
+        ));
         self.hw_dispatch_bg = Some(
-            self.hw_raster.create_dispatch_bind_group(device, &self.dispatch_lists),
+            self.hw_raster
+                .create_dispatch_bind_group(device, &self.dispatch_lists),
         );
-        self.rebuild_vis_bind_group(device, &scene.alpha_mask_view);
+        self.rebuild_vis_bind_group(
+            device,
+            &scene.alpha_mask_view,
+            &scene.bark_textures.albedo_rough_view,
+            &scene.bark_textures.normal_ao_view,
+            &scene.bark_textures.height_view,
+        );
+
+        // Compute DAG cut once — the DAG is static, so the dispatch list
+        // persists in GPU buffers across frames.
+        self.cull_pass
+            .cpu_dag_cut(queue, &scene.dag, &self.dispatch_lists);
     }
 
     /// Rebuild visibility-dependent bind groups (after resize or alpha mask change).
@@ -247,18 +457,34 @@ impl VisbufPipeline {
         &mut self,
         device: &wgpu::Device,
         alpha_view: &wgpu::TextureView,
+        bark_albedo_rough_view: &wgpu::TextureView,
+        bark_normal_ao_view: &wgpu::TextureView,
+        bark_height_view: &wgpu::TextureView,
     ) {
         self.vis_bg = Some(self.material_pass.create_vis_bind_group(
             device,
             &self.vis_buffer,
             &self.shadow_map,
             alpha_view,
+            bark_albedo_rough_view,
+            bark_normal_ao_view,
+            bark_height_view,
+            &self.vis_buffer.depth_float_view,
+            &self.sky_lut_pass,
         ));
-        // Sky bind group depends on vis_buffer
+        // Sky bind group depends on vis_buffer + LUTs
         self.sky_bg = Some(self.sky_pass.create_bind_group(
             device,
             &self.lighting_uniform_buffer,
             &self.vis_buffer,
+            &self.sky_lut_pass,
+        ));
+        // Alpha fixup depends on scene_color + vis_buffer
+        self.alpha_fixup_bg = Some(create_alpha_fixup_bind_group(
+            device,
+            &self.alpha_fixup_bgl,
+            &self.scene_color.view,
+            &self.vis_buffer.view,
         ));
     }
 
@@ -267,7 +493,8 @@ impl VisbufPipeline {
     /// uniform buffers (lighting + bark), which are resolution-independent.
     pub fn resize(&mut self, gpu: &GpuContext) {
         self.vis_buffer = VisibilityBuffer::new(&gpu.device, gpu.width(), gpu.height());
-        self.material_pass.resize(&gpu.device, gpu.width(), gpu.height());
+        self.material_pass
+            .resize(&gpu.device, gpu.width(), gpu.height());
         self.hzb_pass.resize(&gpu.device, gpu.width(), gpu.height());
 
         self.scene_color = create_scene_color_target(
@@ -278,13 +505,19 @@ impl VisbufPipeline {
             "visbuf-scene-color",
         );
 
+        self.cloud_pass
+            .resize(&gpu.device, gpu.width(), gpu.height());
+        if let Some(ssgi) = &mut self.ssgi_pass {
+            ssgi.resize(&gpu.device, gpu.width(), gpu.height());
+        }
         if self.ssao_pass.is_some() {
             self.ssao_pass = Some(SsaoPass::new(&gpu.device, gpu.width(), gpu.height()));
         }
         if self.bloom_pass.is_some() {
             self.bloom_pass = Some(BloomPass::new(&gpu.device, gpu.width(), gpu.height()));
         }
-        self.sun_shaft_pass.resize(&gpu.device, gpu.width(), gpu.height());
+        self.sun_shaft_pass
+            .resize(&gpu.device, gpu.width(), gpu.height());
         self.tonemap_pass = TonemapPass::new(gpu);
 
         // Rebuild depth copy bind group (depends on vis_buffer)
@@ -294,21 +527,25 @@ impl VisbufPipeline {
             &self.vis_buffer,
         ));
 
+        // Rebuild alpha fixup bind group (depends on scene_color + vis_buffer)
+        self.alpha_fixup_bg = Some(create_alpha_fixup_bind_group(
+            &gpu.device,
+            &self.alpha_fixup_bgl,
+            &self.scene_color.view,
+            &self.vis_buffer.view,
+        ));
+
         if self.mesh_bg.is_some() {
             // SW dispatch bind group depends on vis_buffer
-            self.sw_dispatch_bg = Some(
-                self.sw_raster.create_dispatch_bind_group(
-                    &gpu.device,
-                    &self.dispatch_lists,
-                    &self.vis_buffer,
-                ),
-            );
+            self.sw_dispatch_bg = Some(self.sw_raster.create_dispatch_bind_group(
+                &gpu.device,
+                &self.dispatch_lists,
+                &self.vis_buffer,
+            ));
             // Rebuild HW dispatch bind group
             self.hw_dispatch_bg = Some(
-                self.hw_raster.create_dispatch_bind_group(
-                    &gpu.device,
-                    &self.dispatch_lists,
-                ),
+                self.hw_raster
+                    .create_dispatch_bind_group(&gpu.device, &self.dispatch_lists),
             );
         }
     }
@@ -322,6 +559,24 @@ impl VisbufPipeline {
         settings: &SceneSettings,
         elapsed_secs: f32,
     ) -> std::result::Result<(), wgpu::SurfaceError> {
+        // Poll previous frame's timing results (one-frame delay)
+        if let Some(timing) = &mut self.timing {
+            timing.poll_and_log(&gpu.device);
+        }
+
+        // Generate noise textures on first frame
+        self.noise_textures
+            .ensure_generated(&gpu.device, &gpu.queue);
+
+        // Update atmosphere LUTs (dirty-tracked — only regenerates when params change)
+        self.sky_lut_pass.update(
+            settings.sun_direction,
+            settings.rayleigh_strength,
+            settings.mie_strength,
+            settings.mie_anisotropy,
+        );
+        self.sky_lut_pass.generate_if_dirty(&gpu.device, &gpu.queue);
+
         let frame = gpu.surface.get_current_texture()?;
 
         let view_proj = camera.view_projection_matrix();
@@ -339,7 +594,7 @@ impl VisbufPipeline {
                 1.0 / gpu.height() as f32,
             ],
             error_threshold: [
-                1.0, // error_threshold_px
+                1.0 + self.art_direction_lod_bias, // error_threshold_px (quality budget adds bias)
                 1.0 / (2.0 * (fov_y * 0.5).tan()), // fov_factor
                 0.0,
                 0.0,
@@ -347,18 +602,16 @@ impl VisbufPipeline {
         };
         self.hw_raster.write_uniforms(&gpu.queue, &visbuf_uniforms);
 
+        // Compute cascade shadow maps
+        let (cascade_vps, cascade_splits) =
+            compute_all_cascade_vps(camera, settings.sun_direction, self.shadow_depth);
+
         // Update lighting uniforms
-        let shadow_focus_radius = self.shadow_base_radius;
-        let light_vp = compute_light_vp(
-            settings.sun_direction,
-            self.shadow_center,
-            shadow_focus_radius,
-            self.shadow_depth,
-        );
         let lighting = LightingUniforms::from_camera(
             camera,
             settings,
-            light_vp,
+            &cascade_vps,
+            &cascade_splits,
             elapsed_secs,
             gpu.width(),
             gpu.height(),
@@ -370,25 +623,25 @@ impl VisbufPipeline {
         );
 
         // Shadow uniforms
-        self.shadow_pass.write_uniforms(&gpu.queue, light_vp);
-        self.sun_shaft_pass.write_uniforms(
-            &gpu.queue,
-            camera,
-            settings,
-            gpu.width(),
-            gpu.height(),
-        );
+        self.shadow_pass.write_uniforms(&gpu.queue, &cascade_vps);
+        self.sun_shaft_pass
+            .write_uniforms(&gpu.queue, camera, settings, gpu.width(), gpu.height());
 
-        // CPU-side DAG cut — writes meshlet dispatch list directly
-        let _meshlet_count = self.cull_pass.cpu_dag_cut(
-            &gpu.queue,
-            &scene.dag,
-            &self.dispatch_lists,
-        );
+        // Register timing passes for this frame
+        let _t_shadow = self.timing.as_mut().and_then(|t| t.register_pass("shadow"));
+        let _t_material = self.timing.as_mut().and_then(|t| t.register_pass("material"));
+        let _t_sky = self.timing.as_mut().and_then(|t| t.register_pass("sky"));
+        let t_cloud_march = self.timing.as_mut().and_then(|t| t.register_pass("cloud_march"));
+        let t_cloud_temporal = self.timing.as_mut().and_then(|t| t.register_pass("cloud_temporal"));
+        let t_cloud_composite = self.timing.as_mut().and_then(|t| t.register_pass("cloud_composite"));
+        let _t_bloom = self.timing.as_mut().and_then(|t| t.register_pass("bloom"));
+        let _t_tonemap = self.timing.as_mut().and_then(|t| t.register_pass("tonemap"));
 
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("visbuf-frame-encoder"),
-        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("visbuf-frame-encoder"),
+            });
 
         // -- Pass 1: Shadow pass --
         self.shadow_pass.encode(
@@ -440,17 +693,107 @@ impl VisbufPipeline {
                 material_frame_bg,
                 mesh_bg,
                 vis_bg,
+                &self.art_direction_bg,
                 &self.scene_color.view,
             );
         }
 
+        // -- Pass 5.25: Alpha fixup (clear vis_buffer for alpha-failed pixels) --
+        if let Some(alpha_fixup_bg) = &self.alpha_fixup_bg {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alpha-fixup-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.alpha_fixup_pipeline);
+            pass.set_bind_group(0, alpha_fixup_bg, &[]);
+            let w = (gpu.width() + 7) / 8;
+            let h = (gpu.height() + 7) / 8;
+            pass.dispatch_workgroups(w, h, 1);
+        }
+
         // -- Pass 5.5: Sky pass (fills empty vis pixels with atmospheric sky) --
         if let Some(sky_bg) = &self.sky_bg {
-            self.sky_pass.encode(
-                &mut encoder,
-                sky_bg,
-                &self.scene_color.view,
+            self.sky_pass
+                .encode(&mut encoder, sky_bg, &self.scene_color.view);
+        }
+
+        // -- Pass 5.55: Cloud pass (volumetric clouds at profile resolution) --
+        {
+            // Apply resolution tier from profile (may trigger resize)
+            let new_div = match settings.cloud_profile.resolution {
+                crate::scene::CloudResolution::Quarter => 4u32,
+                crate::scene::CloudResolution::Half => 2u32,
+            };
+            if self.cloud_pass.resolution_divisor != new_div {
+                self.cloud_pass.set_resolution(settings.cloud_profile.resolution);
+                self.cloud_pass
+                    .resize(&gpu.device, gpu.width(), gpu.height());
+            }
+            // Sky ambient is now sampled from sky-view LUT in the shader.
+            // Pass a placeholder — the shader overrides with LUT values.
+            let sky_amb = glam::Vec3::splat(0.15);
+            let inv_vp = view_proj.inverse();
+            self.cloud_pass.write_uniforms(
+                &gpu.queue,
+                inv_vp,
+                cam_pos,
+                settings.sun_direction,
+                settings.sun_color,
+                settings.sun_strength,
+                sky_amb,
+                settings.cloud_coverage,
+                elapsed_secs,
+                &settings.cloud_profile,
             );
+            let cloud_timing_slots = match (t_cloud_march, t_cloud_temporal, t_cloud_composite) {
+                (Some(march), Some(temporal), Some(composite)) => {
+                    Some(super::cloud_pass::CloudTimingSlots {
+                        march,
+                        temporal,
+                        composite,
+                    })
+                }
+                _ => None,
+            };
+            let timing_ref = self
+                .timing
+                .as_ref()
+                .zip(cloud_timing_slots.as_ref());
+            self.cloud_pass.encode(
+                &gpu.device,
+                &mut encoder,
+                &self.noise_textures,
+                &self.scene_color.view,
+                &self.vis_buffer.depth_float_view,
+                view_proj,
+                timing_ref,
+                &self.sky_lut_pass.sky_view_view,
+                &self.sky_lut_pass.lut_sampler,
+            );
+        }
+
+        // -- Pass 5.6: SSGI (screen-space global illumination) --
+        if settings.gi_intensity > 0.001 {
+            if let Some(ssgi) = &self.ssgi_pass {
+                let view = camera.view_matrix();
+                let projection = camera.projection_matrix();
+                let gi_intensity = settings.gi_intensity;
+                ssgi.write_uniforms(
+                    &gpu.queue,
+                    view,
+                    projection,
+                    gpu.width(),
+                    gpu.height(),
+                    gi_intensity,
+                );
+                ssgi.execute(
+                    &gpu.device,
+                    &mut encoder,
+                    &self.material_pass.normal_view,
+                    &self.vis_buffer.depth_float_view,
+                    &self.scene_color.view,
+                );
+            }
         }
 
         // -- Pass 6: SSAO --
@@ -474,6 +817,19 @@ impl VisbufPipeline {
             &self.scene_color.view,
         );
 
+        // -- Pass 7.5: Outline --
+        // Skip entirely when outline_strength is effectively zero.
+        if !self.art_direction_outline_skip {
+            self.outline_pass.encode(
+                &gpu.device,
+                &mut encoder,
+                &self.vis_buffer.depth_float_view,
+                &self.material_pass.normal_view,
+                &self.scene_color.view,
+                &self.art_direction_bg,
+            );
+        }
+
         // -- Pass 8: Bloom + Tonemap --
         if let Some(bloom) = &self.bloom_pass {
             bloom.execute(
@@ -484,6 +840,8 @@ impl VisbufPipeline {
                 &self.scene_color.view,
                 gpu.width(),
                 gpu.height(),
+                self.art_direction_bloom_tint,
+                self.art_direction_bloom_softness,
             );
         }
 
@@ -500,9 +858,21 @@ impl VisbufPipeline {
             gpu.width(),
             gpu.height(),
             elapsed_secs,
+            self.art_direction_color_grade,
         );
 
+        // Resolve GPU timing queries
+        if let Some(timing) = &self.timing {
+            timing.resolve(&mut encoder);
+        }
+
         gpu.queue.submit([encoder.finish()]);
+
+        // Begin async readback of timing data (read next frame)
+        if let Some(timing) = &mut self.timing {
+            timing.begin_readback();
+        }
+
         frame.present();
         Ok(())
     }
@@ -551,6 +921,7 @@ impl VisbufPipeline {
             width,
             height,
             elapsed_secs,
+            self.art_direction_color_grade,
         );
         gpu.queue.submit([encoder.finish()]);
 
@@ -602,6 +973,28 @@ fn create_depth_copy_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::TextureView(&vis_buffer.depth_float_view),
+            },
+        ],
+    })
+}
+
+fn create_alpha_fixup_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_color_view: &wgpu::TextureView,
+    vis_buffer_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("alpha-fixup-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(vis_buffer_view),
             },
         ],
     })

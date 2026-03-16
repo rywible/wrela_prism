@@ -4,10 +4,12 @@ use crate::gpu::upload::GpuMesh;
 use crate::gpu::GpuContext;
 use crate::scene::shadow::ShadowMap;
 use crate::scene::Vertex;
+use crate::scene::NUM_CASCADES;
 
+/// Single cascade light VP — one per dynamic offset slot.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ShadowUniforms {
+pub struct ShadowCascadeUniforms {
     pub light_vp: [[f32; 4]; 4],
 }
 
@@ -16,16 +18,23 @@ pub struct ShadowPass {
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
-    shadow_view: wgpu::TextureView,
+    cascade_views: [wgpu::TextureView; NUM_CASCADES],
+    /// Aligned offset between cascade uniform slots.
+    dyn_alignment: u32,
 }
 
 impl ShadowPass {
     pub fn new(gpu: &GpuContext, shadow_map: &ShadowMap) -> Self {
         let device = &gpu.device;
 
+        // Dynamic uniform offset alignment (typically 256 on most GPUs)
+        let min_align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let slot_size = std::mem::size_of::<ShadowCascadeUniforms>() as u64;
+        let dyn_alignment = (slot_size.div_ceil(min_align) * min_align) as u32;
+
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("prism-shadow-uniforms"),
-            size: std::mem::size_of::<ShadowUniforms>() as u64,
+            size: dyn_alignment as u64 * NUM_CASCADES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -37,10 +46,12 @@ impl ShadowPass {
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
+                    has_dynamic_offset: true,
                     min_binding_size: Some(
-                        std::num::NonZeroU64::new(std::mem::size_of::<ShadowUniforms>() as u64)
-                            .unwrap(),
+                        std::num::NonZeroU64::new(
+                            std::mem::size_of::<ShadowCascadeUniforms>() as u64
+                        )
+                        .unwrap(),
                     ),
                 },
                 count: None,
@@ -52,7 +63,16 @@ impl ShadowPass {
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniform_buffer,
+                    offset: 0,
+                    size: Some(
+                        std::num::NonZeroU64::new(
+                            std::mem::size_of::<ShadowCascadeUniforms>() as u64
+                        )
+                        .unwrap(),
+                    ),
+                }),
             }],
         });
 
@@ -132,24 +152,39 @@ impl ShadowPass {
             cache: None,
         });
 
-        let shadow_view = shadow_map
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let cascade_views = std::array::from_fn(|i| {
+            shadow_map
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("prism-shadow-pass-cascade-{i}")),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+        });
 
         Self {
             uniform_buffer,
             bind_group,
             pipeline,
             transparent_pipeline,
-            shadow_view,
+            cascade_views,
+            dyn_alignment,
         }
     }
 
-    pub fn write_uniforms(&self, queue: &wgpu::Queue, light_vp: Mat4) {
-        let uniforms = ShadowUniforms {
-            light_vp: light_vp.to_cols_array_2d(),
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    pub fn write_uniforms(&self, queue: &wgpu::Queue, light_vps: &[Mat4; NUM_CASCADES]) {
+        for (i, vp) in light_vps.iter().enumerate() {
+            let uniforms = ShadowCascadeUniforms {
+                light_vp: vp.to_cols_array_2d(),
+            };
+            queue.write_buffer(
+                &self.uniform_buffer,
+                self.dyn_alignment as u64 * i as u64,
+                bytemuck::bytes_of(&uniforms),
+            );
+        }
     }
 
     pub fn encode(
@@ -159,48 +194,44 @@ impl ShadowPass {
         opaque_list: &[usize],
         transparent_list: &[usize],
     ) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("prism-shadow-pass"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.shadow_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+        for cascade in 0..NUM_CASCADES {
+            let dyn_offset = self.dyn_alignment * cascade as u32;
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(&format!("prism-shadow-pass-cascade-{cascade}")),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.cascade_views[cascade],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            occlusion_query_set: None,
-            timestamp_writes: None,
-            multiview_mask: None,
-        });
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
 
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[dyn_offset]);
 
-        for &idx in opaque_list {
-            let mesh = &meshes[idx];
-            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            if let Some(indirect) = &mesh.indirect_buffer {
-                pass.draw_indirect(indirect, 0);
-            } else {
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.active_index_count, 0, 0..1);
-            }
-        }
-
-        // Double-sided pipeline for foliage cards
-        if !transparent_list.is_empty() {
-            pass.set_pipeline(&self.transparent_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            for &idx in transparent_list {
+            for &idx in opaque_list {
                 let mesh = &meshes[idx];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                if let Some(indirect) = &mesh.indirect_buffer {
-                    pass.draw_indirect(indirect, 0);
-                } else {
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+
+            // Double-sided pipeline for foliage cards
+            if !transparent_list.is_empty() {
+                pass.set_pipeline(&self.transparent_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[dyn_offset]);
+                for &idx in transparent_list {
+                    let mesh = &meshes[idx];
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.active_index_count, 0, 0..1);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
             }
         }

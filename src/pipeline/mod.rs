@@ -1,11 +1,16 @@
 pub mod bloom_pass;
+pub mod cloud_pass;
 pub mod cull_pass;
 pub mod hw_raster_pass;
 pub mod hzb_pass;
 pub mod material_pass;
+pub mod noise_textures;
+pub mod outline_pass;
 pub mod shadow_pass;
+pub mod sky_lut_pass;
 pub mod sky_pass;
 pub mod ssao_pass;
+pub mod ssgi_pass;
 pub mod sun_shaft_pass;
 pub mod sw_raster_pass;
 pub mod tonemap_pass;
@@ -33,7 +38,11 @@ pub enum DebugOverlay {
 use crate::gpu::GpuContext;
 use anyhow::{Context, Result};
 
-pub(crate) fn storage_entry(binding: u32, read_only: bool, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_entry(
+    binding: u32,
+    read_only: bool,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,

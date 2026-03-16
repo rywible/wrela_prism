@@ -1,4 +1,5 @@
 pub mod bounds;
+pub mod sky_probe;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Affine3A, Mat4, Vec3};
@@ -211,6 +212,47 @@ fn compute_sdf_lipschitz(tree: &SdfTree) -> f32 {
 
 // ──────────────────────── Lighting / Scene Uniforms ────────────────────────
 
+/// Cloud rendering resolution tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudResolution {
+    /// 1/4 screen resolution (default for gameplay presets)
+    Quarter,
+    /// 1/2 screen resolution (beauty presets)
+    Half,
+}
+
+/// Cloud volume profile — one density function, different parameters per preset.
+#[derive(Clone, Debug)]
+pub struct CloudProfile {
+    pub coverage: f32,
+    pub density_scale: f32,
+    pub cloud_base_km: f32,
+    pub cloud_top_km: f32,
+    pub detail_erosion: f32,
+    pub wind_speed: f32,
+    pub march_steps: u32,
+    pub light_steps: u32,
+    pub temporal_blend: f32,
+    pub resolution: CloudResolution,
+}
+
+impl Default for CloudProfile {
+    fn default() -> Self {
+        Self {
+            coverage: 0.35,
+            density_scale: 16.0,
+            cloud_base_km: 1.8,
+            cloud_top_km: 3.2,
+            detail_erosion: 0.6,
+            wind_speed: 1.0,
+            march_steps: 48,
+            light_steps: 6,
+            temporal_blend: 0.88,
+            resolution: CloudResolution::Quarter,
+        }
+    }
+}
+
 /// Scene-wide lighting and environment settings.
 pub struct SceneSettings {
     pub sun_direction: Vec3,
@@ -222,10 +264,10 @@ pub struct SceneSettings {
     pub fog_start: f32,
     pub fog_end: f32,
     pub fog_color: Vec3,
-    pub fog_sky_mix: f32,
-    pub sky_zenith: Vec3,
-    pub sky_horizon: Vec3,
-    pub sky_strength: f32,
+    pub fog_sky_mix: f32,  // Legacy: not read by shaders (sky uses LUT)
+    pub sky_zenith: Vec3,  // Legacy: only used by CPU sky probe + cloud ambient
+    pub sky_horizon: Vec3, // Legacy: only used by CPU cloud ambient
+    pub sky_strength: f32, // Legacy: only used by CPU sky probe
     pub rayleigh_strength: f32,
     pub mie_strength: f32,
     pub mie_anisotropy: f32,
@@ -239,8 +281,12 @@ pub struct SceneSettings {
     pub ambient_front: Vec3,
     pub ambient_back: Vec3,
     pub exposure: f32,
-    pub tonemap_strength: f32,
+    pub tonemap_strength: f32, // Legacy: not read by shaders (ACES is fixed)
     pub contact_shadow_strength: f32,
+    pub ambient_intensity: f32,
+    pub gi_intensity: f32,
+    pub cloud_coverage: f32,
+    pub cloud_profile: CloudProfile,
     pub wind: WindSettings,
 }
 
@@ -248,7 +294,10 @@ pub struct SceneSettings {
 #[derive(Clone, Copy, Debug)]
 pub struct WindSettings {
     pub direction: glam::Vec2,
-    pub speed: f32,
+    pub mean_speed: f32,
+    pub gust_strength: f32,
+    pub gust_frequency: f32,
+    pub turbulence: f32,
     pub frozen: bool,
 }
 
@@ -256,11 +305,17 @@ impl Default for WindSettings {
     fn default() -> Self {
         Self {
             direction: glam::Vec2::new(1.0, 0.3),
-            speed: 1.0,
+            mean_speed: 1.0,
+            gust_strength: 0.35,
+            gust_frequency: 0.28,
+            turbulence: 0.65,
             frozen: false,
         }
     }
 }
+
+/// Number of shadow cascades.
+pub const NUM_CASCADES: usize = 4;
 
 /// Uniform buffer layout for the lighting pass.
 #[repr(C)]
@@ -288,13 +343,19 @@ pub struct LightingUniforms {
     pub time_params: [f32; 4],
     pub screen_size: [f32; 4],
     pub wind_params: [f32; 4],
+    // CSM: cascade 1–3 light view-projection matrices (cascade 0 = light_vp above)
+    pub light_vp_1: [[f32; 4]; 4],
+    pub light_vp_2: [[f32; 4]; 4],
+    pub light_vp_3: [[f32; 4]; 4],
+    pub cascade_splits: [f32; 4],
 }
 
 impl LightingUniforms {
     pub fn from_camera(
         camera: &CameraState,
         settings: &SceneSettings,
-        light_vp: Mat4,
+        cascade_light_vps: &[Mat4; NUM_CASCADES],
+        cascade_splits: &[f32; NUM_CASCADES],
         elapsed_secs: f32,
         screen_width: u32,
         screen_height: u32,
@@ -302,6 +363,30 @@ impl LightingUniforms {
         let vp = camera.view_projection_matrix();
         let inv_vp = vp.inverse();
         let cam_pos = camera.position();
+
+        let has_manual_ambient = [
+            settings.ambient_up,
+            settings.ambient_down,
+            settings.ambient_right,
+            settings.ambient_left,
+            settings.ambient_front,
+            settings.ambient_back,
+        ]
+        .into_iter()
+        .any(|ambient| ambient.length_squared() > 1e-4);
+
+        let probe = if has_manual_ambient {
+            sky_probe::SkyProbe {
+                up: settings.ambient_up,
+                down: settings.ambient_down,
+                right: settings.ambient_right,
+                left: settings.ambient_left,
+                front: settings.ambient_front,
+                back: settings.ambient_back,
+            }
+        } else {
+            sky_probe::compute_sky_probe(settings, settings.ambient_intensity)
+        };
 
         Self {
             view_proj: vp.to_cols_array_2d(),
@@ -347,45 +432,15 @@ impl LightingUniforms {
                 settings.exposure,
                 settings.tonemap_strength,
                 settings.contact_shadow_strength,
-                0.0,
+                settings.gi_intensity,
             ],
-            light_vp: light_vp.to_cols_array_2d(),
-            ambient_up: [
-                settings.ambient_up.x,
-                settings.ambient_up.y,
-                settings.ambient_up.z,
-                0.0,
-            ],
-            ambient_down: [
-                settings.ambient_down.x,
-                settings.ambient_down.y,
-                settings.ambient_down.z,
-                0.0,
-            ],
-            ambient_right: [
-                settings.ambient_right.x,
-                settings.ambient_right.y,
-                settings.ambient_right.z,
-                0.0,
-            ],
-            ambient_left: [
-                settings.ambient_left.x,
-                settings.ambient_left.y,
-                settings.ambient_left.z,
-                0.0,
-            ],
-            ambient_front: [
-                settings.ambient_front.x,
-                settings.ambient_front.y,
-                settings.ambient_front.z,
-                0.0,
-            ],
-            ambient_back: [
-                settings.ambient_back.x,
-                settings.ambient_back.y,
-                settings.ambient_back.z,
-                0.0,
-            ],
+            light_vp: cascade_light_vps[0].to_cols_array_2d(),
+            ambient_up: [probe.up.x, probe.up.y, probe.up.z, 0.0],
+            ambient_down: [probe.down.x, probe.down.y, probe.down.z, 0.0],
+            ambient_right: [probe.right.x, probe.right.y, probe.right.z, 0.0],
+            ambient_left: [probe.left.x, probe.left.y, probe.left.z, 0.0],
+            ambient_front: [probe.front.x, probe.front.y, probe.front.z, 0.0],
+            ambient_back: [probe.back.x, probe.back.y, probe.back.z, 0.0],
             atmosphere_params: [
                 settings.sun_angular_radius,
                 settings.rayleigh_strength,
@@ -396,11 +451,15 @@ impl LightingUniforms {
                 settings.horizon_haze,
                 settings.shaft_intensity,
                 settings.shaft_decay,
-                0.0,
+                settings.cloud_coverage,
             ],
             time_params: [
                 elapsed_secs,
-                if settings.wind.frozen { 0.0 } else { elapsed_secs },
+                if settings.wind.frozen {
+                    0.0
+                } else {
+                    elapsed_secs
+                },
                 0.0,
                 0.0,
             ],
@@ -408,9 +467,13 @@ impl LightingUniforms {
             wind_params: [
                 settings.wind.direction.x,
                 settings.wind.direction.y,
-                settings.wind.speed,
-                if settings.wind.frozen { 1.0 } else { 0.0 },
+                settings.wind.mean_speed,
+                settings.wind.gust_strength,
             ],
+            light_vp_1: cascade_light_vps[1].to_cols_array_2d(),
+            light_vp_2: cascade_light_vps[2].to_cols_array_2d(),
+            light_vp_3: cascade_light_vps[3].to_cols_array_2d(),
+            cascade_splits: *cascade_splits,
         }
     }
 }
@@ -424,18 +487,22 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub material: u32,
+    pub feature_id: u32,
     pub uv: [f32; 2],
     pub ao: f32,
+    pub semantic_channels: u32,
 }
 
 impl Vertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
             0 => Float32x3,
             1 => Float32x3,
             2 => Uint32,
-            3 => Float32x2,
-            4 => Float32
+            3 => Uint32,
+            4 => Float32x2,
+            5 => Float32,
+            6 => Uint32
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -445,19 +512,41 @@ impl Vertex {
     }
 }
 
+/// Transform a vertex's position and normal by an affine transform.
+pub fn transform_vertex(vertex: &Vertex, transform: glam::Affine3A) -> Vertex {
+    let normal_transform = glam::Mat3::from_cols(
+        transform.matrix3.x_axis.into(),
+        transform.matrix3.y_axis.into(),
+        transform.matrix3.z_axis.into(),
+    );
+    let mut transformed = *vertex;
+    transformed.position = transform
+        .transform_point3(Vec3::from_array(vertex.position))
+        .to_array();
+    transformed.normal = normal_transform
+        .mul_vec3(Vec3::from_array(vertex.normal))
+        .normalize_or_zero()
+        .to_array();
+    transformed
+}
+
 pub const MATERIAL_TRUNK: u32 = 0;
 pub const MATERIAL_FOLIAGE: u32 = 1;
 pub const MATERIAL_GROUND: u32 = 2;
 
 /// Shadow map helpers.
 pub mod shadow {
-    use glam::{Mat4, Vec3};
+    use super::NUM_CASCADES;
+    use glam::{Mat4, Vec3, Vec4};
 
     pub const SHADOW_MAP_SIZE: u32 = 2048;
 
     pub struct ShadowMap {
         pub texture: wgpu::Texture,
+        /// Combined view of all 4 cascade layers (for shader sampling as texture_depth_2d_array).
         pub view: wgpu::TextureView,
+        /// Per-cascade views for render attachments.
+        pub cascade_views: [wgpu::TextureView; NUM_CASCADES],
         pub sampler: wgpu::Sampler,
     }
 
@@ -468,7 +557,7 @@ pub mod shadow {
                 size: wgpu::Extent3d {
                     width: SHADOW_MAP_SIZE,
                     height: SHADOW_MAP_SIZE,
-                    depth_or_array_layers: 1,
+                    depth_or_array_layers: NUM_CASCADES as u32,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -478,7 +567,21 @@ pub mod shadow {
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            // Combined view for sampling all layers
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            // Per-cascade views for render attachments
+            let cascade_views = std::array::from_fn(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("prism-shadow-cascade-{i}")),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            });
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("prism-shadow-sampler"),
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -492,19 +595,163 @@ pub mod shadow {
             Self {
                 texture,
                 view,
+                cascade_views,
                 sampler,
             }
         }
     }
 
-    pub fn shadow_half_extent(focus_radius: f32) -> f32 {
-        focus_radius * 1.05
+    /// Compute practical-logarithmic cascade split distances.
+    ///
+    /// Returns `NUM_CASCADES` far distances for each cascade (view-space Z).
+    pub fn compute_cascade_splits(near: f32, far: f32, lambda: f32) -> [f32; NUM_CASCADES] {
+        let n = NUM_CASCADES as f32;
+        std::array::from_fn(|i| {
+            let p = (i + 1) as f32 / n;
+            let log_split = near * (far / near).powf(p);
+            let lin_split = near + (far - near) * p;
+            lambda * log_split + (1.0 - lambda) * lin_split
+        })
     }
 
-    pub fn shadow_world_width(focus_radius: f32) -> f32 {
-        shadow_half_extent(focus_radius) * 2.0
+    /// Compute an orthographic light VP matrix for one cascade, fitted to
+    /// the camera sub-frustum corners projected into light space.
+    /// Includes texel snapping to prevent shimmer on camera rotation.
+    pub fn compute_cascade_light_vp(
+        sun_dir: Vec3,
+        frustum_corners: &[Vec3; 8],
+        shadow_depth: f32,
+    ) -> Mat4 {
+        let light_dir = sun_dir.normalize();
+        let up = if light_dir.y.abs() > 0.95 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+
+        // Frustum center
+        let center = frustum_corners.iter().copied().sum::<Vec3>() / 8.0;
+        let light_view = Mat4::look_at_rh(center + light_dir * shadow_depth * 0.5, center, up);
+
+        // Project frustum corners into light view space to find extents
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+
+        for &corner in frustum_corners {
+            let lv = light_view * Vec4::from((corner, 1.0));
+            min_x = min_x.min(lv.x);
+            max_x = max_x.max(lv.x);
+            min_y = min_y.min(lv.y);
+            max_y = max_y.max(lv.y);
+            min_z = min_z.min(lv.z);
+            max_z = max_z.max(lv.z);
+        }
+
+        // Pad Z range for objects behind the frustum that should still cast shadows
+        min_z -= shadow_depth * 0.5;
+
+        // Texel snapping: round min/max to texel boundaries to prevent shimmer
+        let texels_per_unit =
+            SHADOW_MAP_SIZE as f32 / (max_x - min_x).max(max_y - min_y).max(0.001);
+        let snap = |val: f32| -> f32 { (val * texels_per_unit).floor() / texels_per_unit };
+        let snapped_min_x = snap(min_x);
+        let snapped_max_x = snap(max_x);
+        let snapped_min_y = snap(min_y);
+        let snapped_max_y = snap(max_y);
+
+        let proj = Mat4::orthographic_rh(
+            snapped_min_x,
+            snapped_max_x,
+            snapped_min_y,
+            snapped_max_y,
+            -max_z,
+            -min_z,
+        );
+        proj * light_view
     }
 
+    /// Extract the 8 corners of a view sub-frustum between near_split and far_split.
+    ///
+    /// Works by unprojecting the full NDC frustum corners to world space,
+    /// then linearly interpolating along the camera rays to the split distances.
+    pub fn frustum_corners(
+        inv_view_proj: Mat4,
+        near_split: f32,
+        far_split: f32,
+        near: f32,
+        far: f32,
+    ) -> [Vec3; 8] {
+        // Unproject the 8 NDC cube corners to world space
+        // glam perspective_rh: z=0 → near, z=1 → far
+        let ndc_corners = [
+            // Near plane (z=0)
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+            Vec4::new(1.0, 1.0, 0.0, 1.0),
+            // Far plane (z=1)
+            Vec4::new(-1.0, -1.0, 1.0, 1.0),
+            Vec4::new(1.0, -1.0, 1.0, 1.0),
+            Vec4::new(-1.0, 1.0, 1.0, 1.0),
+            Vec4::new(1.0, 1.0, 1.0, 1.0),
+        ];
+
+        let mut world = [Vec3::ZERO; 8];
+        for (i, &ndc) in ndc_corners.iter().enumerate() {
+            let w = inv_view_proj * ndc;
+            world[i] = Vec3::new(w.x / w.w, w.y / w.w, w.z / w.w);
+        }
+
+        // Interpolate along rays from near corners to far corners
+        let t_near = (near_split - near) / (far - near);
+        let t_far = (far_split - near) / (far - near);
+
+        std::array::from_fn(|i| {
+            if i < 4 {
+                world[i].lerp(world[i + 4], t_near)
+            } else {
+                world[i - 4].lerp(world[i], t_far)
+            }
+        })
+    }
+
+    /// Compute all cascade light VP matrices for the current frame.
+    pub fn compute_all_cascade_vps(
+        camera: &crate::camera::CameraState,
+        sun_dir: Vec3,
+        shadow_depth: f32,
+    ) -> ([Mat4; NUM_CASCADES], [f32; NUM_CASCADES]) {
+        let near = camera.near_plane;
+        let far = camera.far_plane;
+        let splits = compute_cascade_splits(near, far, 0.7);
+        let inv_vp = camera.view_projection_matrix().inverse();
+
+        let cascade_vps = std::array::from_fn(|i| {
+            let split_near = if i == 0 { near } else { splits[i - 1] };
+            let split_far = splits[i];
+            let corners = frustum_corners(inv_vp, split_near, split_far, near, far);
+            compute_cascade_light_vp(sun_dir, &corners, shadow_depth)
+        });
+
+        // View-space split distances (for fragment shader cascade selection)
+        let view = camera.view_matrix();
+        let view_splits = std::array::from_fn(|i| {
+            // Convert the split far distance to view-space Z
+            // In a RH view matrix, view-space Z is negative for objects in front
+            // The shader will compare abs(view_z) against these
+            let world_point = camera.position() + camera.forward() * splits[i];
+            let view_point = view * Vec4::from((world_point, 1.0));
+            -view_point.z
+        });
+
+        (cascade_vps, view_splits)
+    }
+
+    // Legacy helper kept for backward compatibility
     pub fn compute_light_vp(
         sun_dir: Vec3,
         shadow_center: Vec3,
@@ -520,7 +767,7 @@ pub mod shadow {
             Vec3::Y
         };
         let view = Mat4::look_at_rh(light_pos, shadow_center, up);
-        let half = shadow_half_extent(focus_radius);
+        let half = focus_radius * 1.05;
         let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, shadow_depth);
         proj * view
     }

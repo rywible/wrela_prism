@@ -9,8 +9,10 @@ struct ShadowVertexIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) material: u32,
-    @location(3) uv: vec2<f32>,
-    @location(4) ao: f32,
+    @location(3) feature_id: u32,
+    @location(4) uv: vec2<f32>,
+    @location(5) ao: f32,
+    @location(6) semantic_channels: u32,
 };
 
 struct ShadowVertexOut {
