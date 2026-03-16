@@ -10,6 +10,7 @@ var nearest_sampler: sampler;
 struct TonemapUniforms {
     screen_size: vec4<f32>,  // width, height, 0, 0
     time_params: vec4<f32>,  // elapsed_secs, 0, 0, 0
+    color_grade: vec4<f32>,  // xyz = tint, w = strength (0 = no grading)
 };
 @group(0) @binding(3)
 var<uniform> tu: TonemapUniforms;
@@ -49,14 +50,22 @@ fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     let hdr = textureLoad(hdr_tex, pixel, 0).rgb * ao;
     var ldr = aces_tonemap(hdr);
 
+    // Art direction color grading (applied after tonemap, before vignette)
+    let grade_strength = tu.color_grade.w;
+    if grade_strength > 0.001 {
+        ldr = mix(ldr, ldr * tu.color_grade.xyz, grade_strength);
+    }
+
     // Vignette
     let uv = input.position.xy / tu.screen_size.xy;
     let vignette = 1.0 - 0.3 * dot(uv - 0.5, uv - 0.5);
     ldr *= vignette;
 
-    // Film grain
-    let grain = fract(sin(dot(uv * tu.time_params.x, vec2(12.9898, 78.233))) * 43758.5453);
-    ldr += (grain - 0.5) * 0.015;
+    // Triangular-PDF dither via interleaved gradient noise — breaks 8-bit banding
+    let dither_pos = input.position.xy;
+    let d1 = fract(52.9829189 * fract(dot(dither_pos + tu.time_params.x * 1.3, vec2(0.06711056, 0.00583715))));
+    let d2 = fract(52.9829189 * fract(dot(dither_pos + tu.time_params.x * 2.7 + 0.5, vec2(0.06711056, 0.00583715))));
+    ldr += (d1 + d2 - 1.0) * (1.0 / 255.0);
 
     return vec4<f32>(ldr, 1.0);
 }
