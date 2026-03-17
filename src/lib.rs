@@ -1,9 +1,11 @@
+pub mod animation;
 pub mod app;
 pub mod art_direction;
 pub mod camera;
 pub mod compiler;
 pub mod gpu;
 pub mod growth;
+pub mod humanoid_animator;
 pub mod material;
 pub mod meshlet;
 pub mod parametric;

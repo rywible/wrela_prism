@@ -47,8 +47,8 @@ pub(crate) fn growth_to_skeleton(tree: &GrowthTree) -> TreeSkeleton {
 /// Instead of tracking individual branches, builds rings of overlapping
 /// clusters at each height band to form a continuous conical crown.
 pub fn growth_foliage_anchors(tree: &GrowthTree) -> Vec<(Vec3, f32)> {
-    const MAX_ANCHORS: usize = 200;
-    const HEIGHT_BANDS: usize = 14;
+    const MAX_ANCHORS: usize = 280;
+    const HEIGHT_BANDS: usize = 18;
 
     // Gather branch extent at each height.
     let branch_segs: Vec<&super::tree::GrowthSegment> = tree
@@ -104,7 +104,7 @@ pub fn growth_foliage_anchors(tree: &GrowthTree) -> Vec<(Vec3, f32)> {
 
         // Cluster radius: larger clusters for denser bands.
         let density = band_leaf_area[band_idx] / band_count[band_idx].max(1) as f32;
-        let cluster_radius = (density.sqrt() * 1.8 + 2.5).clamp(3.5, 9.0);
+        let cluster_radius = (density.sqrt() * 1.8 + 2.5).clamp(4.0, 14.0);
 
         // Place clusters in a ring around the trunk at this height.
         let ring_count = anchors_per_band.min(
@@ -164,16 +164,16 @@ fn growth_mesh_params_with_height(params: &GrowthParams, trunk_height: f32) -> R
         flute_depth: params.species.flute_depth,
         // Fill remaining fields with defaults (unused by tube_mesh).
         base_radius: params.species.base_diameter / 2.0,
-        tip_radius: 0.55,
-        trunk_segments: 85,
+        tip_radius: 0.20,
+        trunk_segments: 120,
         trunk_wobble: 0.07,
-        crown_start_frac: 0.38,
-        branch_count: 95,
+        crown_start_frac: 0.20,
+        branch_count: 120,
         max_branch_depth: 5,
         smooth_k_trunk: 0.30,
         smooth_k_branch: 0.06,
         smooth_k_fine: 0.03,
-        columnar_fraction: 0.70,
+        columnar_fraction: 0.65,
     }
 }
 

@@ -274,6 +274,27 @@ fn sample_multiscatter(cos_sun_zenith: f32, height: f32) -> vec3<f32> {
     return textureLoad(multiscatter_lut, texel, 0).rgb;
 }
 
+fn horizon_alignment(view_dir: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    let view_xz = vec2<f32>(view_dir.x, view_dir.z);
+    let sun_xz = vec2<f32>(sun_dir.x, sun_dir.z);
+    let view_len = length(view_xz);
+    let sun_len = length(sun_xz);
+    if view_len < 1e-4 || sun_len < 1e-4 {
+        return 0.5;
+    }
+    return clamp(dot(view_xz / view_len, sun_xz / sun_len), 0.0, 1.0);
+}
+
+fn lower_atmosphere_lift(ray_dir: vec3<f32>, sun_dir: vec3<f32>, hit_ground: bool) -> vec3<f32> {
+    let horizon = exp(-abs(ray_dir.y) * 14.0);
+    let lower_mix = smoothstep(-0.40, 0.10, ray_dir.y);
+    let sun_side = pow(horizon_alignment(ray_dir, sun_dir), 1.5);
+    let ground_weight = select(0.28, 0.52, hit_ground);
+    let warm = vec3<f32>(0.11, 0.078, 0.038) * (0.35 + 0.65 * sun_side);
+    let dust = vec3<f32>(0.055, 0.060, 0.058);
+    return (warm + dust) * horizon * lower_mix * ground_weight;
+}
+
 @compute @workgroup_size(8, 8)
 fn compute_sky_view(@builtin(global_invocation_id) gid: vec3<u32>) {
     let size = vec2<u32>(192u, 108u);
@@ -355,5 +376,8 @@ fn compute_sky_view(@builtin(global_invocation_id) gid: vec3<u32>) {
         total += view_trans * (single + multi);
     }
 
-    textureStore(output_tex, gid.xy, vec4<f32>(total, 1.0));
+    let horizon_lift = lower_atmosphere_lift(ray_dir, sun_dir, hit_ground)
+        * (0.92 + rayleigh_mult * 0.12 + mie_mult * 0.34);
+
+    textureStore(output_tex, gid.xy, vec4<f32>(total + horizon_lift, 1.0));
 }

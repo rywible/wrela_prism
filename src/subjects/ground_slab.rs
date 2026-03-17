@@ -1,24 +1,35 @@
 use crate::scene::{Vertex, MATERIAL_GROUND};
 use crate::util::smoothstep;
 
-const GROUND_RING_FRACTIONS: &[f32] = &[0.005, 0.01, 0.02, 0.033, 0.08, 0.17, 0.5, 1.0];
+const GROUND_RING_FRACTIONS: &[f32] = &[
+    0.004, 0.009, 0.018, 0.032, 0.055, 0.09, 0.16, 0.28, 0.46, 0.66, 0.82, 0.93, 1.0,
+];
 
-fn ground_height_sample(x: f32, z: f32) -> f32 {
+fn ground_height_sample(x: f32, z: f32, radius: f32) -> f32 {
     let dist = (x * x + z * z).sqrt();
-    let inner_relief = 1.0 - smoothstep(10.0, 24.0, dist);
-    let root_zone = 1.0 - smoothstep(2.0, 11.0, dist);
-    let broad_ripple = (x * 0.36 + z * 0.18).sin() * 0.028;
-    let cross_ripple = (x * 0.22 - z * 0.31 + 1.3).sin() * 0.015;
-    let detail = ((x * 1.7 + 0.4).sin() * (z * 1.3 - 0.7).cos()) * 0.008;
-    let radial_relief = (dist * 0.62).sin() * 0.034 * root_zone;
-    let buttress_echo = (x.atan2(z) * 4.0).sin() * 0.016 * root_zone;
-    (broad_ripple + cross_ripple + detail) * inner_relief + radial_relief + buttress_echo
+    let inner_relief = 1.0 - smoothstep(18.0, 110.0, dist);
+    let root_zone = 1.0 - smoothstep(2.5, 16.0, dist);
+    let outer_plain = smoothstep(radius * 0.42, radius * 0.88, dist);
+    let edge_sink = smoothstep(radius * 0.82, radius, dist);
+
+    let broad_roll = (x * 0.018 + z * 0.011).sin() * 0.22;
+    let broad_cross = (x * 0.010 - z * 0.016 + 1.7).sin() * 0.16;
+    let shallow_swale = (dist * 0.020 + 0.8).sin() * 0.18;
+    let mid_ripple = ((x * 0.085).sin() * (z * 0.074 - 0.6).cos()) * 0.08;
+    let detail = ((x * 0.24 + 0.4).sin() * (z * 0.18 - 0.7).cos()) * 0.022;
+    let radial_relief = (dist * 0.42).sin() * 0.12 * root_zone;
+    let buttress_echo = (x.atan2(z) * 4.0).sin() * 0.10 * root_zone;
+
+    let broad = (broad_roll + broad_cross + shallow_swale) * (1.0 - outer_plain * 0.45);
+    let micro = mid_ripple * (1.0 - outer_plain * 0.82) + detail * inner_relief;
+
+    broad + micro + radial_relief + buttress_echo - edge_sink * 1.4
 }
 
-fn ground_normal_sample(x: f32, z: f32) -> [f32; 3] {
-    let eps = 0.2;
-    let dx = ground_height_sample(x + eps, z) - ground_height_sample(x - eps, z);
-    let dz = ground_height_sample(x, z + eps) - ground_height_sample(x, z - eps);
+fn ground_normal_sample(x: f32, z: f32, radius: f32) -> [f32; 3] {
+    let eps = 0.75;
+    let dx = ground_height_sample(x + eps, z, radius) - ground_height_sample(x - eps, z, radius);
+    let dz = ground_height_sample(x, z + eps, radius) - ground_height_sample(x, z - eps, radius);
     glam::Vec3::new(-dx / (2.0 * eps), 1.0, -dz / (2.0 * eps))
         .normalize_or_zero()
         .to_array()
@@ -35,12 +46,12 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
     let mut indices = Vec::with_capacity(tri_count * 3);
 
     vertices.push(Vertex {
-        position: [0.0, ground_height_sample(0.0, 0.0), 0.0],
-        normal: ground_normal_sample(0.0, 0.0),
+        position: [0.0, ground_height_sample(0.0, 0.0, radius), 0.0],
+        normal: ground_normal_sample(0.0, 0.0, radius),
         material: MATERIAL_GROUND,
         feature_id: 0,
         uv: [0.5, 0.5],
-        ao: 0.55,
+        ao: 0.58,
         semantic_channels: 0,
     });
 
@@ -50,13 +61,13 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
             let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
             let x = angle.cos() * r;
             let z = angle.sin() * r;
-            let y = ground_height_sample(x, z);
+            let y = ground_height_sample(x, z, radius);
             let dist = r;
-            let ao = 0.55 + 0.45 * smoothstep(2.0, 10.0, dist);
+            let ao = 0.58 + 0.42 * smoothstep(3.0, 18.0, dist);
 
             vertices.push(Vertex {
                 position: [x, y, z],
-                normal: ground_normal_sample(x, z),
+                normal: ground_normal_sample(x, z, radius),
                 material: MATERIAL_GROUND,
                 feature_id: 0,
                 uv: [
@@ -147,15 +158,15 @@ pub fn build_ground_slab(radius: f32, thickness: f32, segments: u32) -> (Vec<Ver
     }
 
     let side_vert_offset = vertices.len() as u32;
-    let skirt_bottom_radius = radius * 1.24;
+    let skirt_bottom_radius = radius * 1.10;
     for i in 0..segments {
         let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
         let x_top = angle.cos() * radius;
         let z_top = angle.sin() * radius;
         let x_bottom = angle.cos() * skirt_bottom_radius;
         let z_bottom = angle.sin() * skirt_bottom_radius;
-        let top_y = ground_height_sample(x_top, z_top);
-        let normal = glam::Vec3::new(angle.cos(), 0.48, angle.sin())
+        let top_y = ground_height_sample(x_top, z_top, radius);
+        let normal = glam::Vec3::new(angle.cos(), 0.72, angle.sin())
             .normalize_or_zero()
             .to_array();
         let u = i as f32 / segments as f32;

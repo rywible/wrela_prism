@@ -1,6 +1,6 @@
 pub mod redwood_stage;
 
-use crate::camera::{CameraBookmark, CameraNavigationConfig, CameraState};
+use crate::camera::{CameraBookmark, CameraNavigationConfig, CameraState, ThirdPersonConfig};
 use crate::scene::SceneSettings;
 use glam::Vec3;
 
@@ -42,6 +42,7 @@ pub struct SoundstageConfig {
     pub layout: SoundstageLayout,
     pub camera_bookmark: CameraBookmark,
     pub camera_navigation: CameraNavigationConfig,
+    pub third_person: ThirdPersonConfig,
     pub clear_color: [f64; 4],
 }
 

@@ -4,9 +4,9 @@ use crate::growth::GpuAccess;
 use crate::material::MaterialId;
 use crate::meshlet::build_meshlet_dag;
 use crate::runtime_scene::{
-    compute_mesh_bounds, merge_meshlet_dags, transform_aabb, ChunkCompileInput, ChunkId,
-    MaterialEntry, MaterialTable, MeshletSet, PrototypeSurface, RuntimeChunk, RuntimeInstance,
-    RuntimeInstanceId, RuntimePrototype, RuntimePrototypeId, RuntimeScene, SceneSpatialIndex,
+    compute_mesh_bounds, transform_aabb, ChunkCompileInput, ChunkId, MaterialEntry, MaterialTable,
+    MeshletSet, PrototypeSurface, RuntimeChunk, RuntimeInstance, RuntimeInstanceId,
+    RuntimePrototype, RuntimePrototypeId, RuntimeScene, SceneSpatialIndex,
 };
 use crate::scene::bounds::{Aabb, BoundingSphere};
 use crate::scene::Vertex;
@@ -22,6 +22,9 @@ pub struct CompiledChunk {
     pub instance_ids: Vec<RuntimeInstanceId>,
     pub prototype_ids: Vec<RuntimePrototypeId>,
     pub meshlet_set: MeshletSet,
+    /// Vertex range within the chunk's DAG for animated surfaces.
+    /// `(start_vertex_index, vertex_count)` — `None` if no animated surfaces.
+    pub animated_vertex_range: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -259,7 +262,11 @@ fn build_runtime_chunks(
 }
 
 fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> CompiledChunk {
+    use crate::runtime_scene::merge_meshlet_dags;
+
     let mut dags = Vec::new();
+    // Track which DAG index corresponds to an animated surface and its vertex count.
+    let mut animated_dag_info: Vec<(usize, u32)> = Vec::new();
 
     for instance_id in &chunk.instance_ids {
         let instance = &runtime_scene.instances[instance_id.0 as usize];
@@ -270,13 +277,27 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
                 .iter()
                 .map(|vertex| transform_vertex(vertex, instance.transform.affine))
                 .collect::<Vec<_>>();
-            dags.push(build_meshlet_dag(vertices, &surface.indices));
+            let vert_count = vertices.len() as u32;
+            let mut dag = build_meshlet_dag(vertices, &surface.indices);
+            if surface.animated {
+                // Inflate meshlet bounds for animated geometry so it isn't culled during motion
+                for meshlet in &mut dag.meshlets {
+                    meshlet.bounds.radius += 0.54;
+                }
+                animated_dag_info.push((dags.len(), vert_count));
+            }
+            dags.push(dag);
         }
     }
 
-    let meshlet_set = MeshletSet {
-        dag: merge_meshlet_dags(&dags),
-    };
+    let (merged_dag, vertex_bases) = merge_meshlet_dags(&dags);
+
+    // Compute animated vertex range from the first animated surface's DAG position
+    let animated_vertex_range = animated_dag_info
+        .first()
+        .map(|&(dag_idx, count)| (vertex_bases[dag_idx], count));
+
+    let meshlet_set = MeshletSet { dag: merged_dag };
 
     CompiledChunk {
         id: chunk.id,
@@ -284,6 +305,7 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
         instance_ids: chunk.instance_ids.clone(),
         prototype_ids: chunk.prototype_ids.clone(),
         meshlet_set,
+        animated_vertex_range,
     }
 }
 
@@ -434,6 +456,19 @@ fn realize_procedural_subject(
                 casts_shadows,
             )]
         }
+        ProceduralSubject::Humanoid { params } => {
+            let skeleton = crate::subjects::humanoid::build_skeleton(params);
+            let (vertices, indices) = crate::subjects::humanoid::build_body_mesh(&skeleton, params);
+            vec![build_animated_surface(
+                format!("{label}/body"),
+                vertices,
+                indices,
+                material
+                    .override_material
+                    .unwrap_or(MaterialId(crate::scene::MATERIAL_SKIN)),
+                casts_shadows,
+            )]
+        }
     }
 }
 
@@ -484,8 +519,21 @@ fn build_surface(
         indices,
         material_id,
         casts_shadows,
+        animated: false,
         local_bounds,
     }
+}
+
+fn build_animated_surface(
+    label: String,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    material_id: MaterialId,
+    casts_shadows: bool,
+) -> PrototypeSurface {
+    let mut surface = build_surface(label, vertices, indices, material_id, casts_shadows);
+    surface.animated = true;
+    surface
 }
 
 fn prototype_world_bounds(prototype: &RuntimePrototype, transform: SourceTransform) -> Aabb {

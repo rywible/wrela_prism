@@ -282,6 +282,7 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> FullscreenOutput {
 const MATERIAL_TRUNK: u32 = 0u;
 const MATERIAL_FOLIAGE: u32 = 1u;
 const MATERIAL_GROUND: u32 = 2u;
+const MATERIAL_SKIN: u32 = 3u;
 
 // -- Helpers --
 
@@ -423,6 +424,30 @@ fn sample_shadow(world_pos: vec3<f32>) -> f32 {
     return shadow;
 }
 
+fn horizon_alignment(view_dir: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    let view_xz = vec2<f32>(view_dir.x, view_dir.z);
+    let sun_xz = vec2<f32>(sun_dir.x, sun_dir.z);
+    let view_len = length(view_xz);
+    let sun_len = length(sun_xz);
+    if view_len < 1e-4 || sun_len < 1e-4 {
+        return 0.5;
+    }
+    return clamp(dot(view_xz / view_len, sun_xz / sun_len), 0.0, 1.0);
+}
+
+fn lower_atmosphere_haze(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
+    let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
+    let horizon = exp(-abs(dir.y) * 12.5);
+    let lower_mix = smoothstep(-0.36, 0.16, dir.y);
+    let sun_side = pow(horizon_alignment(dir, sun_dir), 1.35);
+    let dust = uniforms.fog_color.rgb * vec3<f32>(0.86, 0.82, 0.70) * (0.28 + 0.20 * lower_mix);
+    let warm = uniforms.sun_color.rgb * vec3<f32>(0.26, 0.18, 0.09)
+        * (0.28 + 0.40 * sun_side)
+        * (1.0 - cloud_cover * 0.18);
+    let lift = vec3<f32>(0.04, 0.032, 0.020);
+    return (dust + warm + lift) * horizon;
+}
+
 // Screen-space contact shadows: 16-step ray march along sun direction.
 // Returns 0.0 (shadowed) to 1.0 (lit).
 fn contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
@@ -506,7 +531,7 @@ fn sample_sky_lut(dir: vec3<f32>) -> vec3<f32> {
     u = select(u + 1.0, u, u >= 0.0);
     let sun_color = uniforms.sun_color.rgb * uniforms.sun_color.w;
     let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
-    let sky_scale = mix(1.0, 1.12, cloud_cover);
+    let sky_scale = mix(1.02, 1.10, cloud_cover);
     return textureSampleLevel(sky_view_lut, sky_lut_sampler, vec2<f32>(u, v), 0.0).rgb
         * sun_color
         * sky_scale;
@@ -515,28 +540,29 @@ fn sample_sky_lut(dir: vec3<f32>) -> vec3<f32> {
 fn direct_sun_visibility() -> f32 {
     let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
     let sun_height = max(uniforms.sun_direction.y, 0.0);
-    return clamp(1.0 - cloud_cover * (0.24 + 0.12 * sun_height), 0.55, 1.0);
+    return clamp(1.0 - cloud_cover * (0.16 + 0.08 * sun_height), 0.68, 1.0);
 }
 
 fn sky_fill_visibility() -> f32 {
     let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
-    return mix(1.0, 1.30, cloud_cover);
+    return mix(1.0, 1.22, cloud_cover);
 }
 
 fn sample_aerial_sky(dir: vec3<f32>) -> vec3<f32> {
+    let sun_dir = normalize(uniforms.sun_direction.xyz);
     let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
-    let elevation = max(dir.y, 0.0);
-    let zenith_t = pow(smoothstep(-0.02, 0.52, elevation), 0.45);
-    let horizon_t = smoothstep(-0.05, 0.14, dir.y);
-    let scattering = sample_sky_lut(dir) * mix(1.06, 0.94, cloud_cover);
+    let zenith_t = pow(smoothstep(-0.08, 0.58, dir.y), 0.55);
+    let horizon_t = smoothstep(-0.10, 0.18, dir.y);
+    let scattering = sample_sky_lut(dir) * mix(1.10, 0.98, cloud_cover);
+    let lower_haze = lower_atmosphere_haze(dir, sun_dir);
     let lower_grade = mix(
-        uniforms.fog_color.rgb * (0.42 + cloud_cover * 0.20),
-        uniforms.sky_horizon.rgb * 0.24,
+        uniforms.fog_color.rgb * vec3<f32>(0.28, 0.28, 0.22) + uniforms.sun_color.rgb * vec3<f32>(0.08, 0.06, 0.03),
+        uniforms.sky_horizon.rgb * 0.14 + uniforms.sun_color.rgb * vec3<f32>(0.05, 0.04, 0.03),
         horizon_t
     );
-    let upper_grade = mix(uniforms.sky_horizon.rgb * 0.10, uniforms.sky_zenith.rgb * 0.18, zenith_t);
-    let grade = mix(lower_grade, upper_grade, smoothstep(0.02, 0.60, elevation));
-    return scattering + grade * uniforms.sun_color.rgb * (0.30 + cloud_cover * 0.12);
+    let upper_grade = mix(uniforms.sky_horizon.rgb * 0.06, uniforms.sky_zenith.rgb * 0.14, zenith_t);
+    let grade = mix(lower_grade, upper_grade, smoothstep(-0.02, 0.60, dir.y));
+    return scattering + grade + lower_haze;
 }
 
 // -- PBR Functions --
@@ -677,6 +703,10 @@ fn micro_fiber_noise(uv: vec2<f32>, detail_fade: f32) -> vec2<f32> {
 
 fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     // MATERIAL_TRUNK is handled by the procedural bark path in fs_resolve().
+    if material == MATERIAL_SKIN {
+        // Warm skin tone — muted, slightly stylized
+        return vec3<f32>(0.55, 0.38, 0.30);
+    }
     if material == MATERIAL_FOLIAGE {
         let canopy_noise =
             0.5 + 0.5 * sin(position.x * 4.8 + position.z * 5.9 + position.y * 3.1)
@@ -695,34 +725,38 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
 
     // Ground
     let radial = length(position.xz);
-    let soil_band = 0.5 + 0.5 * sin(radial * 0.85 + position.x * 0.18);
-    let moss_patch = 0.5 + 0.5 * sin(position.x * 0.42 + position.z * 0.58 + soil_band * 2.0);
-    let moss_patch2 = 0.5 + 0.5 * sin(position.x * 0.71 - position.z * 0.34 + soil_band * 1.4);
-    let warm_soil = vec3<f32>(0.23, 0.16, 0.10);
-    let dark_soil = vec3<f32>(0.10, 0.065, 0.038);
-    let muted_moss = vec3<f32>(0.078, 0.098, 0.068);
-    let soil = mix(dark_soil, warm_soil, soil_band * 0.42 + 0.22);
+    let macro_a = value_noise(position.xz * 0.018 + vec2<f32>(7.4, 2.1));
+    let macro_b = value_noise(position.xz * 0.043 + vec2<f32>(19.3, 11.7));
+    let litter_noise = value_noise(position.xz * 0.24 + vec2<f32>(3.4, 8.8));
+    let detail_noise = value_noise(position.xz * 0.62 + vec2<f32>(23.0, 2.0));
+    let root_zone = 1.0 - smoothstep(3.5, 18.0, radial);
+    let near_tree = 1.0 - smoothstep(14.0, 64.0, radial);
+    let far_plain = smoothstep(70.0, 260.0, radial);
 
-    // Needle litter
-    let needle_noise = sin(position.x * 18.0 + position.z * 22.0) * sin(position.z * 14.0 - position.x * 9.0);
-    let needle_litter = vec3<f32>(0.24, 0.15, 0.07);
-    let duff_patch = 0.5 + 0.5 * sin(position.x * 0.23 - position.z * 0.17 + moss_patch * 1.8);
-    var ground = mix(
-        soil,
-        needle_litter,
-        clamp(needle_noise * 0.5 + 0.5, 0.0, 1.0) * 0.20 + duff_patch * 0.08
-    );
+    let duff_bed = clamp(macro_a * 0.55 + macro_b * 0.25 + near_tree * 0.30, 0.0, 1.0);
+    let moss_mask = smoothstep(0.48, 0.80, macro_b) * smoothstep(0.16, 0.84, macro_a) * (1.0 - root_zone * 0.30);
+    let clearing_mask = smoothstep(0.54, 0.86, macro_a - macro_b * 0.18);
+    let litter_mask = smoothstep(0.46, 0.88, litter_noise + macro_a * 0.22) * (0.55 + 0.45 * near_tree);
+    let mineral_mask = smoothstep(0.42, 0.76, detail_noise + macro_b * 0.12) * far_plain;
 
-    // Moss patches
-    ground = mix(ground, muted_moss, moss_patch * 0.24 + moss_patch2 * 0.12);
+    let damp_soil = vec3<f32>(0.18, 0.13, 0.09);
+    let warm_duff = vec3<f32>(0.40, 0.26, 0.14);
+    let dry_soil = vec3<f32>(0.30, 0.21, 0.12);
+    let root_dark = vec3<f32>(0.13, 0.09, 0.06);
+    let muted_moss = vec3<f32>(0.11, 0.14, 0.09);
+    let pale_litter = vec3<f32>(0.46, 0.31, 0.16);
+    let mineral_dust = vec3<f32>(0.34, 0.26, 0.18);
 
-    // Dry clearings catch a bit more warm duff color.
-    let dry_patch = 0.5 + 0.5 * sin(position.x * 0.31 + position.z * 0.19 + soil_band * 2.4);
-    ground = mix(ground, vec3<f32>(0.19, 0.12, 0.065), dry_patch * 0.08);
+    var ground = mix(damp_soil, warm_duff, duff_bed * 0.64 + 0.16);
+    ground = mix(ground, root_dark, root_zone * 0.32);
+    ground = mix(ground, muted_moss, moss_mask * 0.34);
+    ground = mix(ground, dry_soil, clearing_mask * 0.26);
+    ground = mix(ground, pale_litter, litter_mask * 0.18);
+    ground = mix(ground, mineral_dust, mineral_mask * 0.16);
 
-    // Root zone shadow
-    let root_shadow = 1.0 - (1.0 - smoothstep(0.5, 3.0, radial)) * 0.15;
-    ground *= root_shadow;
+    let tonal_breakup = 0.94 + 0.10 * (macro_b * 0.7 + detail_noise * 0.3);
+    ground *= tonal_breakup;
+    ground = mix(ground, vec3<f32>(0.36, 0.28, 0.18), far_plain * 0.24);
 
     return ground;
 }
@@ -746,10 +780,10 @@ fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
     } else if material == MATERIAL_TRUNK {
         fog *= 0.90;
     }
-    // Ground: with the slab pushed much farther out, only add a very late fade.
+    // Ground: fade into atmospheric haze earlier so the slab edge doesn't read as a horizon stripe.
     if material == MATERIAL_GROUND {
-        let edge_fade = smoothstep(fog_end * 1.35, fog_end * 2.10, dist);
-        fog = max(fog, edge_fade * 0.28);
+        let edge_fade = smoothstep(fog_start * 0.70, fog_end * 1.05, dist);
+        fog = max(fog, edge_fade * 0.88);
     }
 
     return fog;
@@ -1000,6 +1034,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
             metallic = 0.0;
             f0 = vec3<f32>(0.025);
             sss_strength = 0.35;
+        } else if material == MATERIAL_SKIN {
+            roughness = 0.65;
+            metallic = 0.0;
+            f0 = vec3<f32>(0.04);
+            sss_strength = 0.15;
         } else {
             // Ground
             roughness = 0.92;
@@ -1054,15 +1093,20 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
             ambient_term = ambient * (1.10 + max(normal.y, 0.0) * 0.38);
             sky_fill_term = sky_fill * 2.20;
             sss = transmission * sss_strength;
+        } else {
+            let sun_warmth = smoothstep(0.0, 0.85, NdotL);
+            diffuse_term *= mix(vec3<f32>(1.0), vec3<f32>(1.14, 1.03, 0.84), sun_warmth) * 1.12;
+            ambient_term = ambient * 1.26;
+            sky_fill_term = sky_fill * 1.75;
         }
 
         // Ground contact shadow & root zone
         var ground_darken = 1.0;
         if material == MATERIAL_GROUND {
             let radial = length(world_pos.xz);
-            let contact = 1.0 - smoothstep(2.0, 7.8, radial);
-            let root_zone = 1.0 - smoothstep(4.2, 12.5, radial);
-            ground_darken = (1.0 - contact * uniforms.lighting_params.z) * (1.0 - root_zone * 0.12);
+            let contact = 1.0 - smoothstep(1.6, 6.8, radial);
+            let root_zone = 1.0 - smoothstep(4.2, 13.5, radial);
+            ground_darken = (1.0 - contact * uniforms.lighting_params.z) * (1.0 - root_zone * 0.08);
         }
 
         // Foliage rim
@@ -1073,7 +1117,7 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         }
 
         // Ground bounce: sunlit earth scatters warm light upward
-        let ground_bounce_color = vec3<f32>(0.06, 0.045, 0.025);
+        let ground_bounce_color = vec3<f32>(0.10, 0.075, 0.040);
         let ground_facing = max(-normal.y, 0.0);
         let ground_bounce = ground_bounce_color * ground_facing * sun_energy;
 
@@ -1102,6 +1146,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     // 4. Palette remap
     color = apply_palette_remap(color, material, art.color_discipline);
 
+    if material == MATERIAL_GROUND {
+        let distance_lift = smoothstep(uniforms.fog_params.z * 0.55, uniforms.fog_params.w * 0.92, cam_dist);
+        color = mix(color, color + vec3<f32>(0.12, 0.09, 0.05), distance_lift * 0.22);
+    }
+
     // -- Aerial perspective from shared atmosphere model --
     // Height fog provides the distance-based opacity curve.
     // The inscatter color comes from the same sky LUT as the sky pass.
@@ -1111,13 +1160,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     let fog_dir = normalize(world_pos - camera_pos);
     var aerial = sample_aerial_sky(fog_dir);
     if material == MATERIAL_GROUND {
-        let ground_haze = mix(
-            vec3<f32>(0.17, 0.15, 0.12),
-            uniforms.fog_color.rgb * vec3<f32>(0.62, 0.64, 0.68),
-            0.38
-        ) * uniforms.sun_color.rgb;
-        let sky_lift = smoothstep(-0.02, 0.16, fog_dir.y);
-        aerial = mix(ground_haze, aerial, sky_lift);
+        let ground_haze = lower_atmosphere_haze(fog_dir, sun_dir) + vec3<f32>(0.18, 0.15, 0.10);
+        let sky_lift = smoothstep(-0.18, 0.16, fog_dir.y);
+        aerial = mix(ground_haze, aerial * 1.08, sky_lift);
     }
     color = mix(color, aerial, fog_factor);
 

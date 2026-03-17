@@ -4,6 +4,7 @@ use crate::growth::GrowthParams;
 use crate::material::MaterialId;
 use crate::scene::{bounds::Aabb, ParametricDef, SdfTree, Vertex};
 use crate::soundstage::SoundstageLayout;
+use crate::subjects::humanoid::HumanoidParams;
 use crate::subjects::redwood_growth::RedwoodParams;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -88,6 +89,9 @@ pub enum ProceduralSubject {
         radius: f32,
         thickness: f32,
         segments: u32,
+    },
+    Humanoid {
+        params: HumanoidParams,
     },
 }
 
@@ -199,6 +203,13 @@ impl SourceSceneBuilder {
             }),
             SourceTransform::IDENTITY,
         );
+        builder.push_node(
+            "humanoid",
+            SourceGeometry::ProceduralSubject(ProceduralSubject::Humanoid {
+                params: HumanoidParams::default(),
+            }),
+            SourceTransform::from_translation(glam::Vec3::new(15.0, 0.0, 10.0)),
+        );
         builder.build()
     }
 
@@ -226,6 +237,13 @@ impl SourceSceneBuilder {
             }),
             SourceTransform::IDENTITY,
         );
+        builder.push_node(
+            "humanoid",
+            SourceGeometry::ProceduralSubject(ProceduralSubject::Humanoid {
+                params: HumanoidParams::default(),
+            }),
+            SourceTransform::from_translation(glam::Vec3::new(15.0, 0.0, 10.0)),
+        );
         builder.build()
     }
 }
@@ -240,7 +258,7 @@ mod tests {
             &crate::soundstage::redwood_stage::hero().layout,
             Some(7),
         );
-        assert_eq!(scene.nodes.len(), 2);
+        assert_eq!(scene.nodes.len(), 3);
         assert!(matches!(
             scene.nodes[0].geometry,
             SourceGeometry::ProceduralSubject(ProceduralSubject::RedwoodTree { .. })

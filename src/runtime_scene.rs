@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use glam::Affine3A;
 
-use crate::gpu::upload::{upload_mesh, GpuMesh};
+use crate::gpu::upload::{upload_mesh, upload_mesh_animated, GpuMesh};
 use crate::gpu::GpuContext;
 use crate::material::MaterialId;
 use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
@@ -27,7 +27,15 @@ pub struct PrototypeSurface {
     pub indices: Vec<u32>,
     pub material_id: MaterialId,
     pub casts_shadows: bool,
+    pub animated: bool,
     pub local_bounds: Aabb,
+}
+
+/// Describes a contiguous vertex region in the meshlet vertex buffer
+/// that can be re-uploaded each frame for animated geometry.
+pub struct AnimatedRegion {
+    pub vertex_byte_offset: u64,
+    pub vertex_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +189,8 @@ pub struct RuntimeSceneGpu {
     pub shadow_opaque_list: Vec<usize>,
     pub bark_textures: crate::material::bark_bake::BarkTextures,
     pub resident_chunks: Vec<ChunkId>,
+    pub animated_regions: Vec<(String, AnimatedRegion)>,
+    pub animated_shadow_indices: Vec<(String, usize)>,
 }
 
 impl RuntimeSceneGpu {
@@ -203,6 +213,7 @@ impl RuntimeSceneGpu {
         let mut dags = Vec::new();
         let mut shadow_meshes = Vec::new();
         let mut shadow_opaque_list = Vec::new();
+        let mut animated_shadow_indices = Vec::new();
 
         for chunk in compiled
             .compiled_chunks
@@ -219,24 +230,50 @@ impl RuntimeSceneGpu {
             .filter(|instance| resident_chunks.contains(&instance.chunk_id))
         {
             let prototype = &compiled.runtime_scene.prototypes[instance.prototype_id.0 as usize];
+            let is_animated = prototype.surfaces.iter().any(|s| s.animated);
             for surface in &prototype.surfaces {
                 let (vertices, indices) =
                     expand_surface_with_transform(surface, instance.transform.affine);
-                let mesh = upload_mesh(
-                    &gpu.device,
-                    &vertices,
-                    &indices,
-                    &format!("{}-{}", instance.label, surface.label),
-                );
+                let label = format!("{}-{}", instance.label, surface.label);
+                let mesh = if is_animated {
+                    upload_mesh_animated(&gpu.device, &vertices, &indices, &label)
+                } else {
+                    upload_mesh(&gpu.device, &vertices, &indices, &label)
+                };
                 let mesh_idx = shadow_meshes.len();
                 shadow_meshes.push(mesh);
+                if is_animated {
+                    animated_shadow_indices.push((label, mesh_idx));
+                }
                 if surface.casts_shadows {
                     shadow_opaque_list.push(mesh_idx);
                 }
             }
         }
 
-        let dag = merge_meshlet_dags(&dags);
+        let (dag, vertex_bases) = merge_meshlet_dags(&dags);
+
+        // Build animated regions using per-chunk animated vertex ranges
+        let mut animated_regions = Vec::new();
+        let resident_compiled: Vec<_> = compiled
+            .compiled_chunks
+            .iter()
+            .filter(|chunk| resident_chunks.contains(&chunk.id))
+            .collect();
+        for (dag_idx, chunk) in resident_compiled.iter().enumerate() {
+            if let Some((start_in_chunk, count)) = chunk.animated_vertex_range {
+                let global_start = vertex_bases[dag_idx] + start_in_chunk;
+                let byte_offset = global_start as u64 * std::mem::size_of::<Vertex>() as u64;
+                animated_regions.push((
+                    "humanoid".to_string(),
+                    AnimatedRegion {
+                        vertex_byte_offset: byte_offset,
+                        vertex_count: count,
+                    },
+                ));
+            }
+        }
+
         let meshlet_buffers = GpuMeshletBuffers::from_dag(&gpu.device, &dag);
 
         let bark_textures =
@@ -250,7 +287,37 @@ impl RuntimeSceneGpu {
             shadow_opaque_list,
             bark_textures,
             resident_chunks,
+            animated_regions,
+            animated_shadow_indices,
         }
+    }
+
+    /// Re-upload deformed vertices into the meshlet vertex buffer.
+    pub fn update_animated_vertices(
+        &self,
+        queue: &wgpu::Queue,
+        region: &AnimatedRegion,
+        vertices: &[Vertex],
+    ) {
+        queue.write_buffer(
+            &self.meshlet_buffers.vertex_buffer,
+            region.vertex_byte_offset,
+            bytemuck::cast_slice(vertices),
+        );
+    }
+
+    /// Re-upload deformed vertices into a shadow mesh vertex buffer.
+    pub fn update_shadow_vertices(
+        &self,
+        queue: &wgpu::Queue,
+        mesh_idx: usize,
+        vertices: &[Vertex],
+    ) {
+        queue.write_buffer(
+            &self.shadow_meshes[mesh_idx].vertex_buffer,
+            0,
+            bytemuck::cast_slice(vertices),
+        );
     }
 }
 
@@ -293,19 +360,24 @@ pub(crate) fn expand_surface_with_transform(
     (vertices, surface.indices.clone())
 }
 
-pub(crate) fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
+pub(crate) fn merge_meshlet_dags(dags: &[MeshletDag]) -> (MeshletDag, Vec<u32>) {
+    let mut vertex_bases = Vec::with_capacity(dags.len());
     if dags.is_empty() {
-        return MeshletDag {
-            meshlets: Vec::new(),
-            meshlet_vertices: Vec::new(),
-            meshlet_triangles: Vec::new(),
-            groups: Vec::new(),
-            vertices: Vec::new(),
-            level_offsets: vec![0],
-        };
+        return (
+            MeshletDag {
+                meshlets: Vec::new(),
+                meshlet_vertices: Vec::new(),
+                meshlet_triangles: Vec::new(),
+                groups: Vec::new(),
+                vertices: Vec::new(),
+                level_offsets: vec![0],
+            },
+            vertex_bases,
+        );
     }
     if dags.len() == 1 {
-        return dags[0].clone();
+        vertex_bases.push(0);
+        return (dags[0].clone(), vertex_bases);
     }
 
     let mut merged = MeshletDag {
@@ -319,6 +391,7 @@ pub(crate) fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
 
     for dag in dags {
         let vertex_base = merged.vertices.len() as u32;
+        vertex_bases.push(vertex_base);
         let meshlet_vertex_base = merged.meshlet_vertices.len() as u32;
         let tri_base = merged.meshlet_triangles.len() as u32;
         let meshlet_base = merged.meshlets.len() as u32;
@@ -351,7 +424,7 @@ pub(crate) fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
             }));
     }
 
-    merged
+    (merged, vertex_bases)
 }
 
 #[cfg(test)]
@@ -403,7 +476,7 @@ mod tests {
                     indices: vec![],
                     material_id: crate::material::MaterialId(MATERIAL_TRUNK),
                     casts_shadows: true,
-
+                    animated: false,
                     local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
                         glam::Vec3::ZERO,
                         glam::Vec3::ONE,
@@ -436,6 +509,7 @@ mod tests {
             indices: vec![0],
             material_id: crate::material::MaterialId(MATERIAL_TRUNK),
             casts_shadows: true,
+            animated: false,
             local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
                 glam::Vec3::new(1.0, 2.0, 3.0),
                 glam::Vec3::ZERO,

@@ -37,3 +37,31 @@ pub fn upload_mesh(
         indirect_buffer: None,
     }
 }
+
+/// Like `upload_mesh` but the vertex buffer uses `VERTEX | COPY_DST` so it can be
+/// re-uploaded each frame for animated geometry.
+pub fn upload_mesh_animated(
+    device: &wgpu::Device,
+    vertices: &[Vertex],
+    indices: &[u32],
+    label: &str,
+) -> GpuMesh {
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("prism-{label}-vertices-animated")),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("prism-{label}-indices")),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let index_count = indices.len() as u32;
+    GpuMesh {
+        vertex_buffer,
+        index_buffer,
+        index_count,
+        active_index_count: index_count,
+        indirect_buffer: None,
+    }
+}

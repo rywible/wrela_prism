@@ -72,11 +72,11 @@ pub struct RedwoodSpecies {
 impl Default for RedwoodSpecies {
     fn default() -> Self {
         Self {
-            max_height: 65.0,
-            base_diameter: 9.0,
+            max_height: 100.0,
+            base_diameter: 7.0,
 
-            leader_extension_rate: 1.5,
-            lateral_extension_rate: 2.5,
+            leader_extension_rate: 2.3,
+            lateral_extension_rate: 3.8,
 
             phyllotactic_angle: 137.508_f32.to_radians(), // golden angle
             bud_activation_probability: 0.14,

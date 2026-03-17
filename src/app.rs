@@ -15,7 +15,8 @@ use winit::{
 };
 
 use crate::art_direction::ArtDirection;
-use crate::camera::CameraState;
+use crate::camera::{CameraMode, CameraState, ThirdPersonConfig, ThirdPersonState};
+
 use crate::compiler::{CompiledScene, SceneCompiler};
 use crate::gpu::GpuContext;
 use crate::renderer::{FrameInputs, Renderer};
@@ -39,6 +40,7 @@ struct AppOptions {
     style: Option<String>,
     style_blend: Option<f32>,
     growth_sim: bool,
+    third_person: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,6 +69,10 @@ struct RuntimeState {
     warmup_remaining: u32,
     debug_overlay: crate::pipeline::DebugOverlay,
     art_direction: ArtDirection,
+    humanoid_animator: Option<crate::humanoid_animator::HumanoidAnimator>,
+    camera_mode: CameraMode,
+    character_pos: glam::Vec3,
+    third_person: ThirdPersonState,
 }
 
 impl RuntimeState {
@@ -161,6 +167,42 @@ impl RuntimeState {
             ArtDirection::new()
         };
 
+        // Initialize humanoid animator if animated regions exist
+        info!(
+            "animated regions: {}, animated shadow indices: {}",
+            runtime_scene_gpu.animated_regions.len(),
+            runtime_scene_gpu.animated_shadow_indices.len(),
+        );
+        for (label, region) in &runtime_scene_gpu.animated_regions {
+            info!(
+                "  animated region '{}': byte_offset={}, vertex_count={}",
+                label, region.vertex_byte_offset, region.vertex_count
+            );
+        }
+        let humanoid_animator =
+            if let Some((_, region)) = runtime_scene_gpu.animated_regions.first() {
+                let shadow_idx = runtime_scene_gpu
+                    .animated_shadow_indices
+                    .first()
+                    .map(|(_, idx)| *idx);
+                let params = crate::subjects::humanoid::HumanoidParams::default();
+                info!(
+                    "humanoid animator: region byte_offset={}, vertex_count={}, shadow_idx={:?}",
+                    region.vertex_byte_offset, region.vertex_count, shadow_idx
+                );
+                Some(crate::humanoid_animator::HumanoidAnimator::new(
+                    &params,
+                    crate::runtime_scene::AnimatedRegion {
+                        vertex_byte_offset: region.vertex_byte_offset,
+                        vertex_count: region.vertex_count,
+                    },
+                    shadow_idx,
+                ))
+            } else {
+                info!("no animated regions found — humanoid animator disabled");
+                None
+            };
+
         let now = Instant::now();
         info!("wrela_prism initialized — {}x{}", size.width, size.height);
 
@@ -194,6 +236,14 @@ impl RuntimeState {
             warmup_remaining,
             debug_overlay: crate::pipeline::DebugOverlay::default(),
             art_direction,
+            humanoid_animator,
+            camera_mode: if options.third_person {
+                CameraMode::ThirdPerson
+            } else {
+                CameraMode::FreeCam
+            },
+            character_pos: glam::Vec3::new(8.0, 0.0, 0.0),
+            third_person: ThirdPersonState::new(ThirdPersonConfig::default()),
         })
     }
 
@@ -274,15 +324,54 @@ impl RuntimeState {
         let sprint = self.pressed_keys.contains(&KeyCode::ShiftLeft)
             || self.pressed_keys.contains(&KeyCode::ShiftRight);
 
-        if strafe != 0.0 || forward != 0.0 || vertical != 0.0 {
-            self.camera
-                .move_on_plane(glam::Vec2::new(strafe, forward), vertical, dt, sprint);
+        match self.camera_mode {
+            CameraMode::FreeCam => {
+                if strafe != 0.0 || forward != 0.0 || vertical != 0.0 {
+                    self.camera.move_on_plane(
+                        glam::Vec2::new(strafe, forward),
+                        vertical,
+                        dt,
+                        sprint,
+                    );
+                }
+            }
+            CameraMode::ThirdPerson => {
+                // WASD moves character on Y=0 plane
+                let planar = glam::Vec2::new(strafe, forward);
+                self.character_pos = self.third_person.move_character(
+                    self.character_pos,
+                    planar,
+                    dt,
+                    sprint,
+                    &self.camera.navigation,
+                );
+
+                // Compute camera position from orbit
+                let (cam_pos, yaw, pitch) =
+                    self.third_person.compute_camera(self.character_pos);
+                self.camera.position = cam_pos;
+                self.camera.yaw = yaw;
+                self.camera.pitch = pitch;
+            }
         }
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let dt = self.frame_delta_secs();
         self.apply_camera_input(dt);
+
+        // Update character visibility and model matrix for the forward pass
+        let is_third_person = self.camera_mode == CameraMode::ThirdPerson;
+        self.renderer.set_character_visible(is_third_person);
+        if is_third_person {
+            let model = glam::Mat4::from_translation(self.character_pos);
+            self.renderer.set_character_model(model);
+        }
+
+        // Tick humanoid animation before render
+        if let Some(ref mut animator) = self.humanoid_animator {
+            animator.tick(dt, &self.gpu.queue, &self.runtime_scene_gpu);
+        }
 
         // Update art direction (advance transitions, upload uniforms to GPU)
         self.art_direction.update(
@@ -394,6 +483,18 @@ impl ApplicationHandler for App {
                     if event.state == ElementState::Pressed {
                         match code {
                             KeyCode::Escape => runtime.release_cursor(),
+                            KeyCode::Tab => {
+                                runtime.camera_mode = match runtime.camera_mode {
+                                    CameraMode::FreeCam => {
+                                        info!("camera mode: third-person");
+                                        CameraMode::ThirdPerson
+                                    }
+                                    CameraMode::ThirdPerson => {
+                                        info!("camera mode: free-cam");
+                                        CameraMode::FreeCam
+                                    }
+                                };
+                            }
                             KeyCode::F1 => runtime
                                 .toggle_debug_overlay(crate::pipeline::DebugOverlay::StructureOnly),
                             KeyCode::F2 => runtime
@@ -500,9 +601,15 @@ impl ApplicationHandler for App {
         }
 
         if let DeviceEvent::MouseMotion { delta } = event {
-            runtime
-                .camera
-                .apply_look_delta(glam::Vec2::new(delta.0 as f32, delta.1 as f32));
+            let delta_vec = glam::Vec2::new(delta.0 as f32, delta.1 as f32);
+            match runtime.camera_mode {
+                CameraMode::FreeCam => {
+                    runtime.camera.apply_look_delta(delta_vec);
+                }
+                CameraMode::ThirdPerson => {
+                    runtime.third_person.apply_look_delta(delta_vec);
+                }
+            }
         }
     }
 
@@ -611,6 +718,9 @@ impl AppOptions {
                 "--growth-sim" => {
                     options.growth_sim = true;
                 }
+                "--third-person" => {
+                    options.third_person = true;
+                }
                 other => bail!("unrecognized argument: {other}"),
             }
         }
@@ -646,6 +756,7 @@ impl Default for AppOptions {
             style: None,
             style_blend: None,
             growth_sim: false,
+            third_person: false,
         }
     }
 }

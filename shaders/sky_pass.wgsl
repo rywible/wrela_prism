@@ -101,6 +101,34 @@ fn soft_sky_rolloff(color: vec3<f32>) -> vec3<f32> {
     return color / (vec3<f32>(1.0) + color * vec3<f32>(0.22, 0.18, 0.14));
 }
 
+fn horizon_alignment(view_dir: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    let view_xz = vec2<f32>(view_dir.x, view_dir.z);
+    let sun_xz = vec2<f32>(sun_dir.x, sun_dir.z);
+    let view_len = length(view_xz);
+    let sun_len = length(sun_xz);
+    if view_len < 1e-4 || sun_len < 1e-4 {
+        return 0.5;
+    }
+    return clamp(dot(view_xz / view_len, sun_xz / sun_len), 0.0, 1.0);
+}
+
+fn lower_atmosphere_haze(
+    ray_dir: vec3<f32>,
+    sun_dir: vec3<f32>,
+    sun_transmittance: vec3<f32>,
+    cloud_cover: f32,
+) -> vec3<f32> {
+    let horizon = exp(-abs(ray_dir.y) * 13.0);
+    let lower_mix = smoothstep(-0.36, 0.14, ray_dir.y);
+    let sun_side = pow(horizon_alignment(ray_dir, sun_dir), 1.35);
+    let dust = uniforms.fog_color.rgb * vec3<f32>(0.86, 0.82, 0.70) * (0.28 + 0.20 * lower_mix);
+    let warm = uniforms.sun_color.rgb * sun_transmittance * vec3<f32>(0.28, 0.19, 0.09)
+        * (0.30 + 0.40 * sun_side)
+        * (1.0 - cloud_cover * 0.18);
+    let lift = vec3<f32>(0.04, 0.032, 0.020);
+    return (dust + warm + lift) * horizon;
+}
+
 // ──────────────────────── Main Fragment ────────────────────────
 
 @fragment
@@ -124,8 +152,8 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let sky_strength = max(uniforms.sky_zenith.w, 0.001);
     let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
     let sun_height = max(sun_dir.y, 0.0);
-    let clear_sun = clamp(1.0 - cloud_cover * (0.24 + 0.12 * sun_height), 0.55, 1.0);
-    let diffuse_sun = mix(1.0, 0.88, cloud_cover);
+    let clear_sun = clamp(1.0 - cloud_cover * (0.16 + 0.08 * sun_height), 0.68, 1.0);
+    let diffuse_sun = mix(1.0, 0.93, cloud_cover);
     let cos_theta = dot(ray_dir, sun_dir);
     let angular_dist = acos(clamp(cos_theta, -1.0, 1.0));
     let sun_transmittance = sample_transmittance_at(sun_dir.y, 0.001);
@@ -134,62 +162,62 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let sky_uv = dir_to_sky_view_uv(ray_dir);
     let lut_color = textureSampleLevel(sky_view_lut, lut_sampler, sky_uv, 0.0).rgb;
     let scattering = lut_color * sun_color * diffuse_sun * sky_strength;
+    let lower_haze = lower_atmosphere_haze(ray_dir, sun_dir, sun_transmittance, cloud_cover);
 
     // ── Build sky color in layers ──
 
-    // Elevation factor: 1.0 at zenith, 0.0 at horizon
-    let elev = max(ray_dir.y, 0.0);
-    let zenith_weight = pow(elev, 0.5);
+    let elev = clamp(ray_dir.y * 0.75 + 0.32, 0.0, 1.0);
+    let zenith_weight = pow(elev, 0.68);
 
     // Gradient colors are now a gentle grade over the LUT, not the main sky body.
-    let horizon_blend = smoothstep(0.0, 0.10, elev);
+    let horizon_blend = smoothstep(-0.08, 0.18, ray_dir.y);
     let lower_grade = mix(
-        uniforms.fog_color.rgb * (0.42 + cloud_cover * 0.18),
-        uniforms.sky_horizon.rgb * (0.28 + clear_sun * 0.10),
+        uniforms.fog_color.rgb * vec3<f32>(0.28, 0.28, 0.22) + uniforms.sun_color.rgb * vec3<f32>(0.08, 0.06, 0.03),
+        uniforms.sky_horizon.rgb * 0.16 + uniforms.sun_color.rgb * vec3<f32>(0.05, 0.04, 0.03),
         horizon_blend
     );
     let upper_grade = mix(
-        uniforms.sky_horizon.rgb * 0.12,
-        uniforms.sky_zenith.rgb * 0.24,
+        uniforms.sky_horizon.rgb * 0.07,
+        uniforms.sky_zenith.rgb * 0.18,
         zenith_weight
     );
-    let base_grade = mix(lower_grade, upper_grade, smoothstep(0.03, 0.58, elev));
+    let base_grade = mix(lower_grade, upper_grade, smoothstep(-0.02, 0.62, ray_dir.y));
 
-    let scatter_boost = mix(1.18, 1.72, smoothstep(0.0, 0.32, elev));
+    let scatter_boost = mix(1.46, 1.84, smoothstep(-0.10, 0.40, ray_dir.y));
     let scatter_contrib = soft_sky_rolloff(scattering * scatter_boost);
-    var sky = scatter_contrib + base_grade;
+    var sky = scatter_contrib + base_grade + lower_haze;
 
     // Layer 3: Sun-side warmth — golden, not red (avoids purple mixing with blue)
     let sun_facing = max(cos_theta, 0.0);
-    let sun_warmth = sun_facing * sun_facing * 0.035 * clear_sun;
+    let sun_warmth = pow(sun_facing, 1.7) * 0.065 * clear_sun;
     sky += vec3<f32>(0.55, 0.46, 0.16) * sun_warmth * sun_transmittance;
 
     // Layer 4: Warm horizon band — concentrated at the horizon line
-    let horizon_band = exp(-abs(ray_dir.y) * 8.0);
+    let horizon_band = exp(-abs(ray_dir.y) * 6.8);
     let haze_strength = uniforms.shaft_params.x * mix(1.0, 1.30, cloud_cover);
     let sun_horiz_dot = max(dot(
         normalize(vec3<f32>(ray_dir.x, 0.0, ray_dir.z)),
         normalize(vec3<f32>(sun_dir.x, 0.0, sun_dir.z))), 0.0);
-    let warm_horiz = horizon_band * pow(sun_horiz_dot, 2.0) * haze_strength;
-    sky += vec3<f32>(0.18, 0.10, 0.035) * warm_horiz;
+    let warm_horiz = horizon_band * pow(sun_horiz_dot, 1.5) * haze_strength;
+    sky += vec3<f32>(0.12, 0.075, 0.030) * warm_horiz * sun_transmittance;
 
     // Layer 5: Mie forward-scatter — warm glow around the sun
-    let mie_glow = exp(-angular_dist * 3.5);
-    sky += vec3<f32>(1.0, 0.87, 0.58) * sun_color * sun_transmittance * mie_glow * 0.05 * clear_sun;
+    let mie_glow = exp(-angular_dist * 4.4);
+    sky += vec3<f32>(1.0, 0.87, 0.58) * sun_color * sun_transmittance * mie_glow * 0.08 * clear_sun;
 
     // ── Sun disk — small, intense, limb-darkened ──
     let cos_sun = cos(sun_angular_radius);
     if cos_theta > cos_sun {
         let limb = pow(1.0 - angular_dist / sun_angular_radius, 0.4);
-        sky += sun_color * limb * sun_transmittance * 34.0 * clear_sun;
+        sky += sun_color * limb * sun_transmittance * 42.0 * clear_sun;
     }
 
     // ── Corona — tight warm ring right around disk ──
     let corona = exp(-angular_dist * 40.0);
-    sky += vec3<f32>(1.0, 0.92, 0.70) * sun_color * sun_transmittance * corona * 0.22 * clear_sun;
+    sky += vec3<f32>(1.0, 0.92, 0.70) * sun_color * sun_transmittance * corona * 0.30 * clear_sun;
 
     let sky_luma = dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722));
-    sky = mix(sky, vec3<f32>(sky_luma), cloud_cover * 0.08);
+    sky = mix(sky, vec3<f32>(sky_luma), cloud_cover * 0.04);
 
     // Exposure (must match material pass)
     sky *= exposure;

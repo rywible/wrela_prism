@@ -535,6 +535,7 @@ pub fn transform_vertex(vertex: &Vertex, transform: glam::Affine3A) -> Vertex {
 pub const MATERIAL_TRUNK: u32 = 0;
 pub const MATERIAL_FOLIAGE: u32 = 1;
 pub const MATERIAL_GROUND: u32 = 2;
+pub const MATERIAL_SKIN: u32 = 3;
 
 /// Shadow map helpers.
 pub mod shadow {

@@ -108,7 +108,7 @@ fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     var ldr = filmic_tonemap(hdr);
     let ldr_luma = luminance(ldr);
     let highlight_desat = smoothstep(0.55, 0.98, ldr_luma);
-    ldr = mix(ldr, vec3<f32>(ldr_luma), highlight_desat * 0.14);
+    ldr = mix(ldr, vec3<f32>(ldr_luma), highlight_desat * 0.08);
 
     // Art direction color grading (applied after tonemap, before vignette)
     let grade_strength = tu.color_grade.w;

@@ -94,6 +94,16 @@ impl Renderer {
         self.pipeline.art_direction_lod_bias = bias;
     }
 
+    /// Set whether the forward-rendered character capsule is drawn.
+    pub fn set_character_visible(&mut self, visible: bool) {
+        self.pipeline.character_visible = visible;
+    }
+
+    /// Set the character's world-space model matrix.
+    pub fn set_character_model(&mut self, model: glam::Mat4) {
+        self.pipeline.character_model = model;
+    }
+
     /// Set art direction post-processing parameters for bloom and tonemap.
     pub fn set_art_direction_post(
         &mut self,

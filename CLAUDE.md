@@ -27,9 +27,14 @@ cargo fmt --check            # Check formatting
 --camera-position x,y,z                              # Camera world position
 --camera-yaw <degrees>                               # Horizontal rotation
 --camera-pitch <degrees>                             # Vertical rotation
+--third-person                                       # Start in third-person camera mode
 ```
 
 **Logging:** `RUST_LOG=wrela_prism=debug cargo run --release` (default filter: `wrela_prism=info,wgpu=warn`)
+
+## Coordinate Convention
+
+**1 unit = 1 meter.** All spatial parameters (positions, distances, radii, heights) are in meters.
 
 ## Architecture
 
@@ -97,7 +102,8 @@ All shaders are WGSL files in `shaders/`. They are included at compile time via 
 
 ## Interactive Controls
 
-- **WASD** — Move, **QE** — Vertical, **Shift** — Sprint
-- **Mouse** — Look (after left-click to capture cursor)
+- **WASD** — Move (free-cam) / Move character (third-person), **QE** — Vertical (free-cam only), **Shift** — Sprint
+- **Mouse** — Look (free-cam) / Orbit camera (third-person) — after left-click to capture cursor
+- **Tab** — Toggle between FreeCam and ThirdPerson camera modes
 - **F1-F4** — Debug overlays (structure-only, canopy-only, wind magnitude, LOD heatmap)
 - **ESC** — Release cursor

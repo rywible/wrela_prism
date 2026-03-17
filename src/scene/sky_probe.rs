@@ -41,14 +41,14 @@ fn cloud_direct_visibility(settings: &SceneSettings, sun_height: f32) -> f32 {
         / 2.0)
         .clamp(0.6, 1.8);
     let density = (settings.cloud_profile.density_scale / 24.0).clamp(0.4, 1.2);
-    let occlusion = coverage * (0.22 + 0.12 * sun_height + 0.08 * thickness + 0.06 * density);
-    (1.0 - occlusion).clamp(0.55, 1.0)
+    let occlusion = coverage * (0.14 + 0.08 * sun_height + 0.05 * thickness + 0.04 * density);
+    (1.0 - occlusion).clamp(0.68, 1.0)
 }
 
 fn cloud_diffuse_boost(settings: &SceneSettings, sun_height: f32) -> f32 {
     let coverage = settings.cloud_coverage.clamp(0.0, 1.0);
     let overcast = coverage * (1.0 - 0.25 * sun_height);
-    1.0 + overcast * 0.16
+    1.0 + overcast * 0.10
 }
 
 /// Ray-sphere intersection. Returns (t_near, t_far) or (-1, -1) on miss.

@@ -58,18 +58,18 @@ impl Default for RedwoodParams {
     fn default() -> Self {
         Self {
             seed: 42,
-            trunk_height: 65.0,
-            base_radius: 4.5,
-            tip_radius: 0.55,
-            trunk_segments: 85,
+            trunk_height: 100.0,
+            base_radius: 3.5,
+            tip_radius: 0.20,
+            trunk_segments: 120,
             trunk_wobble: 0.07,
-            crown_start_frac: 0.38,
-            branch_count: 95,
+            crown_start_frac: 0.20,
+            branch_count: 120,
             max_branch_depth: 5,
             smooth_k_trunk: 0.30,
             smooth_k_branch: 0.06,
             smooth_k_fine: 0.03,
-            columnar_fraction: 0.70,
+            columnar_fraction: 0.65,
             flute_count: 8,
             flute_depth: 0.20,
         }
@@ -236,13 +236,41 @@ fn grow_branches(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut 
         .count();
 
     let lobe_angles = build_lobe_angles(rng);
-    let specs = build_primary_branch_specs(params, &lobe_angles, rng);
+
+    // Lobe bias: 2-3 lobes get 1.3-1.5× mass, others get 0.7-0.8×
+    let lobe_count = lobe_angles.len();
+    let dominant_lobe_count = 2 + usize::from(rng.next_f32() < 0.5);
+    let mut lobe_mass_bias = vec![rng.next_f32_range(0.70, 0.80); lobe_count];
+    for _i in 0..dominant_lobe_count.min(lobe_count) {
+        let idx = (rng.next_u64() as usize) % lobe_count;
+        lobe_mass_bias[idx] = rng.next_f32_range(1.30, 1.50);
+    }
+
+    let mut specs = build_primary_branch_specs(params, &lobe_angles, rng);
+
+    // Crown gaps: suppress 5-10% of mid-crown branches
+    let gap_fraction = rng.next_f32_range(0.05, 0.10);
+    for spec in &mut specs {
+        if spec.style.is_live()
+            && spec.trunk_frac > params.crown_start_frac + 0.10
+            && spec.trunk_frac < 0.80
+            && rng.next_f32() < gap_fraction
+        {
+            spec.length *= 0.05; // near-zero length = suppressed
+        }
+        // Apply lobe mass bias to branch length
+        if let Some(lid) = spec.lobe_id {
+            let lid_idx = (lid as usize) % lobe_count.max(1);
+            spec.length *= lobe_mass_bias[lid_idx];
+        }
+    }
+
     for spec in specs {
         grow_primary_branch(skeleton, params, rng, trunk_node_count, spec);
     }
 
-    // Apex crown: 14-22 branches filling the top of the crown
-    let apex_count = 14 + (rng.next_u64() % 9) as usize;
+    // Apex crown: 16-24 branches filling the top of the crown
+    let apex_count = 16 + (rng.next_u64() % 9) as usize;
     for i in 0..apex_count {
         let lobe_id = (i % lobe_angles.len().max(1)) as u8;
         let apex_t = i as f32 / apex_count.max(1) as f32;
@@ -257,6 +285,97 @@ fn grow_branches(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut 
             lobe_id: Some(lobe_id),
         };
         grow_primary_branch(skeleton, params, rng, trunk_node_count, apex_spec);
+    }
+
+    // Broken-top reiteration system
+    grow_reiteration(skeleton, params, rng, trunk_node_count, &lobe_angles);
+}
+
+/// Broken-top reiteration: leader death point with secondary leaders and dead spike.
+fn grow_reiteration(
+    skeleton: &mut TreeSkeleton,
+    params: &RedwoodParams,
+    rng: &mut TreeRng,
+    trunk_node_count: usize,
+    lobe_angles: &[f32],
+) {
+    // Leader death point: 82-92% of trunk height
+    let death_frac = rng.next_f32_range(0.82, 0.92);
+    let death_idx = find_trunk_node_at_frac(skeleton, death_frac, params, trunk_node_count);
+    let death_pos = skeleton.nodes[death_idx].position;
+    let death_radius = skeleton.nodes[death_idx].radius;
+
+    // Dead spike: original leader stub extends 2-5m above as bare wood
+    let spike_height = rng.next_f32_range(2.0, 5.0);
+    let spike_segments = 3;
+    let mut prev_spike = death_idx;
+    for seg_i in 0..spike_segments {
+        let seg_t = (seg_i + 1) as f32 / spike_segments as f32;
+        let pos = death_pos + Vec3::Y * spike_height * seg_t;
+        let radius = death_radius * (1.0 - seg_t * 0.7);
+        prev_spike = skeleton.push(SkeletonNode {
+            position: pos,
+            radius: radius.max(0.05),
+            parent: Some(prev_spike),
+            depth: 0,
+            kind: BranchKind::DeadStub,
+            lobe_id: None,
+        });
+    }
+
+    // Reiteration forks: 2-4 secondary leaders at the death point
+    let fork_count = 2 + (rng.next_u64() % 3) as usize;
+    for fork_i in 0..fork_count {
+        let angle_offset = (fork_i as f32 / fork_count as f32) * std::f32::consts::TAU
+            + rng.next_f32_range(-0.3, 0.3);
+        let tilt_deg = rng.next_f32_range(20.0, 40.0);
+        let tilt = tilt_deg.to_radians();
+        let leader_height = rng.next_f32_range(8.0, 15.0);
+        let leader_segments = 4;
+
+        let dir = Vec3::new(
+            angle_offset.cos() * tilt.sin(),
+            tilt.cos(),
+            angle_offset.sin() * tilt.sin(),
+        )
+        .normalize_or_zero();
+
+        let mut prev_idx = death_idx;
+        let mut prev_pos = death_pos;
+        let seg_len = leader_height / leader_segments as f32;
+        let base_r = death_radius * 0.5;
+
+        for seg_i in 0..leader_segments {
+            let seg_t = (seg_i + 1) as f32 / leader_segments as f32;
+            let pos = prev_pos + dir * seg_len;
+            let radius = base_r * (1.0 - seg_t * 0.6).max(0.1);
+            let node_idx = skeleton.push(SkeletonNode {
+                position: pos,
+                radius,
+                parent: Some(prev_idx),
+                depth: 1,
+                kind: BranchKind::LiveScaffold,
+                lobe_id: Some((fork_i % lobe_angles.len().max(1)) as u8),
+            });
+
+            // Add foliage branches on reiteration leaders
+            if seg_i >= 1 {
+                let child_length = leader_height * 0.3 * (1.0 - seg_t * 0.5);
+                grow_live_sub_branches(
+                    skeleton,
+                    node_idx,
+                    2,
+                    child_length,
+                    params,
+                    rng,
+                    (fork_i % lobe_angles.len().max(1)) as u8,
+                    0.7,
+                );
+            }
+
+            prev_idx = node_idx;
+            prev_pos = pos;
+        }
     }
 }
 
@@ -328,7 +447,7 @@ fn build_primary_branch_specs(
             pitch_deg: rng.next_f32_range(-5.0, 12.0),
             length: params.trunk_height
                 * crown_envelope(height_frac, params.crown_start_frac)
-                * 0.15
+                * 0.20
                 * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
@@ -346,7 +465,7 @@ fn build_primary_branch_specs(
             pitch_deg: rng.next_f32_range(10.0, 35.0) + upper_t * 15.0,
             length: params.trunk_height
                 * crown_envelope(height_frac, params.crown_start_frac)
-                * 0.13
+                * 0.17
                 * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
@@ -363,7 +482,7 @@ fn build_primary_branch_specs(
             pitch_deg: rng.next_f32_range(35.0, 65.0),
             length: params.trunk_height
                 * crown_envelope(height_frac, params.crown_start_frac)
-                * 0.09
+                * 0.14
                 * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
@@ -384,16 +503,21 @@ fn build_primary_branch_specs(
     specs
 }
 
-/// Conical crown envelope: widest near crown base, tapering toward top.
-/// Returns a scale factor [0, 1] for branch length at a given trunk fraction.
-/// Uses a softer taper to produce a fuller, more natural crown silhouette.
+/// Piecewise crown envelope: columnar body with rounded-cap taper.
+/// Returns a scale factor [0.20, 1.0] for branch length at a given trunk fraction.
+/// t ∈ [0, 0.6]: near-constant 1.0 (columnar body)
+/// t ∈ [0.6, 1.0]: smoothstep taper from 1.0 to 0.20 (rounded cap, never pinches to zero)
 fn crown_envelope(height_frac: f32, crown_start_frac: f32) -> f32 {
     if height_frac < crown_start_frac {
         return 0.0;
     }
     let t = (height_frac - crown_start_frac) / (1.0 - crown_start_frac);
-    // Softer taper: stays wider longer, then narrows near top
-    (1.0 - t * t).max(0.0)
+    if t <= 0.6 {
+        1.0
+    } else {
+        let taper_t = smoothstep(0.6, 1.0, t);
+        1.0 - 0.80 * taper_t // lerp(1.0, 0.20, taper_t)
+    }
 }
 
 fn grow_primary_branch(

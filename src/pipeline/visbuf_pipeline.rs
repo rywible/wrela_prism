@@ -8,6 +8,7 @@ use crate::scene::{LightingUniforms, SceneSettings};
 use super::bloom_pass::BloomPass;
 use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
+use super::forward_character::ForwardCharacterPass;
 use super::hw_raster_pass::{
     extract_frustum_planes, DispatchLists, HwRasterPass, VisbufFrameUniforms, VisibilityBuffer,
 };
@@ -88,6 +89,14 @@ pub struct VisbufPipeline {
     pub art_direction_bloom_softness: f32,
     pub art_direction_color_grade: [f32; 4],
     pub art_direction_lod_bias: f32,
+
+    // Forward-rendered character capsule
+    pub forward_character: ForwardCharacterPass,
+    forward_char_scene_bg: Option<wgpu::BindGroup>,
+    /// Character model matrix set per-frame from app.
+    pub character_model: glam::Mat4,
+    /// Whether to draw the character (third-person mode).
+    pub character_visible: bool,
 
     // Depth copy (Depth32Float → R32Float via compute)
     depth_copy_pipeline: wgpu::ComputePipeline,
@@ -289,6 +298,10 @@ impl VisbufPipeline {
             &vis_buffer,
         ));
 
+        let forward_character = ForwardCharacterPass::new(&gpu.device, &lighting_uniform_buffer);
+        let forward_char_scene_bg =
+            Some(forward_character.create_scene_bind_group(&gpu.device, &lighting_uniform_buffer));
+
         Self {
             hw_raster,
             cull_pass,
@@ -332,6 +345,10 @@ impl VisbufPipeline {
             art_direction_bloom_softness: 0.0,
             art_direction_color_grade: [1.0, 1.0, 1.0, 0.0],
             art_direction_lod_bias: 0.0,
+            forward_character,
+            forward_char_scene_bg,
+            character_model: glam::Mat4::IDENTITY,
+            character_visible: false,
             depth_copy_pipeline,
             depth_copy_bgl,
             depth_copy_bg,
@@ -645,6 +662,33 @@ impl VisbufPipeline {
                 &self.art_direction_bg,
                 &self.scene_color.view,
             );
+        }
+
+        // -- Pass 5.1: Forward character (capsule) --
+        if self.character_visible {
+            if let Some(scene_bg) = &self.forward_char_scene_bg {
+                self.forward_character
+                    .write_model(&gpu.queue, self.character_model);
+                self.forward_character.encode(
+                    &mut encoder,
+                    scene_bg,
+                    &self.scene_color.view,
+                    &self.vis_buffer.depth_view,
+                );
+            }
+
+            // Re-copy depth after character was drawn (character writes to depth)
+            if let Some(depth_copy_bg) = &self.depth_copy_bg {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("depth-copy-pass-post-char"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.depth_copy_pipeline);
+                pass.set_bind_group(0, depth_copy_bg, &[]);
+                let w = (self.vis_buffer.width + 7) / 8;
+                let h = (self.vis_buffer.height + 7) / 8;
+                pass.dispatch_workgroups(w, h, 1);
+            }
         }
 
         // -- Pass 5.5: Sky pass (fills empty vis pixels with atmospheric sky) --
