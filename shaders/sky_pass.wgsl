@@ -97,6 +97,10 @@ fn sample_transmittance_at(cos_zenith: f32, height: f32) -> vec3<f32> {
     return textureSampleLevel(transmittance_lut, lut_sampler, uv, 0.0).rgb;
 }
 
+fn soft_sky_rolloff(color: vec3<f32>) -> vec3<f32> {
+    return color / (vec3<f32>(1.0) + color * vec3<f32>(0.22, 0.18, 0.14));
+}
+
 // ──────────────────────── Main Fragment ────────────────────────
 
 @fragment
@@ -117,6 +121,11 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let sun_angular_radius = uniforms.atmosphere_params.x;
     let exposure = uniforms.lighting_params.x;
     let sun_color = uniforms.sun_color.rgb * uniforms.sun_color.w;
+    let sky_strength = max(uniforms.sky_zenith.w, 0.001);
+    let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
+    let sun_height = max(sun_dir.y, 0.0);
+    let clear_sun = clamp(1.0 - cloud_cover * (0.24 + 0.12 * sun_height), 0.55, 1.0);
+    let diffuse_sun = mix(1.0, 0.88, cloud_cover);
     let cos_theta = dot(ray_dir, sun_dir);
     let angular_dist = acos(clamp(cos_theta, -1.0, 1.0));
     let sun_transmittance = sample_transmittance_at(sun_dir.y, 0.001);
@@ -124,7 +133,7 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
     // ── Sky-view LUT: physical Rayleigh + Mie scattering ──
     let sky_uv = dir_to_sky_view_uv(ray_dir);
     let lut_color = textureSampleLevel(sky_view_lut, lut_sampler, sky_uv, 0.0).rgb;
-    let scattering = lut_color * sun_color;
+    let scattering = lut_color * sun_color * diffuse_sun * sky_strength;
 
     // ── Build sky color in layers ──
 
@@ -132,50 +141,55 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let elev = max(ray_dir.y, 0.0);
     let zenith_weight = pow(elev, 0.5);
 
-    // Layer 1: 3-zone base gradient
-    //   Horizon (elev=0): fog_color — matches material-pass aerial perspective
-    //   Low sky (elev~5°): sky_horizon — the bright pale sky color
-    //   Zenith (elev=90°): sky_zenith — deep saturated blue
-    let horizon_blend = smoothstep(0.0, 0.08, elev);  // fog→horizon in first ~5°
-    let lower_sky = mix(uniforms.fog_color.rgb, uniforms.sky_horizon.rgb * 0.6, horizon_blend);
-    let base_sky = mix(lower_sky, uniforms.sky_zenith.rgb, zenith_weight);
+    // Gradient colors are now a gentle grade over the LUT, not the main sky body.
+    let horizon_blend = smoothstep(0.0, 0.10, elev);
+    let lower_grade = mix(
+        uniforms.fog_color.rgb * (0.42 + cloud_cover * 0.18),
+        uniforms.sky_horizon.rgb * (0.28 + clear_sun * 0.10),
+        horizon_blend
+    );
+    let upper_grade = mix(
+        uniforms.sky_horizon.rgb * 0.12,
+        uniforms.sky_zenith.rgb * 0.24,
+        zenith_weight
+    );
+    let base_grade = mix(lower_grade, upper_grade, smoothstep(0.03, 0.58, elev));
 
-    // Layer 2: Physical scattering from LUT
-    // Color-selective clamp: allow blue Rayleigh through, limit R/G from Mie
-    // to prevent warm scattering from turning the blue sky lavender.
-    let scatter_boost = mix(0.2, 2.0, smoothstep(0.0, 0.25, elev));
-    let scatter_raw = scattering * scatter_boost;
-    let scatter_contrib = min(scatter_raw, vec3<f32>(0.05, 0.07, 0.18));
-    var sky = base_sky + scatter_contrib;
+    let scatter_boost = mix(1.18, 1.72, smoothstep(0.0, 0.32, elev));
+    let scatter_contrib = soft_sky_rolloff(scattering * scatter_boost);
+    var sky = scatter_contrib + base_grade;
 
     // Layer 3: Sun-side warmth — golden, not red (avoids purple mixing with blue)
     let sun_facing = max(cos_theta, 0.0);
-    let sun_warmth = sun_facing * sun_facing * 0.03;
-    sky += vec3<f32>(0.5, 0.5, 0.1) * sun_warmth * sun_transmittance;
+    let sun_warmth = sun_facing * sun_facing * 0.035 * clear_sun;
+    sky += vec3<f32>(0.55, 0.46, 0.16) * sun_warmth * sun_transmittance;
 
     // Layer 4: Warm horizon band — concentrated at the horizon line
     let horizon_band = exp(-abs(ray_dir.y) * 8.0);
-    let haze_strength = uniforms.shaft_params.x;
+    let haze_strength = uniforms.shaft_params.x * mix(1.0, 1.30, cloud_cover);
     let sun_horiz_dot = max(dot(
         normalize(vec3<f32>(ray_dir.x, 0.0, ray_dir.z)),
         normalize(vec3<f32>(sun_dir.x, 0.0, sun_dir.z))), 0.0);
     let warm_horiz = horizon_band * pow(sun_horiz_dot, 2.0) * haze_strength;
-    sky += vec3<f32>(0.15, 0.08, 0.02) * warm_horiz;
+    sky += vec3<f32>(0.18, 0.10, 0.035) * warm_horiz;
 
     // Layer 5: Mie forward-scatter — warm glow around the sun
     let mie_glow = exp(-angular_dist * 3.5);
-    sky += vec3<f32>(1.0, 0.85, 0.55) * sun_color * sun_transmittance * mie_glow * 0.04;
+    sky += vec3<f32>(1.0, 0.87, 0.58) * sun_color * sun_transmittance * mie_glow * 0.05 * clear_sun;
 
     // ── Sun disk — small, intense, limb-darkened ──
     let cos_sun = cos(sun_angular_radius);
     if cos_theta > cos_sun {
         let limb = pow(1.0 - angular_dist / sun_angular_radius, 0.4);
-        sky += sun_color * limb * sun_transmittance * 50.0;
+        sky += sun_color * limb * sun_transmittance * 34.0 * clear_sun;
     }
 
     // ── Corona — tight warm ring right around disk ──
     let corona = exp(-angular_dist * 40.0);
-    sky += vec3<f32>(1.0, 0.92, 0.70) * sun_color * sun_transmittance * corona * 0.3;
+    sky += vec3<f32>(1.0, 0.92, 0.70) * sun_color * sun_transmittance * corona * 0.22 * clear_sun;
+
+    let sky_luma = dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722));
+    sky = mix(sky, vec3<f32>(sky_luma), cloud_cover * 0.08);
 
     // Exposure (must match material pass)
     sky *= exposure;

@@ -1,0 +1,187 @@
+<h2>Revised Architecture: Three-Layer Style Transform</h2>
+<p class="subtitle">Incorporating palette system, style axes, and semantic channels</p>
+
+<div class="section">
+  <div style="background: #0d0d2b; border-radius: 12px; padding: 32px; position: relative;">
+    <!-- Flow diagram -->
+    <div style="display: flex; flex-direction: column; gap: 12px; align-items: center;">
+
+      <!-- Layer 1: Style Axes -->
+      <div style="background: linear-gradient(135deg, #1a0a3e, #2d1b69); border: 2px solid #7c83ff; border-radius: 12px; padding: 20px; width: 90%; max-width: 700px;">
+        <div style="display: flex; justify-content: space-between; align-items: start;">
+          <div>
+            <span class="label" style="color: #7c83ff; font-size: 13px;">Layer 1 — User-Facing</span>
+            <h3 style="margin: 4px 0 8px 0; color: #fff;">Style Axes (~8-12 knobs)</h3>
+            <p style="color: #aaa; margin: 0; font-size: 14px;">High-level, intuitive controls. What artists actually touch.</p>
+          </div>
+          <div style="background: #7c83ff22; border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #7c83ff; white-space: nowrap;">CPU-side</div>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;">
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">softness</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">exaggeration</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">shadow_graphicness</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">palette_warmth</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">atmospheric_depth</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">surface_detail</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">outline_presence</code>
+          <code style="background: #7c83ff22; color: #b8bbff; padding: 4px 10px; border-radius: 6px; font-size: 13px;">color_discipline</code>
+        </div>
+      </div>
+
+      <div style="color: #555; font-size: 20px;">&#x25BC; <span style="font-size: 12px; color: #666;">mapping functions (hand-authored)</span></div>
+
+      <!-- Layer 2: Style Parameters -->
+      <div style="background: linear-gradient(135deg, #1a2a0a, #2d4a1b); border: 2px solid #f0a500; border-radius: 12px; padding: 20px; width: 90%; max-width: 700px;">
+        <div style="display: flex; justify-content: space-between; align-items: start;">
+          <div>
+            <span class="label" style="color: #f0a500; font-size: 13px;">Layer 2 — GPU Uniforms</span>
+            <h3 style="margin: 4px 0 8px 0; color: #fff;">ArtDirectionUniforms (~25 params)</h3>
+            <p style="color: #aaa; margin: 0; font-size: 14px;">Raw GPU parameters. Derived from style axes. Directly interpolatable.</p>
+          </div>
+          <div style="background: #f0a50022; border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #f0a500; white-space: nowrap;">Uniform Buffer</div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 12px;">
+          <div>
+            <span style="color: #888; font-size: 11px; text-transform: uppercase;">Geometry</span>
+            <div style="color: #ccc; font-size: 13px; line-height: 1.8; margin-top: 4px;">
+              silhouette_inflate<br>
+              normal_smoothing<br>
+              detail_suppression
+            </div>
+          </div>
+          <div>
+            <span style="color: #888; font-size: 11px; text-transform: uppercase;">Shading</span>
+            <div style="color: #ccc; font-size: 13px; line-height: 1.8; margin-top: 4px;">
+              shading_bands<br>
+              band_softness<br>
+              shadow_color_shift<br>
+              rim_light_strength<br>
+              specular_flattening<br>
+              transmission_boost
+            </div>
+          </div>
+          <div>
+            <span style="color: #888; font-size: 11px; text-transform: uppercase;">Post-Process</span>
+            <div style="color: #ccc; font-size: 13px; line-height: 1.8; margin-top: 4px;">
+              outline_strength<br>
+              outline_thickness<br>
+              color_grade_tint<br>
+              bloom_tint<br>
+              detail_fade_distance
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="color: #555; font-size: 20px;">&#x25BC; <span style="font-size: 12px; color: #666;">applied via semantic channels</span></div>
+
+      <!-- Layer 3: Semantic Channels -->
+      <div style="background: linear-gradient(135deg, #2a0a0a, #4a1b1b); border: 2px solid #e74c3c; border-radius: 12px; padding: 20px; width: 90%; max-width: 700px;">
+        <div style="display: flex; justify-content: space-between; align-items: start;">
+          <div>
+            <span class="label" style="color: #e74c3c; font-size: 13px;">Layer 3 — Per-Object Semantic Channels</span>
+            <h3 style="margin: 4px 0 8px 0; color: #fff;">Object Semantic Data</h3>
+            <p style="color: #aaa; margin: 0; font-size: 14px;">Objects expose abstract properties. Style transforms act on these, not on object internals.</p>
+          </div>
+          <div style="background: #e74c3c22; border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #e74c3c; white-space: nowrap;">Per-Vertex / Per-Instance</div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px;">
+          <div style="background: #1a0a0a; border-radius: 8px; padding: 12px;">
+            <span style="color: #e74c3c; font-size: 12px; font-weight: 600;">Shared Channels (all objects)</span>
+            <div style="color: #ccc; font-size: 13px; line-height: 1.8; margin-top: 6px;">
+              curvature<br>
+              edge_sharpness<br>
+              surface_noise<br>
+              visual_importance
+            </div>
+          </div>
+          <div style="background: #1a0a0a; border-radius: 8px; padding: 12px;">
+            <span style="color: #e74c3c; font-size: 12px; font-weight: 600;">How Style Uses Them</span>
+            <div style="color: #ccc; font-size: 13px; line-height: 1.8; margin-top: 6px;">
+              <code>softness</code> × <code>edge_sharpness</code> → smooths all edges<br>
+              <code>exaggeration</code> × <code>curvature</code> → amplifies all curves<br>
+              <code>surface_detail</code> × <code>surface_noise</code> → reduces noise<br>
+              Works on trees, rocks, ground — any object
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Palette System</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 24px;">
+    <p style="color: #ccc; line-height: 1.8; margin-top: 0;">
+      Separate from the three layers, a <strong>palette mapping</strong> forces all object colors into a curated family.
+      Objects output raw base colors. The style system remaps them through palette slots.
+    </p>
+    <div style="display: flex; gap: 24px; align-items: center; justify-content: center; margin: 20px 0;">
+      <!-- Raw colors -->
+      <div style="text-align: center;">
+        <span style="color: #888; font-size: 12px; display: block; margin-bottom: 8px;">Raw Object Colors</span>
+        <div style="display: flex; gap: 4px;">
+          <div style="width: 36px; height: 36px; background: #4a3020; border-radius: 6px;" title="bark brown"></div>
+          <div style="width: 36px; height: 36px; background: #1a4a1a; border-radius: 6px;" title="leaf green"></div>
+          <div style="width: 36px; height: 36px; background: #3a3025; border-radius: 6px;" title="soil brown"></div>
+          <div style="width: 36px; height: 36px; background: #2a5a2a; border-radius: 6px;" title="moss green"></div>
+        </div>
+      </div>
+
+      <div style="color: #f0a500; font-size: 24px;">→</div>
+
+      <!-- Palette transform -->
+      <div style="text-align: center;">
+        <span style="color: #f0a500; font-size: 12px; display: block; margin-bottom: 8px;">Demon Slayer Palette</span>
+        <div style="display: flex; gap: 4px;">
+          <div style="width: 36px; height: 36px; background: #5c3a28; border-radius: 6px;" title="warm bark"></div>
+          <div style="width: 36px; height: 36px; background: #1a5c3a; border-radius: 6px;" title="deep teal green"></div>
+          <div style="width: 36px; height: 36px; background: #3a2840; border-radius: 6px;" title="purple-brown soil"></div>
+          <div style="width: 36px; height: 36px; background: #2a6848; border-radius: 6px;" title="jade moss"></div>
+        </div>
+      </div>
+
+      <div style="color: #f0a500; font-size: 24px;">→</div>
+
+      <!-- Alt palette -->
+      <div style="text-align: center;">
+        <span style="color: #7c83ff; font-size: 12px; display: block; margin-bottom: 8px;">Ghibli Palette</span>
+        <div style="display: flex; gap: 4px;">
+          <div style="width: 36px; height: 36px; background: #6b4a30; border-radius: 6px;" title="soft warm bark"></div>
+          <div style="width: 36px; height: 36px; background: #3a8a4a; border-radius: 6px;" title="bright vivid green"></div>
+          <div style="width: 36px; height: 36px; background: #5a4a38; border-radius: 6px;" title="warm earth"></div>
+          <div style="width: 36px; height: 36px; background: #4a9a5a; border-radius: 6px;" title="lush moss"></div>
+        </div>
+      </div>
+    </div>
+    <p style="color: #aaa; font-size: 13px; margin-bottom: 0; text-align: center;">
+      Same objects, same geometry, same lighting model. Different palette → different world.
+    </p>
+  </div>
+</div>
+
+<div style="background: linear-gradient(135deg, #0d0d2b, #1a0a2e); border-radius: 12px; padding: 24px; border: 1px solid #333;">
+  <h3 style="margin-top: 0;">What Changed From Previous Design</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+    <div>
+      <span class="label" style="color: #888;">Before</span>
+      <ul style="color: #ccc; line-height: 1.8; margin-top: 8px;">
+        <li>~25 raw knobs exposed directly to user</li>
+        <li>Per-material shader paths (trunk/foliage/ground)</li>
+        <li>Color control via saturation + hue shift</li>
+        <li>No abstraction between user intent and GPU params</li>
+      </ul>
+    </div>
+    <div>
+      <span class="label" style="color: #7c83ff;">After</span>
+      <ul style="color: #ccc; line-height: 1.8; margin-top: 8px;">
+        <li>~8-12 style axes → mapped to GPU params</li>
+        <li>Semantic channels make styles object-agnostic</li>
+        <li>Palette system for color cohesion</li>
+        <li>Clean separation: intent → parameters → transforms</li>
+      </ul>
+    </div>
+  </div>
+</div>

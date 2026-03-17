@@ -69,6 +69,10 @@ fn density_at_height(altitude: f32) -> vec2<f32> {
     );
 }
 
+fn ozone_density(altitude: f32) -> f32 {
+    return max(1.0 - abs(altitude - 25.0) / 15.0, 0.0);
+}
+
 // ──────────────────────── Transmittance LUT ────────────────────────
 //
 // Parameterization: x = cos(zenith_angle) mapped [0,1], y = height mapped [0,1]
@@ -110,9 +114,7 @@ fn compute_transmittance_impl(cos_zenith: f32, height: f32) -> vec3<f32> {
         let d = density_at_height(alt);
         optical_r += d.x * step_size;
         optical_m += d.y * step_size;
-        // Ozone: thin layer centered at 25km
-        let oz_density = max(1.0 - abs(alt - 25.0) / 15.0, 0.0);
-        optical_oz += oz_density * step_size;
+        optical_oz += ozone_density(alt) * step_size;
     }
 
     let tau = BETA_R * optical_r + BETA_M * optical_m + BETA_OZ * optical_oz;
@@ -189,6 +191,7 @@ fn compute_multiscatter(@builtin(global_invocation_id) gid: vec3<u32>) {
         let step_size = ray_len / f32(num_steps);
         var optical_r = 0.0;
         var optical_m = 0.0;
+        var optical_oz = 0.0;
         var luminance = vec3<f32>(0.0);
         var fms = vec3<f32>(0.0);
 
@@ -200,8 +203,11 @@ fn compute_multiscatter(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             optical_r += d.x * step_size;
             optical_m += d.y * step_size;
+            optical_oz += ozone_density(alt) * step_size;
 
-            let local_tau = BETA_R * optical_r * rayleigh_mult + BETA_M * optical_m * mie_mult;
+            let local_tau = BETA_R * optical_r * rayleigh_mult
+                + BETA_M * optical_m * mie_mult
+                + BETA_OZ * optical_oz;
             let local_trans = exp(-local_tau);
 
             let cos_zen_sun = normalize(pos).y * sun_dir.y + normalize(pos).x * sun_dir.x;
@@ -310,6 +316,7 @@ fn compute_sky_view(@builtin(global_invocation_id) gid: vec3<u32>) {
     var total = vec3<f32>(0.0);
     var optical_r = 0.0;
     var optical_m = 0.0;
+    var optical_oz = 0.0;
 
     for (var i = 0; i < steps; i++) {
         let t = (f32(i) + 0.5) * step_size;
@@ -319,11 +326,15 @@ fn compute_sky_view(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let dr = d.x * step_size;
         let dm = d.y * step_size;
+        let doz = ozone_density(alt) * step_size;
         optical_r += dr;
         optical_m += dm;
+        optical_oz += doz;
 
         // View transmittance
-        let view_tau = BETA_R * optical_r * rayleigh_mult + BETA_M * optical_m * mie_mult;
+        let view_tau = BETA_R * optical_r * rayleigh_mult
+            + BETA_M * optical_m * mie_mult
+            + BETA_OZ * optical_oz;
         let view_trans = exp(-view_tau);
 
         // Sun transmittance from LUT

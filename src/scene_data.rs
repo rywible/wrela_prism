@@ -2,9 +2,6 @@
 pub const VISIBILITY_EMPTY: u32 = 0;
 /// Bias applied so valid geometry never aliases the empty sentinel.
 pub const VISIBILITY_ID_BIAS: u32 = 1;
-/// Default alpha-mask seed used for foliage runtime uploads.
-pub const DEFAULT_FOLIAGE_ALPHA_SEED: u32 = 42;
-
 pub fn pack_visibility_id(meshlet_idx: u32, tri_idx: u32) -> u32 {
     ((meshlet_idx << 8) | tri_idx) + VISIBILITY_ID_BIAS
 }

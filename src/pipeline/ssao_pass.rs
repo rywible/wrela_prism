@@ -28,9 +28,7 @@ impl SsaoPass {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prism-ssao-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/ssao.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssao.wgsl").into()),
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -43,7 +41,8 @@ impl SsaoPass {
         let raw_ao_texture = create_ao_texture(device, width, height, "prism-ssao-raw");
         let raw_ao_view = raw_ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let blurred_ao_texture = create_ao_texture(device, width, height, "prism-ssao-blurred");
-        let blurred_ao_view = blurred_ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let blurred_ao_view =
+            blurred_ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Sample pass bind group layout
         let sample_bind_group_layout =
@@ -59,7 +58,7 @@ impl SsaoPass {
                             has_dynamic_offset: false,
                             min_binding_size: Some(
                                 std::num::NonZeroU64::new(
-                                    std::mem::size_of::<SsaoUniforms>() as u64,
+                                    std::mem::size_of::<SsaoUniforms>() as u64
                                 )
                                 .unwrap(),
                             ),
@@ -116,7 +115,7 @@ impl SsaoPass {
                             has_dynamic_offset: false,
                             min_binding_size: Some(
                                 std::num::NonZeroU64::new(
-                                    std::mem::size_of::<SsaoUniforms>() as u64,
+                                    std::mem::size_of::<SsaoUniforms>() as u64
                                 )
                                 .unwrap(),
                             ),
@@ -326,12 +325,7 @@ impl SsaoPass {
     }
 }
 
-fn create_ao_texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-    label: &str,
-) -> wgpu::Texture {
+fn create_ao_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {

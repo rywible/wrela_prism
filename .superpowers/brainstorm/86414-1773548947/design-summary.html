@@ -1,0 +1,129 @@
+<h2>Art Direction System — Full Design Summary</h2>
+<p class="subtitle">Everything we've agreed on, in one view</p>
+
+<div class="section">
+  <h3>Architecture: Style Transform Stack (3 Layers)</h3>
+  <div style="background: #0d0d2b; border-radius: 12px; padding: 24px;">
+    <div style="display: flex; gap: 12px; align-items: stretch;">
+      <div style="flex: 1; background: linear-gradient(135deg, #1a0a3e, #2d1b69); border: 1px solid #7c83ff; border-radius: 10px; padding: 16px;">
+        <span class="label" style="color: #7c83ff;">Layer 1: Style Axes</span>
+        <p style="color: #ccc; font-size: 13px; margin: 8px 0 0;">~8-12 high-level knobs (softness, exaggeration, shadow_graphicness, etc). User-facing and game-facing API. Interpolatable for runtime morphing.</p>
+      </div>
+      <div style="display: flex; align-items: center; color: #555;">→</div>
+      <div style="flex: 1; background: linear-gradient(135deg, #1a2a0a, #2d4a1b); border: 1px solid #f0a500; border-radius: 10px; padding: 16px;">
+        <span class="label" style="color: #f0a500;">Layer 2: GPU Params</span>
+        <p style="color: #ccc; font-size: 13px; margin: 8px 0 0;">~25 raw params in ArtDirectionUniforms. Derived from axes via mapping functions. Separate uniform buffer bound to shaders.</p>
+      </div>
+      <div style="display: flex; align-items: center; color: #555;">→</div>
+      <div style="flex: 1; background: linear-gradient(135deg, #2a0a0a, #4a1b1b); border: 1px solid #e74c3c; border-radius: 10px; padding: 16px;">
+        <span class="label" style="color: #e74c3c;">Layer 3: Semantic Channels</span>
+        <p style="color: #ccc; font-size: 13px; margin: 8px 0 0;">Per-vertex data (curvature, edge_sharpness, surface_noise, importance). Packed as u32. Style transforms act on these, not object internals.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Pipeline Changes</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+    <div style="display: grid; grid-template-columns: auto auto 1fr; gap: 6px 16px; color: #ccc; font-size: 14px; line-height: 2;">
+      <span style="color: #7c83ff;">MODIFY</span><span style="color: #888;">HW Raster</span><span>Geometry deformation (inflate, smooth, suppress) after vertex transform</span>
+      <span style="color: #f0a500;">MODIFY</span><span style="color: #888;">Material Resolve</span><span>Post-PBR transforms: light banding → shadow shift → rim → palette → spec flatten</span>
+      <span style="color: #f0a500;">MODIFY</span><span style="color: #888;">Bloom</span><span>Read bloom_tint + bloom_softness from art direction uniforms</span>
+      <span style="color: #f0a500;">MODIFY</span><span style="color: #888;">Tonemap</span><span>Color grading step (tint + strength) post-tonemap</span>
+      <span style="color: #e74c3c;">NEW</span><span style="color: #888;">Outline Pass</span><span>Sobel on depth + normals → variable-weight screen-space outlines</span>
+      <span style="color: #e74c3c;">NEW</span><span style="color: #888;">art_direction.rs</span><span>StyleAxes, ArtDirectionUniforms, StylePalette, transition engine</span>
+      <span style="color: #e74c3c;">NEW</span><span style="color: #888;">Vertex format</span><span>+4 bytes per vertex for packed semantic channels</span>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Key Design Decisions</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+      <div>
+        <span class="label" style="color: #888;">Philosophy</span>
+        <ul style="color: #ccc; font-size: 14px; line-height: 1.9; margin-top: 8px;">
+          <li>High-fidelity simulation → controlled degradation</li>
+          <li>PBR runs fully, style transforms applied on top</li>
+          <li>All defaults = identity (current photorealistic look)</li>
+          <li>Style is a gameplay system, not just a dev tool</li>
+        </ul>
+      </div>
+      <div>
+        <span class="label" style="color: #888;">Technical</span>
+        <ul style="color: #ccc; font-size: 14px; line-height: 1.9; margin-top: 8px;">
+          <li>Separate ArtDirectionUniforms buffer (not extending LightingUniforms)</li>
+          <li>Per-object overrides via prototype-indexed buffer</li>
+          <li>All knobs are floats/vec3s — everything interpolates</li>
+          <li>Vertex deformation (no regeneration) for runtime geometry morphing</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Runtime API — Two Consumers</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+    <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+      <span class="label" style="color: #7c83ff;">Gameplay (Programmatic)</span>
+      <div style="color: #ccc; font-size: 14px; line-height: 1.8; margin-top: 8px;">
+        <code>transition_to(style, duration, curve)</code><br>
+        <code>set_blend([(style_a, weight), ...])</code><br>
+        <code>drive_axis(axis, value)</code><br><br>
+        <span style="color: #888;">Examples: flow state → watercolor, death → monochrome, biome transitions, combat intensity driving shadow_graphicness</span>
+      </div>
+    </div>
+    <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+      <span class="label" style="color: #f0a500;">Harness (Authoring)</span>
+      <div style="color: #ccc; font-size: 14px; line-height: 1.8; margin-top: 8px;">
+        F5 — cycle style snapshots<br>
+        F6 — inspector overlay<br>
+        [ / ] — blend slider<br>
+        0 — reset to photorealistic<br>
+        CLI: <code>--style</code>, <code>--style-blend</code><br><br>
+        <span style="color: #888;">Used to author and tune styles that gameplay later drives</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Palette System</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+    <p style="color: #ccc; font-size: 14px; line-height: 1.8; margin: 0;">
+      9 curated color slots (shadow, dark, mid, light, accent, bark, foliage, earth, sky_tint). Objects output raw base colors.
+      Shader remaps via luminance-based tonal slot matching + material-hint blending. <code>color_discipline</code> axis controls blend strength
+      (0 = raw colors, 1 = fully palette-mapped). Palette slots are vec3s — interpolatable for morphing between palettes.
+    </p>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Scope: What's NOT In Stage 1</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 20px;">
+    <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">Spatial style fields</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">Style inheritance syntax</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">Style sharing ecosystem</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">Composition-layer influence</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">Latent style manifold</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">AI-assisted style generation</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">GUI slider panel</span>
+      <span style="background: #333; color: #888; padding: 6px 14px; border-radius: 20px; font-size: 13px;">SW raster deformation</span>
+    </div>
+  </div>
+</div>
+
+<div style="background: linear-gradient(135deg, #0d1a0d, #0a2a1a); border-radius: 12px; padding: 24px; border: 1px solid #2a5a3a; margin-top: 16px;">
+  <h3 style="margin-top: 0; color: #4ade80;">First Target: Demon Slayer Style</h3>
+  <p style="color: #ccc; font-size: 14px; line-height: 1.8; margin: 0;">
+    The implementation validates the system by building one complete style:
+    soft gradient banding (~3-4 steps), purple-shifted shadows, strong warm rim lights,
+    curated palette (deep greens, warm bark, purple shadow tones), variable-weight ink outlines on silhouettes,
+    warm bloom tint, slight geometry inflation for bold silhouettes, gentle specular flattening.
+    When all axes are at zero, the renderer produces its current photorealistic output — unchanged.
+  </p>
+</div>

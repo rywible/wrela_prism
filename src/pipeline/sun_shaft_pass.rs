@@ -28,20 +28,24 @@ impl SunShaftUniforms {
             glam::Vec3::ZERO
         };
         let sun_screen = glam::Vec2::new(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        let facing = camera.forward().dot(settings.sun_direction.normalize()).max(0.0);
-        let on_screen = if clip.w > 0.0
-            && ndc.x >= -1.3
-            && ndc.x <= 1.3
-            && ndc.y >= -1.3
-            && ndc.y <= 1.3
-        {
-            1.0
-        } else {
-            0.0
-        };
+        let facing = camera
+            .forward()
+            .dot(settings.sun_direction.normalize())
+            .max(0.0);
+        let on_screen =
+            if clip.w > 0.0 && ndc.x >= -1.3 && ndc.x <= 1.3 && ndc.y >= -1.3 && ndc.y <= 1.3 {
+                1.0
+            } else {
+                0.0
+            };
 
         Self {
-            sun_screen: [sun_screen.x, sun_screen.y, facing * on_screen, settings.horizon_haze],
+            sun_screen: [
+                sun_screen.x,
+                sun_screen.y,
+                facing * on_screen,
+                settings.horizon_haze,
+            ],
             sun_color: [
                 settings.sun_color.x,
                 settings.sun_color.y,
@@ -77,11 +81,7 @@ impl SunShaftPass {
         Self::new_for_size(&gpu.device, gpu.width(), gpu.height())
     }
 
-    pub fn new_for_size(
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-    ) -> Self {
+    pub fn new_for_size(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("prism-sun-shaft-uniforms"),
             size: std::mem::size_of::<SunShaftUniforms>() as u64,
@@ -197,12 +197,7 @@ impl SunShaftPass {
         }
     }
 
-    pub fn resize(
-        &mut self,
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let (shaft_texture, shaft_view, shaft_width, shaft_height) =
             create_shaft_target(device, width, height, "prism-sun-shaft-target");
         self.shaft_texture = shaft_texture;

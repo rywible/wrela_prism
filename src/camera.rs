@@ -109,7 +109,13 @@ impl CameraState {
         self.enforce_constraints();
     }
 
-    pub fn move_on_plane(&mut self, planar_input: Vec2, vertical_input: f32, dt: f32, sprint: bool) {
+    pub fn move_on_plane(
+        &mut self,
+        planar_input: Vec2,
+        vertical_input: f32,
+        dt: f32,
+        sprint: bool,
+    ) {
         let planar = planar_input.clamp_length_max(1.0);
         let speed = self.navigation.base_move_speed
             * if sprint {
@@ -119,9 +125,10 @@ impl CameraState {
             };
         let flat_forward = Vec3::new(self.forward().x, 0.0, self.forward().z).normalize_or_zero();
         let flat_right = Vec3::new(self.right().x, 0.0, self.right().z).normalize_or_zero();
-        let displacement = (flat_forward * planar.y + flat_right * planar.x + Vec3::Y * vertical_input)
-            * speed
-            * dt.max(0.0);
+        let displacement =
+            (flat_forward * planar.y + flat_right * planar.x + Vec3::Y * vertical_input)
+                * speed
+                * dt.max(0.0);
         self.position += displacement;
         self.enforce_constraints();
     }
@@ -250,5 +257,4 @@ mod tests {
         assert!(horizontal.length() <= 64.001);
         assert!(camera.pitch >= -0.45 - 0.001);
     }
-
 }

@@ -1,5 +1,6 @@
 use glam::Affine3A;
 
+use crate::growth::GrowthParams;
 use crate::material::MaterialId;
 use crate::scene::{bounds::Aabb, ParametricDef, SdfTree, Vertex};
 use crate::soundstage::SoundstageLayout;
@@ -79,6 +80,10 @@ pub enum ProceduralSubject {
         params: RedwoodParams,
         foliage_tier: u32,
     },
+    GrowthTree {
+        params: GrowthParams,
+        foliage_tier: u32,
+    },
     GroundSlab {
         radius: f32,
         thickness: f32,
@@ -108,7 +113,6 @@ pub struct SourceNode {
     pub lod_policy: SourceLodPolicy,
     pub bounds: SourceBounds,
     pub casts_shadows: bool,
-    pub alpha_tested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +167,6 @@ impl SourceSceneBuilder {
             lod_policy: SourceLodPolicy::Auto,
             bounds: SourceBounds::Auto,
             casts_shadows: true,
-            alpha_tested: false,
         });
         id
     }
@@ -173,7 +176,8 @@ impl SourceSceneBuilder {
     }
 
     pub fn redwood_soundstage(layout: &SoundstageLayout, seed: Option<u64>) -> SourceScene {
-        let mut builder = Self::new("redwood_soundstage").with_chunk_size(layout.ground_radius * 4.0);
+        let mut builder =
+            Self::new("redwood_soundstage").with_chunk_size(layout.ground_radius * 4.0);
         let mut params = RedwoodParams::default();
         if let Some(seed) = seed {
             params.seed = seed;
@@ -181,6 +185,33 @@ impl SourceSceneBuilder {
         builder.push_node(
             "hero_redwood",
             SourceGeometry::ProceduralSubject(ProceduralSubject::RedwoodTree {
+                params,
+                foliage_tier: 2,
+            }),
+            SourceTransform::IDENTITY,
+        );
+        builder.push_node(
+            "ground_slab",
+            SourceGeometry::ProceduralSubject(ProceduralSubject::GroundSlab {
+                radius: layout.ground_radius,
+                thickness: layout.ground_thickness,
+                segments: 128,
+            }),
+            SourceTransform::IDENTITY,
+        );
+        builder.build()
+    }
+
+    pub fn redwood_soundstage_growth(layout: &SoundstageLayout, seed: Option<u64>) -> SourceScene {
+        let mut builder =
+            Self::new("redwood_soundstage_growth").with_chunk_size(layout.ground_radius * 4.0);
+        let mut params = GrowthParams::default();
+        if let Some(seed) = seed {
+            params.seed = seed;
+        }
+        builder.push_node(
+            "hero_redwood_growth",
+            SourceGeometry::ProceduralSubject(ProceduralSubject::GrowthTree {
                 params,
                 foliage_tier: 2,
             }),

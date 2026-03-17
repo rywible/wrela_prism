@@ -6,7 +6,7 @@ pub mod simplify;
 pub use bounds::MeshletBounds;
 pub use gpu_buffers::GpuMeshletBuffers;
 pub use partition::MeshletInfo;
-pub use simplify::{MeshletDag, MeshletGroup, build_meshlet_dag};
+pub use simplify::{build_meshlet_dag, MeshletDag, MeshletGroup};
 
 #[cfg(test)]
 pub(crate) fn make_grid(n: usize) -> (Vec<crate::scene::Vertex>, Vec<u32>) {

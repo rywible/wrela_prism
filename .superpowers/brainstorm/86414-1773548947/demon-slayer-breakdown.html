@@ -1,0 +1,100 @@
+<h2>Demon Slayer Style — Mapped to Art Direction Tiers</h2>
+<p class="subtitle">Breaking down ufotable's visual language into the knobs we need</p>
+
+<div class="section">
+  <h3>Tier 1: Geometry (CPU-side, procedural generation)</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 24px; margin-bottom: 8px;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+      <div>
+        <span class="label" style="color: #7c83ff;">What Demon Slayer Does</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li>Bold, clean silhouettes — trees read as strong shapes</li>
+          <li>Simplified branching — fewer but more deliberate branches</li>
+          <li>Exaggerated proportions — thicker trunks, wider canopies</li>
+          <li>Organic but not noisy — controlled irregularity</li>
+        </ul>
+      </div>
+      <div>
+        <span class="label" style="color: #7c83ff;">Knobs Needed</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li><code>silhouette_boldness</code> — push proportions toward iconic shapes</li>
+          <li><code>branch_simplification</code> — reduce count, increase visual weight</li>
+          <li><code>trunk_taper_exaggeration</code> — more dramatic base-to-tip ratio</li>
+          <li><code>noise_suppression</code> — smooth out micro-detail in geometry</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Tier 2: Shading & Materials (GPU uniform + per-object overrides)</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 24px; margin-bottom: 8px;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+      <div>
+        <span class="label" style="color: #f0a500;">What Demon Slayer Does</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li>Soft gradient banding — not hard 2-step cel, but ~3-4 smooth bands</li>
+          <li>Color-shifted shadows — cool purples/blues in shadow, warm in light</li>
+          <li>Exaggerated rim/back lighting — strong edge glow, especially at dusk</li>
+          <li>Saturated, curated palettes — deep greens, rich earth tones</li>
+          <li>Surface detail preserved but "painted" — bark reads as texture, not noise</li>
+          <li>Subsurface scattering on foliage — leaves glow when backlit</li>
+        </ul>
+      </div>
+      <div>
+        <span class="label" style="color: #f0a500;">Knobs Needed</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li><code>shading_bands</code> — number of discrete light steps (0=smooth PBR, 3-4=anime)</li>
+          <li><code>band_softness</code> — smoothstep width between bands</li>
+          <li><code>shadow_color_shift</code> — hue/sat offset for shadowed regions</li>
+          <li><code>rim_light_strength</code> + <code>rim_light_color</code></li>
+          <li><code>palette_saturation</code> — global saturation multiplier</li>
+          <li><code>palette_hue_shift</code> — rotate entire palette</li>
+          <li><code>specular_flattening</code> — reduce specular toward matte</li>
+          <li><code>transmission_boost</code> — backlit leaf glow intensity</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Tier 3: Post-Processing (screen-space, global only)</h3>
+  <div style="background: #1a1a2e; border-radius: 12px; padding: 24px; margin-bottom: 8px;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+      <div>
+        <span class="label" style="color: #e74c3c;">What Demon Slayer Does</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li>Variable-weight outlines — thick on silhouettes, thin/absent on interior</li>
+          <li>Atmospheric color grading — scenes have strong overall tint</li>
+          <li>Painterly depth fog — distance objects flatten to background painting</li>
+          <li>Bloom with character — soft, warm glow, not generic HDR bloom</li>
+          <li>No visible paper/halftone texture — clean digital anime look</li>
+        </ul>
+      </div>
+      <div>
+        <span class="label" style="color: #e74c3c;">Knobs Needed</span>
+        <ul style="color: #ccc; margin-top: 8px; line-height: 1.8;">
+          <li><code>outline_strength</code> + <code>outline_thickness</code></li>
+          <li><code>outline_depth_sensitivity</code> + <code>outline_normal_sensitivity</code></li>
+          <li><code>color_grade_tint</code> + <code>color_grade_strength</code></li>
+          <li><code>fog_color_artistic</code> — override physical fog with art-directed color</li>
+          <li><code>bloom_tint</code> + <code>bloom_softness</code></li>
+          <li><code>detail_fade_distance</code> — where objects start flattening</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div style="background: linear-gradient(135deg, #0d0d2b, #1a0a2e); border-radius: 12px; padding: 24px; border: 1px solid #333;">
+  <h3 style="margin-top: 0;">Key Insight</h3>
+  <p style="color: #ccc; line-height: 1.8; margin: 0;">
+    Demon Slayer's look is <strong>not</strong> traditional cel-shading. It's full 3D simulation → artistic restraint.
+    Your existing PBR pipeline (atmospheric scattering, SSAO, shadow maps, subsurface on bark/foliage)
+    already provides the rich base. The art direction system adds <em>controlled degradation</em>:
+    banding the smooth lighting, shifting the palette, adding drawn edges, and pushing the atmosphere.
+    This is exactly the "high fidelity then desample" approach you described.
+  </p>
+</div>

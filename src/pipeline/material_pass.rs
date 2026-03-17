@@ -11,7 +11,6 @@ pub struct MaterialPass {
     pipeline: wgpu::RenderPipeline,
     frame_bind_group_layout: wgpu::BindGroupLayout,
     vis_bind_group_layout: wgpu::BindGroupLayout,
-    alpha_sampler: wgpu::Sampler,
     bark_sampler: wgpu::Sampler,
     sky_lut_sampler: wgpu::Sampler,
     /// Normal output texture for SSAO.
@@ -89,7 +88,7 @@ impl MaterialPass {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                         count: None,
                     },
-                    // Alpha mask texture
+                    // Bark albedo+roughness texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -100,27 +99,9 @@ impl MaterialPass {
                         },
                         count: None,
                     },
-                    // Alpha mask sampler
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // Bark albedo+roughness texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
                     // Bark normal+AO texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 6,
+                        binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -131,14 +112,14 @@ impl MaterialPass {
                     },
                     // Bark sampler
                     wgpu::BindGroupLayoutEntry {
-                        binding: 7,
+                        binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
                     // Bark height map (R8Unorm, for POM)
                     wgpu::BindGroupLayoutEntry {
-                        binding: 8,
+                        binding: 6,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -149,7 +130,7 @@ impl MaterialPass {
                     },
                     // Depth buffer (R32Float, for contact shadows)
                     wgpu::BindGroupLayoutEntry {
-                        binding: 9,
+                        binding: 7,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -160,7 +141,7 @@ impl MaterialPass {
                     },
                     // Sky-view LUT for aerial perspective
                     wgpu::BindGroupLayoutEntry {
-                        binding: 10,
+                        binding: 8,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -171,7 +152,7 @@ impl MaterialPass {
                     },
                     // Sky LUT sampler
                     wgpu::BindGroupLayoutEntry {
-                        binding: 11,
+                        binding: 9,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -234,13 +215,6 @@ impl MaterialPass {
 
         let (normal_texture, normal_view) = create_normal_target(device, width, height);
 
-        let alpha_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("alpha-mask-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
         let bark_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bark-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -264,7 +238,6 @@ impl MaterialPass {
             pipeline,
             frame_bind_group_layout,
             vis_bind_group_layout,
-            alpha_sampler,
             bark_sampler,
             sky_lut_sampler,
             normal_texture,
@@ -311,7 +284,6 @@ impl MaterialPass {
         device: &wgpu::Device,
         vis_buffer: &VisibilityBuffer,
         shadow_map: &ShadowMap,
-        alpha_mask_view: &wgpu::TextureView,
         bark_albedo_rough_view: &wgpu::TextureView,
         bark_normal_ao_view: &wgpu::TextureView,
         bark_height_view: &wgpu::TextureView,
@@ -336,38 +308,30 @@ impl MaterialPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(alpha_mask_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&self.alpha_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
                     resource: wgpu::BindingResource::TextureView(bark_albedo_rough_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
+                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(bark_normal_ao_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 7,
+                    binding: 5,
                     resource: wgpu::BindingResource::Sampler(&self.bark_sampler),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 8,
+                    binding: 6,
                     resource: wgpu::BindingResource::TextureView(bark_height_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 9,
+                    binding: 7,
                     resource: wgpu::BindingResource::TextureView(depth_float_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 10,
+                    binding: 8,
                     resource: wgpu::BindingResource::TextureView(&sky_lut.sky_view_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 11,
+                    binding: 9,
                     resource: wgpu::BindingResource::Sampler(&self.sky_lut_sampler),
                 },
             ],

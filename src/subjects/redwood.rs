@@ -3,8 +3,7 @@ use glam::Vec3;
 use crate::material::MaterialId;
 use crate::scene::{GeometryDef, SceneGraph, SceneHandle, SdfTree};
 use crate::subjects::redwood_growth::{
-    build_trunk_sdf_grown, generate_foliage_anchors_grown, trunk_capsule_data_grown,
-    RedwoodParams,
+    build_trunk_sdf_grown, generate_foliage_anchors_grown, trunk_capsule_data_grown, RedwoodParams,
 };
 
 pub const MATERIAL_BARK: MaterialId = MaterialId(0);

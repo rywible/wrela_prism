@@ -75,11 +75,12 @@ impl GpuMeshletBuffers {
         while tri_data.len() % 4 != 0 {
             tri_data.push(0);
         }
-        let meshlet_triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("meshlet-triangle-indices"),
-            contents: &tri_data,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let meshlet_triangle_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("meshlet-triangle-indices"),
+                contents: &tri_data,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         // Build meshlet descriptors
         let descs: Vec<GpuMeshletDescriptor> = dag

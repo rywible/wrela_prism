@@ -8,7 +8,6 @@ use crate::material::MaterialId;
 use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
 use crate::scene::bounds::{Aabb, BoundingSphere};
 use crate::scene::Vertex;
-use crate::scene_data::DEFAULT_FOLIAGE_ALPHA_SEED;
 use crate::solver::projection::screen_diameter;
 use crate::source_scene::{SourceNodeId, SourceTransform};
 
@@ -28,7 +27,6 @@ pub struct PrototypeSurface {
     pub indices: Vec<u32>,
     pub material_id: MaterialId,
     pub casts_shadows: bool,
-    pub alpha_tested: bool,
     pub local_bounds: Aabb,
 }
 
@@ -68,7 +66,6 @@ pub struct ChunkCompileInput {
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialEntry {
     pub id: MaterialId,
-    pub alpha_tested: bool,
     pub casts_shadows: bool,
 }
 
@@ -182,9 +179,6 @@ pub struct RuntimeSceneGpu {
     pub meshlet_buffers: GpuMeshletBuffers,
     pub shadow_meshes: Vec<GpuMesh>,
     pub shadow_opaque_list: Vec<usize>,
-    pub shadow_transparent_list: Vec<usize>,
-    pub alpha_mask_texture: wgpu::Texture,
-    pub alpha_mask_view: wgpu::TextureView,
     pub bark_textures: crate::material::bark_bake::BarkTextures,
     pub resident_chunks: Vec<ChunkId>,
 }
@@ -209,7 +203,6 @@ impl RuntimeSceneGpu {
         let mut dags = Vec::new();
         let mut shadow_meshes = Vec::new();
         let mut shadow_opaque_list = Vec::new();
-        let mut shadow_transparent_list = Vec::new();
 
         for chunk in compiled
             .compiled_chunks
@@ -238,23 +231,13 @@ impl RuntimeSceneGpu {
                 let mesh_idx = shadow_meshes.len();
                 shadow_meshes.push(mesh);
                 if surface.casts_shadows {
-                    if surface.alpha_tested {
-                        shadow_transparent_list.push(mesh_idx);
-                    } else {
-                        shadow_opaque_list.push(mesh_idx);
-                    }
+                    shadow_opaque_list.push(mesh_idx);
                 }
             }
         }
 
         let dag = merge_meshlet_dags(&dags);
         let meshlet_buffers = GpuMeshletBuffers::from_dag(&gpu.device, &dag);
-        let (alpha_mask_texture, alpha_mask_view) =
-            crate::subjects::alpha_mask::create_alpha_mask_texture(
-                &gpu.device,
-                &gpu.queue,
-                DEFAULT_FOLIAGE_ALPHA_SEED,
-            );
 
         let bark_textures =
             crate::material::bark_bake::create_bark_textures(&gpu.device, &gpu.queue, bark_params);
@@ -265,9 +248,6 @@ impl RuntimeSceneGpu {
             meshlet_buffers,
             shadow_meshes,
             shadow_opaque_list,
-            shadow_transparent_list,
-            alpha_mask_texture,
-            alpha_mask_view,
             bark_textures,
             resident_chunks,
         }
@@ -313,7 +293,7 @@ pub(crate) fn expand_surface_with_transform(
     (vertices, surface.indices.clone())
 }
 
-fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
+pub(crate) fn merge_meshlet_dags(dags: &[MeshletDag]) -> MeshletDag {
     if dags.is_empty() {
         return MeshletDag {
             meshlets: Vec::new(),
@@ -423,7 +403,7 @@ mod tests {
                     indices: vec![],
                     material_id: crate::material::MaterialId(MATERIAL_TRUNK),
                     casts_shadows: true,
-                    alpha_tested: false,
+
                     local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
                         glam::Vec3::ZERO,
                         glam::Vec3::ONE,
@@ -456,7 +436,6 @@ mod tests {
             indices: vec![0],
             material_id: crate::material::MaterialId(MATERIAL_TRUNK),
             casts_shadows: true,
-            alpha_tested: false,
             local_bounds: crate::scene::bounds::Aabb::from_center_half_extents(
                 glam::Vec3::new(1.0, 2.0, 3.0),
                 glam::Vec3::ZERO,

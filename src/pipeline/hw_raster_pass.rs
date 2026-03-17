@@ -11,6 +11,7 @@ pub struct VisbufFrameUniforms {
     pub camera_position: [f32; 4],
     pub screen_size: [f32; 4],
     pub error_threshold: [f32; 4],
+    pub frustum_planes: [[f32; 4]; 6],
 }
 
 /// Max vertices per draw call = MAX_MESHLET_TRIANGLES * 3
@@ -64,8 +65,7 @@ impl DispatchLists {
         let hw_indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hw-indirect-draw"),
             contents: bytemuck::cast_slice(&[MAX_VERTS_PER_MESHLET_DRAW, 0u32, 0u32, 0u32]),
-            usage: wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
         });
 
         Self {
@@ -117,7 +117,11 @@ impl VisibilityBuffer {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("visibility-buffer"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -132,7 +136,11 @@ impl VisibilityBuffer {
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("visibility-depth"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -147,7 +155,11 @@ impl VisibilityBuffer {
         // R32Float copy for post-processing that needs float-sampled depth
         let depth_float_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("visibility-depth-float"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -155,8 +167,8 @@ impl VisibilityBuffer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
-        let depth_float_view = depth_float_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_float_view =
+            depth_float_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("visibility-storage"),
@@ -166,10 +178,15 @@ impl VisibilityBuffer {
         });
 
         Self {
-            texture, view,
-            depth_texture, depth_view,
-            depth_float_texture, depth_float_view,
-            storage_buffer, width, height,
+            texture,
+            view,
+            depth_texture,
+            depth_view,
+            depth_float_texture,
+            depth_float_view,
+            storage_buffer,
+            width,
+            height,
         }
     }
 
@@ -218,19 +235,33 @@ impl HwRasterPass {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("visbuf-mesh-bgl"),
                 entries: &[
-                    storage_entry(0, true, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
-                    storage_entry(1, true, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
-                    storage_entry(2, true, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
-                    storage_entry(3, true, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
+                    storage_entry(
+                        0,
+                        true,
+                        wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
+                    storage_entry(
+                        1,
+                        true,
+                        wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
+                    storage_entry(
+                        2,
+                        true,
+                        wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
+                    storage_entry(
+                        3,
+                        true,
+                        wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
                 ],
             });
 
         let dispatch_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw-dispatch-bgl"),
-                entries: &[
-                    storage_entry(0, true, wgpu::ShaderStages::VERTEX),
-                ],
+                entries: &[storage_entry(0, true, wgpu::ShaderStages::VERTEX)],
             });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -242,7 +273,11 @@ impl HwRasterPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("hw-vis-layout"),
-            bind_group_layouts: &[&bind_group_layout, &mesh_bind_group_layout, &dispatch_bind_group_layout],
+            bind_group_layouts: &[
+                &bind_group_layout,
+                &mesh_bind_group_layout,
+                &dispatch_bind_group_layout,
+            ],
             immediate_size: 0,
         });
 
@@ -323,10 +358,22 @@ impl HwRasterPass {
             label: Some("visbuf-mesh-bg"),
             layout: &self.mesh_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: buffers.vertex_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: buffers.meshlet_vertex_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: buffers.meshlet_triangle_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: buffers.meshlet_desc_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffers.vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.meshlet_vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.meshlet_triangle_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.meshlet_desc_buffer.as_entire_binding(),
+                },
             ],
         })
     }
@@ -362,7 +409,12 @@ impl HwRasterPass {
                 view: &vis_buffer.view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -388,4 +440,75 @@ impl HwRasterPass {
     }
 }
 
+fn normalize_plane(plane: glam::Vec4) -> [f32; 4] {
+    let normal = plane.truncate();
+    let len = normal.length();
+    if len <= 1e-6 {
+        return plane.to_array();
+    }
+    (plane / len).to_array()
+}
+
+pub fn extract_frustum_planes(view_proj: glam::Mat4) -> [[f32; 4]; 6] {
+    let row0 = glam::Vec4::new(
+        view_proj.x_axis.x,
+        view_proj.y_axis.x,
+        view_proj.z_axis.x,
+        view_proj.w_axis.x,
+    );
+    let row1 = glam::Vec4::new(
+        view_proj.x_axis.y,
+        view_proj.y_axis.y,
+        view_proj.z_axis.y,
+        view_proj.w_axis.y,
+    );
+    let row2 = glam::Vec4::new(
+        view_proj.x_axis.z,
+        view_proj.y_axis.z,
+        view_proj.z_axis.z,
+        view_proj.w_axis.z,
+    );
+    let row3 = glam::Vec4::new(
+        view_proj.x_axis.w,
+        view_proj.y_axis.w,
+        view_proj.z_axis.w,
+        view_proj.w_axis.w,
+    );
+
+    [
+        normalize_plane(row3 + row0),
+        normalize_plane(row3 - row0),
+        normalize_plane(row3 + row1),
+        normalize_plane(row3 - row1),
+        normalize_plane(row2),
+        normalize_plane(row3 - row2),
+    ]
+}
+
 use super::storage_entry;
+
+#[cfg(test)]
+mod tests {
+    use super::extract_frustum_planes;
+    use crate::camera::CameraState;
+    use glam::{Vec3, Vec4};
+
+    fn sphere_inside_all_planes(planes: &[[f32; 4]; 6], center: Vec3, radius: f32) -> bool {
+        planes.iter().all(|plane| {
+            let plane = Vec4::from_array(*plane);
+            plane.truncate().dot(center) + plane.w >= -radius
+        })
+    }
+
+    #[test]
+    fn extracted_frustum_planes_accept_visible_points_and_reject_points_behind_camera() {
+        let camera = CameraState::new(16.0 / 9.0);
+        let planes = extract_frustum_planes(camera.view_projection_matrix());
+
+        let visible = camera.position() + camera.forward() * 20.0;
+        let behind = camera.position() - camera.forward() * 20.0;
+
+        assert!(sphere_inside_all_planes(&planes, visible, 0.5));
+        assert!(!sphere_inside_all_planes(&planes, behind, 0.5));
+    }
+}

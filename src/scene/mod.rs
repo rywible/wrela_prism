@@ -375,17 +375,19 @@ impl LightingUniforms {
         .into_iter()
         .any(|ambient| ambient.length_squared() > 1e-4);
 
+        let auto_probe = sky_probe::compute_sky_probe(settings, settings.ambient_intensity);
         let probe = if has_manual_ambient {
+            let manual_mix = 0.22;
             sky_probe::SkyProbe {
-                up: settings.ambient_up,
-                down: settings.ambient_down,
-                right: settings.ambient_right,
-                left: settings.ambient_left,
-                front: settings.ambient_front,
-                back: settings.ambient_back,
+                up: auto_probe.up.lerp(settings.ambient_up, manual_mix),
+                down: auto_probe.down.lerp(settings.ambient_down, manual_mix),
+                right: auto_probe.right.lerp(settings.ambient_right, manual_mix),
+                left: auto_probe.left.lerp(settings.ambient_left, manual_mix),
+                front: auto_probe.front.lerp(settings.ambient_front, manual_mix),
+                back: auto_probe.back.lerp(settings.ambient_back, manual_mix),
             }
         } else {
-            sky_probe::compute_sky_probe(settings, settings.ambient_intensity)
+            auto_probe
         };
 
         Self {

@@ -38,6 +38,7 @@ struct AppOptions {
     seed: Option<u64>,
     style: Option<String>,
     style_blend: Option<f32>,
+    growth_sim: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -95,23 +96,38 @@ impl RuntimeState {
             stage_config.layout.shadow_depth,
         );
 
-        // Build redwood tree parameters
-        let redwood_params = {
+        // Build scene based on mode.
+        let (bark_params, source_scene) = if options.growth_sim {
+            let mut growth_params = crate::growth::GrowthParams::default();
+            if let Some(seed) = options.seed {
+                growth_params.seed = seed;
+            }
+            let bp = crate::material::procedural::BarkParams::from_growth(&growth_params);
+            let scene = crate::source_scene::SourceSceneBuilder::redwood_soundstage_growth(
+                &stage_config.layout,
+                options.seed,
+            );
+            (bp, scene)
+        } else {
             let mut p = crate::subjects::redwood_growth::RedwoodParams::default();
             if let Some(seed) = options.seed {
                 p.seed = seed;
             }
-            p
+            let bp = crate::material::procedural::BarkParams::from_redwood(&p);
+            let scene = crate::source_scene::SourceSceneBuilder::redwood_soundstage(
+                &stage_config.layout,
+                options.seed,
+            );
+            (bp, scene)
         };
 
-        let bark_params = crate::material::procedural::BarkParams::from_redwood(&redwood_params);
         renderer.write_bark_params(&gpu.queue, &bark_params);
 
-        let source_scene = crate::source_scene::SourceSceneBuilder::redwood_soundstage(
-            &stage_config.layout,
-            options.seed,
-        );
-        let compiled_scene = SceneCompiler::new().compile(&source_scene);
+        let gpu_access = crate::growth::GpuAccess {
+            device: &gpu.device,
+            queue: &gpu.queue,
+        };
+        let compiled_scene = SceneCompiler::new().compile_with_gpu(&source_scene, Some(gpu_access));
         let residency = SceneResidencyManager::new(&compiled_scene.runtime_scene);
         let runtime_scene_gpu =
             RuntimeSceneGpu::upload(&gpu, &compiled_scene, &residency, &bark_params);
@@ -592,6 +608,9 @@ impl AppOptions {
                     };
                     options.style_blend = Some(value.parse()?);
                 }
+                "--growth-sim" => {
+                    options.growth_sim = true;
+                }
                 other => bail!("unrecognized argument: {other}"),
             }
         }
@@ -626,6 +645,7 @@ impl Default for AppOptions {
             seed: None,
             style: None,
             style_blend: None,
+            growth_sim: false,
         }
     }
 }

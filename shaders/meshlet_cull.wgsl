@@ -1,13 +1,14 @@
-// Per-meshlet DAG cut + frustum + cone + HZB culling (compute shader).
+// Per-meshlet frustum culling (compute shader).
 //
-// Traverses the DAG: for each group, projects error → decide render or recurse.
-// Surviving meshlets are sorted into HW (large) or SW (small) dispatch lists.
+// CPU selects groups via adaptive DAG cut; this shader iterates each group's
+// meshlets, applies frustum culling, and writes survivors to the HW dispatch list.
 
 struct FrameUniforms {
     view_proj: mat4x4<f32>,
     camera_position: vec4<f32>,
     screen_size: vec4<f32>,
     error_threshold: vec4<f32>,   // (error_threshold_px, fov_factor, 0, 0)
+    frustum_planes: array<vec4<f32>, 6>,
 };
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 
@@ -70,23 +71,18 @@ fn project_error(error: f32, center: vec3<f32>) -> f32 {
 }
 
 fn frustum_cull_sphere(center: vec3<f32>, radius: f32) -> bool {
-    // Simple NDC frustum cull
-    let clip = frame.view_proj * vec4<f32>(center, 1.0);
-    if clip.w <= 0.0 {
-        return true; // Behind camera
+    let world_center = vec4<f32>(center, 1.0);
+    for (var i = 0u; i < 6u; i = i + 1u) {
+        let plane = frame.frustum_planes[i];
+        if dot(plane.xyz, world_center.xyz) + plane.w < -radius {
+            return true;
+        }
     }
-    let ndc = clip.xyz / clip.w;
-    let ndc_r = radius / clip.w * 2.0; // Approximate NDC radius
-    if ndc.x - ndc_r > 1.0 || ndc.x + ndc_r < -1.0 ||
-       ndc.y - ndc_r > 1.0 || ndc.y + ndc_r < -1.0 {
+    let clip = frame.view_proj * world_center;
+    if clip.w <= 0.0 {
         return true;
     }
     return false;
-}
-
-fn cone_cull(bounds: MeshletBounds) -> bool {
-    let dir = normalize(bounds.center - frame.camera_position.xyz);
-    return dot(dir, bounds.cone_axis) >= bounds.cone_cutoff;
 }
 
 @compute @workgroup_size(64)
@@ -99,20 +95,7 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let group_idx = group_queue[queue_idx];
     let group = meshlet_groups[group_idx];
 
-    // DAG cut decision: is this group's error acceptable?
-    // Use the first meshlet's bounds center as a proxy for the group center.
-    let group_center = meshlet_bounds[group.meshlet_start].center;
-    let projected_error = project_error(group.error, group_center);
-
-    // For leaf groups (no children), always render
-    let is_leaf = group.child_count == 0u;
-    let should_render = is_leaf || projected_error < frame.error_threshold.x;
-
-    if !should_render {
-        // Need to recurse — but this is handled by the CPU-side queue builder
-        // In the GPU-driven version, we'd append children to a next-pass queue
-        return;
-    }
+    // DAG cut decision already made by CPU — this shader only does per-meshlet culling.
 
     // Process each meshlet in this group
     for (var mi = 0u; mi < group.meshlet_count; mi = mi + 1u) {
@@ -121,11 +104,6 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Frustum cull
         if frustum_cull_sphere(bounds.center, bounds.radius) {
-            continue;
-        }
-
-        // Cone cull (backface)
-        if cone_cull(bounds) {
             continue;
         }
 

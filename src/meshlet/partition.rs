@@ -1,7 +1,7 @@
 use meshopt::{clusterize, VertexDataAdapter};
 
-use crate::scene::Vertex;
 use super::bounds::MeshletBounds;
+use crate::scene::Vertex;
 
 /// Maximum vertices per meshlet (meshopt limit: 256).
 pub const MAX_MESHLET_VERTICES: usize = 64;
@@ -79,14 +79,38 @@ pub fn build_meshlets_from_mesh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{Vertex, MATERIAL_TRUNK};
     use crate::meshlet::make_grid;
+    use crate::scene::{Vertex, MATERIAL_TRUNK};
 
     fn make_triangle() -> (Vec<Vertex>, Vec<u32>) {
         let verts = vec![
-            Vertex { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [0.0, 0.0], ao: 1.0, semantic_channels: 0 },
-            Vertex { position: [1.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [1.0, 0.0], ao: 1.0, semantic_channels: 0 },
-            Vertex { position: [0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], material: MATERIAL_TRUNK, feature_id: 0, uv: [0.0, 1.0], ao: 1.0, semantic_channels: 0 },
+            Vertex {
+                position: [0.0, 0.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                material: MATERIAL_TRUNK,
+                feature_id: 0,
+                uv: [0.0, 0.0],
+                ao: 1.0,
+                semantic_channels: 0,
+            },
+            Vertex {
+                position: [1.0, 0.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                material: MATERIAL_TRUNK,
+                feature_id: 0,
+                uv: [1.0, 0.0],
+                ao: 1.0,
+                semantic_channels: 0,
+            },
+            Vertex {
+                position: [0.0, 0.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+                material: MATERIAL_TRUNK,
+                feature_id: 0,
+                uv: [0.0, 1.0],
+                ao: 1.0,
+                semantic_channels: 0,
+            },
         ];
         let indices = vec![0, 1, 2];
         (verts, indices)
@@ -107,7 +131,11 @@ mod tests {
         let (verts, indices) = make_grid(20);
         let result = build_meshlets_from_mesh(&verts, &indices, 0);
         // 20x20 grid = 800 triangles, at 124 tris/meshlet ≈ 7+ meshlets
-        assert!(result.meshlets.len() >= 4, "expected multiple meshlets, got {}", result.meshlets.len());
+        assert!(
+            result.meshlets.len() >= 4,
+            "expected multiple meshlets, got {}",
+            result.meshlets.len()
+        );
 
         // All triangles accounted for
         let total_tris: u32 = result.meshlets.iter().map(|m| m.triangle_count).sum();

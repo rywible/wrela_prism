@@ -78,6 +78,13 @@ fn vs_composite(@builtin(vertex_index) vid: u32) -> FullscreenOutput {
     return out;
 }
 
+fn ray_dir_from_uv(uv: vec2<f32>) -> vec3<f32> {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
+    let near_pt = cu.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let far_pt = cu.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    return normalize(far_pt.xyz / far_pt.w - near_pt.xyz / near_pt.w);
+}
+
 @fragment
 fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let quarter_size = vec2<f32>(cu.screen_params.x, cu.screen_params.y);
@@ -150,6 +157,13 @@ fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
             cloud = textureSample(cloud_tex, cloud_sampler, input.uv);
         }
     }
+
+    let ray_dir = ray_dir_from_uv(input.uv);
+    let horizon_fade = smoothstep(0.01, 0.085, ray_dir.y);
+    cloud = vec4<f32>(
+        cloud.rgb * horizon_fade,
+        mix(1.0, cloud.a, horizon_fade),
+    );
 
     // cloud.rgb = inscattered light, cloud.a = transmittance
     return vec4<f32>(cloud.rgb, cloud.a);

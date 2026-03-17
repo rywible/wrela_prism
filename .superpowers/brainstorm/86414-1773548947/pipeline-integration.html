@@ -1,0 +1,206 @@
+<h2>Pipeline Integration — Where Style Hooks In</h2>
+<p class="subtitle">Mapping art direction transforms to existing render passes</p>
+
+<div class="section">
+  <div style="background: #0d0d2b; border-radius: 12px; padding: 32px;">
+
+    <!-- Pipeline flow -->
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+
+      <!-- Procedural Generation (CPU) -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #555;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #888; font-size: 11px; text-transform: uppercase;">CPU — Procedural Generation</span>
+              <div style="color: #ddd; font-size: 15px; font-weight: 600; margin-top: 4px;">Object Generators</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;">RedwoodParams → skeleton → tube mesh → vertices</div>
+            </div>
+            <div style="color: #555; font-size: 12px; text-align: right;">existing code<br>unchanged</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC; <span style="font-size: 11px; color: #666;">vertices carry semantic channels (packed into vertex data)</span></div>
+
+      <!-- Cull Pass -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #555;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #888; font-size: 11px; text-transform: uppercase;">Pass 1 — Cull</span>
+              <div style="color: #ddd; font-size: 15px;">Compute shader instance culling</div>
+            </div>
+            <div style="color: #555; font-size: 12px;">unchanged</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- HW Raster — MODIFIED -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #7c83ff;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #7c83ff; font-size: 11px; text-transform: uppercase; font-weight: 600;">Pass 2 — HW Raster ★ MODIFIED</span>
+              <div style="color: #ddd; font-size: 15px; font-weight: 600; margin-top: 4px;">Geometry Deformation</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;">Reads <code style="color: #7c83ff;">ArtDirectionUniforms</code> tier 1 params</div>
+            </div>
+          </div>
+          <div style="background: #7c83ff11; border-radius: 8px; padding: 12px; margin-top: 12px;">
+            <div style="color: #aaa; font-size: 13px; line-height: 1.7;">
+              <strong style="color: #7c83ff;">New behavior:</strong> After standard vertex transform, apply:<br>
+              &nbsp;&nbsp;• <code>silhouette_inflate</code> × vertex <code>curvature</code> channel → push outward along normal<br>
+              &nbsp;&nbsp;• <code>normal_smoothing</code> × vertex <code>edge_sharpness</code> → blend toward averaged normals<br>
+              &nbsp;&nbsp;• <code>detail_suppression</code> × vertex <code>surface_noise</code> → dampen high-freq displacement<br>
+              <span style="color: #666;">All zero = current behavior. Smooth interpolation = runtime morphing.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- Shadow Pass -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #555;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #888; font-size: 11px; text-transform: uppercase;">Pass 3-5 — Shadow / HZB</span>
+              <div style="color: #ddd; font-size: 15px;">Shadow map + hierarchical Z</div>
+            </div>
+            <div style="color: #555; font-size: 12px;">unchanged</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- Material Resolve — MODIFIED -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #f0a500;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #f0a500; font-size: 11px; text-transform: uppercase; font-weight: 600;">Pass 6 — Material Resolve ★ MAJOR CHANGES</span>
+              <div style="color: #ddd; font-size: 15px; font-weight: 600; margin-top: 4px;">Shading Transforms + Palette</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;">Reads <code style="color: #f0a500;">ArtDirectionUniforms</code> tier 2 params + palette buffer</div>
+            </div>
+          </div>
+          <div style="background: #f0a50011; border-radius: 8px; padding: 12px; margin-top: 12px;">
+            <div style="color: #aaa; font-size: 13px; line-height: 1.7;">
+              <strong style="color: #f0a500;">Pipeline within the shader:</strong><br><br>
+              1. <strong>Existing PBR</strong> — full Lambertian + Cook-Torrance + SSS runs as-is → produces <code>raw_light</code><br><br>
+              2. <strong style="color: #f0a500;">NEW: Light banding</strong> — quantize <code>raw_light</code> into <code>shading_bands</code> steps with <code>band_softness</code> smoothstep<br><br>
+              3. <strong style="color: #f0a500;">NEW: Shadow color shift</strong> — where light &lt; threshold, blend toward <code>shadow_color_shift</code><br><br>
+              4. <strong style="color: #f0a500;">NEW: Rim lighting</strong> — fresnel-based edge glow scaled by <code>rim_light_strength</code><br><br>
+              5. <strong style="color: #f0a500;">NEW: Palette remap</strong> — base_color runs through palette LUT, blended by <code>color_discipline</code><br><br>
+              6. <strong style="color: #f0a500;">NEW: Specular flatten</strong> — lerp specular toward zero by <code>specular_flattening</code><br><br>
+              <span style="color: #666;">Order matters: PBR first (high fidelity), then style transforms (controlled degradation).</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- SSAO -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #555;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #888; font-size: 11px; text-transform: uppercase;">Pass 7 — SSAO</span>
+              <div style="color: #ddd; font-size: 15px;">Screen-space ambient occlusion</div>
+            </div>
+            <div style="color: #555; font-size: 12px;">unchanged</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- Sky + Sun Shafts -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #555;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #888; font-size: 11px; text-transform: uppercase;">Pass 8-9 — Sky + Sun Shafts</span>
+              <div style="color: #ddd; font-size: 15px;">Atmosphere, god rays</div>
+            </div>
+            <div style="color: #555; font-size: 12px;">unchanged<br><span style="font-size: 11px;">(atmosphere knobs already in SceneSettings)</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- NEW: Outline Pass -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #e74c3c;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #e74c3c; font-size: 11px; text-transform: uppercase; font-weight: 600;">Pass 9.5 — Outline ★ NEW PASS</span>
+              <div style="color: #ddd; font-size: 15px; font-weight: 600; margin-top: 4px;">Screen-Space Edge Detection</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;">Reads depth buffer + normal buffer → detects edges → composites outlines</div>
+            </div>
+          </div>
+          <div style="background: #e74c3c11; border-radius: 8px; padding: 12px; margin-top: 12px;">
+            <div style="color: #aaa; font-size: 13px; line-height: 1.7;">
+              <strong style="color: #e74c3c;">Technique:</strong> Sobel/Roberts on depth + normals<br>
+              &nbsp;&nbsp;• <code>outline_depth_sensitivity</code> — edge weight from depth discontinuities (silhouettes)<br>
+              &nbsp;&nbsp;• <code>outline_normal_sensitivity</code> — edge weight from normal discontinuities (surface detail)<br>
+              &nbsp;&nbsp;• <code>outline_thickness</code> — kernel size / dilation<br>
+              &nbsp;&nbsp;• <code>outline_strength</code> — final blend (0 = invisible, 1 = full ink)<br>
+              &nbsp;&nbsp;• <code>outline_color</code> — typically near-black for anime<br>
+              <span style="color: #666;">When outline_strength = 0, this pass is a no-op (early-out).</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- Bloom — MODIFIED -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #f0a500;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #f0a500; font-size: 11px; text-transform: uppercase; font-weight: 600;">Pass 10 — Bloom ★ MINOR CHANGES</span>
+              <div style="color: #ddd; font-size: 15px;">Threshold → blur → composite</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;">Existing bloom, but tint + softness now driven by art direction</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: center; color: #555;">&#x25BC;</div>
+
+      <!-- Tonemap — MODIFIED -->
+      <div style="display: flex; align-items: stretch; gap: 12px;">
+        <div style="background: #1a1a2e; border-radius: 10px; padding: 16px; flex: 1; border-left: 4px solid #f0a500;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: #f0a500; font-size: 11px; text-transform: uppercase; font-weight: 600;">Pass 11 — Tonemap ★ MINOR CHANGES</span>
+              <div style="color: #ddd; font-size: 15px;">Final tone mapping + color grade</div>
+              <div style="color: #999; font-size: 13px; margin-top: 4px;"><code style="color: #f0a500;">color_grade_tint</code> + <code style="color: #f0a500;">color_grade_strength</code> applied post-tonemap</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div style="background: linear-gradient(135deg, #0d0d2b, #1a0a2e); border-radius: 12px; padding: 24px; border: 1px solid #333; margin-top: 16px;">
+  <h3 style="margin-top: 0;">Summary of Changes to Existing Code</h3>
+  <div style="display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; color: #ccc; font-size: 14px; line-height: 1.8;">
+    <span style="color: #7c83ff; font-weight: 600;">Modified</span><span>HW Raster vertex shader — add deformation after transform</span>
+    <span style="color: #f0a500; font-weight: 600;">Modified</span><span>material_resolve.wgsl — add post-PBR style transforms + palette lookup</span>
+    <span style="color: #f0a500; font-weight: 600;">Modified</span><span>bloom_pass — read bloom_tint, bloom_softness from art direction</span>
+    <span style="color: #f0a500; font-weight: 600;">Modified</span><span>tonemap_pass — add color grading step</span>
+    <span style="color: #e74c3c; font-weight: 600;">New</span><span>outline_pass.rs + outline.wgsl — screen-space edge detection pass</span>
+    <span style="color: #e74c3c; font-weight: 600;">New</span><span>art_direction.rs — ArtDirectionUniforms, style axes, palette, GPU upload</span>
+    <span style="color: #e74c3c; font-weight: 600;">New</span><span>Vertex format extended — semantic channel data packed alongside existing fields</span>
+  </div>
+</div>

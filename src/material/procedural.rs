@@ -1,5 +1,6 @@
-use bytemuck::{Pod, Zeroable};
+use crate::growth::GrowthParams;
 use crate::subjects::redwood_growth::RedwoodParams;
+use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -22,6 +23,21 @@ impl BarkParams {
             bark_thickness_base: 0.42,
             bark_thickness_tip: 0.07,
             trunk_height: params.trunk_height,
+            stiffness_ratio: 3.35,
+            fiber_density: 8.5,
+            seed: params.seed as u32,
+        }
+    }
+
+    pub fn from_growth(params: &GrowthParams) -> Self {
+        let species = &params.species;
+        let trunk_height = species.max_height * (params.target_age as f32 / 500.0).min(1.0);
+        Self {
+            trunk_radius_base: species.base_diameter / 2.0,
+            trunk_radius_tip: 0.55,
+            bark_thickness_base: 0.42,
+            bark_thickness_tip: 0.07,
+            trunk_height,
             stiffness_ratio: 3.35,
             fiber_density: 8.5,
             seed: params.seed as u32,

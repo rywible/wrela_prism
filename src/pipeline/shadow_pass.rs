@@ -17,7 +17,6 @@ pub struct ShadowPass {
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
-    transparent_pipeline: wgpu::RenderPipeline,
     cascade_views: [wgpu::TextureView; NUM_CASCADES],
     /// Aligned offset between cascade uniform slots.
     dyn_alignment: u32,
@@ -125,33 +124,6 @@ impl ShadowPass {
             cache: None,
         });
 
-        // Double-sided pipeline for foliage cards
-        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("prism-shadow-transparent-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                buffers: &[Vertex::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shadow"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // double-sided
-                ..Default::default()
-            },
-            depth_stencil: Some(depth_stencil),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
         let cascade_views = std::array::from_fn(|i| {
             shadow_map
                 .texture
@@ -168,7 +140,6 @@ impl ShadowPass {
             uniform_buffer,
             bind_group,
             pipeline,
-            transparent_pipeline,
             cascade_views,
             dyn_alignment,
         }
@@ -192,7 +163,6 @@ impl ShadowPass {
         encoder: &mut wgpu::CommandEncoder,
         meshes: &[GpuMesh],
         opaque_list: &[usize],
-        transparent_list: &[usize],
     ) {
         for cascade in 0..NUM_CASCADES {
             let dyn_offset = self.dyn_alignment * cascade as u32;
@@ -221,18 +191,6 @@ impl ShadowPass {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-
-            // Double-sided pipeline for foliage cards
-            if !transparent_list.is_empty() {
-                pass.set_pipeline(&self.transparent_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[dyn_offset]);
-                for &idx in transparent_list {
-                    let mesh = &meshes[idx];
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                }
             }
         }
     }

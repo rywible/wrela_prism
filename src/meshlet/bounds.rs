@@ -18,7 +18,11 @@ impl MeshletBounds {
         Self {
             center: b.center,
             radius: b.radius,
-            cone_axis: [b.cone_axis_s8[0] as f32 / 127.0, b.cone_axis_s8[1] as f32 / 127.0, b.cone_axis_s8[2] as f32 / 127.0],
+            cone_axis: [
+                b.cone_axis_s8[0] as f32 / 127.0,
+                b.cone_axis_s8[1] as f32 / 127.0,
+                b.cone_axis_s8[2] as f32 / 127.0,
+            ],
             cone_cutoff: b.cone_cutoff_s8 as f32 / 127.0,
         }
     }

@@ -41,7 +41,6 @@ pub struct RedwoodParams {
     pub trunk_height: f32,
     pub base_radius: f32,
     pub tip_radius: f32,
-    pub root_flare: f32,
     pub trunk_segments: usize,
     pub trunk_wobble: f32,
     pub crown_start_frac: f32,
@@ -50,24 +49,29 @@ pub struct RedwoodParams {
     pub smooth_k_trunk: f32,
     pub smooth_k_branch: f32,
     pub smooth_k_fine: f32,
+    pub columnar_fraction: f32,
+    pub flute_count: u32,
+    pub flute_depth: f32,
 }
 
 impl Default for RedwoodParams {
     fn default() -> Self {
         Self {
             seed: 42,
-            trunk_height: 42.0,
-            base_radius: 3.1,
-            tip_radius: 0.36,
-            root_flare: 1.8,
-            trunk_segments: 56,
+            trunk_height: 65.0,
+            base_radius: 4.5,
+            tip_radius: 0.55,
+            trunk_segments: 85,
             trunk_wobble: 0.07,
-            crown_start_frac: 0.70,
-            branch_count: 14,
-            max_branch_depth: 3,
+            crown_start_frac: 0.38,
+            branch_count: 95,
+            max_branch_depth: 5,
             smooth_k_trunk: 0.30,
             smooth_k_branch: 0.06,
             smooth_k_fine: 0.03,
+            columnar_fraction: 0.70,
+            flute_count: 8,
+            flute_depth: 0.20,
         }
     }
 }
@@ -77,7 +81,6 @@ impl Default for RedwoodParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BranchKind {
     Trunk,
-    Buttress,
     LiveScaffold,
     LiveSecondary,
     LiveFine,
@@ -93,7 +96,7 @@ impl BranchKind {
     }
 
     pub(crate) fn is_structural_trunk(self) -> bool {
-        matches!(self, Self::Trunk | Self::Buttress)
+        matches!(self, Self::Trunk)
     }
 }
 
@@ -163,7 +166,6 @@ pub(crate) fn build_skeleton(params: &RedwoodParams) -> TreeSkeleton {
     let mut rng = TreeRng::new(params.seed);
     let mut skeleton = TreeSkeleton::new();
     grow_trunk(&mut skeleton, params, &mut rng);
-    grow_buttresses(&mut skeleton, params, &mut rng);
     grow_branches(&mut skeleton, params, &mut rng);
     skeleton
 }
@@ -179,7 +181,7 @@ fn grow_trunk(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut Tre
 
     skeleton.push(SkeletonNode {
         position: Vec3::ZERO,
-        radius: params.base_radius + params.root_flare,
+        radius: params.base_radius,
         parent: None,
         depth: 0,
         kind: BranchKind::Trunk,
@@ -190,13 +192,20 @@ fn grow_trunk(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut Tre
         let t = i as f32 / params.trunk_segments as f32;
         let y = t * params.trunk_height;
 
-        let taper_t = t.powf(1.72);
-        let trunk_radius =
-            params.base_radius + (params.tip_radius - params.base_radius) * taper_t;
-
-        let flare_fade = 1.0 - smoothstep(0.02, 0.58, t);
-        let flare = params.root_flare * flare_fade.powf(1.85);
-        let radius = trunk_radius + flare;
+        // Two-phase columnar taper: lower portion stays nearly constant,
+        // upper portion tapers more steeply to the tip.
+        let cf = params.columnar_fraction;
+        let radius = if t <= cf {
+            // Lower columnar section: gentle taper from 1.0 to 0.85 of base
+            let s = smoothstep(0.0, cf, t);
+            let factor = 1.0 - 0.15 * s; // lerp(1.0, 0.85, s)
+            params.base_radius * factor
+        } else {
+            // Upper section: quadratic taper from 0.85*base to tip
+            let t_upper = (t - cf) / (1.0 - cf);
+            let r_at_crown = params.base_radius * 0.85;
+            r_at_crown + (params.tip_radius - r_at_crown) * t_upper.powf(2.0)
+        };
 
         let raw_x = rng.next_f32_range(-params.trunk_wobble, params.trunk_wobble);
         let raw_z = rng.next_f32_range(-params.trunk_wobble, params.trunk_wobble);
@@ -217,58 +226,6 @@ fn grow_trunk(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut Tre
     }
 }
 
-fn grow_buttresses(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut TreeRng) {
-    let trunk_count = skeleton.nodes.len();
-    let buttress_count = 4 + (rng.next_u64() % 3) as usize;
-    let base_angle = rng.next_f32() * std::f32::consts::TAU;
-
-    for i in 0..buttress_count {
-        let angle = base_angle
-            + i as f32 / buttress_count as f32 * std::f32::consts::TAU
-            + rng.next_f32_range(-0.18, 0.18);
-        let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
-        let attach_frac = rng.next_f32_range(0.03, 0.06);
-        let trunk_idx = find_trunk_node_at_frac(skeleton, attach_frac, params, trunk_count);
-        let trunk_pos = skeleton.nodes[trunk_idx].position;
-        let attach_height = rng.next_f32_range(0.18, 1.05);
-
-        let attach = Vec3::new(trunk_pos.x, attach_height, trunk_pos.z)
-            + outward * (params.base_radius * rng.next_f32_range(0.48, 0.62))
-            + Vec3::Y * rng.next_f32_range(0.0, 0.08);
-        let mid = attach
-            + outward * rng.next_f32_range(0.7, 1.5)
-            + Vec3::Y * rng.next_f32_range(-0.10, 0.15);
-        let tip = attach
-            + outward * rng.next_f32_range(1.8, 3.0)
-            + Vec3::Y * rng.next_f32_range(-0.28, 0.05);
-
-        let attach_idx = skeleton.push(SkeletonNode {
-            position: attach,
-            radius: params.base_radius * rng.next_f32_range(0.95, 1.08),
-            parent: Some(trunk_idx),
-            depth: 1,
-            kind: BranchKind::Buttress,
-            lobe_id: None,
-        });
-        let mid_idx = skeleton.push(SkeletonNode {
-            position: mid,
-            radius: params.base_radius * rng.next_f32_range(0.58, 0.70),
-            parent: Some(attach_idx),
-            depth: 1,
-            kind: BranchKind::Buttress,
-            lobe_id: None,
-        });
-        skeleton.push(SkeletonNode {
-            position: tip,
-            radius: params.base_radius * rng.next_f32_range(0.30, 0.42),
-            parent: Some(mid_idx),
-            depth: 1,
-            kind: BranchKind::Buttress,
-            lobe_id: None,
-        });
-    }
-}
-
 // ──────────────────────── Phase 2: Branches ────────────────────────
 
 fn grow_branches(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut TreeRng) {
@@ -283,12 +240,31 @@ fn grow_branches(skeleton: &mut TreeSkeleton, params: &RedwoodParams, rng: &mut 
     for spec in specs {
         grow_primary_branch(skeleton, params, rng, trunk_node_count, spec);
     }
+
+    // Apex crown: 14-22 branches filling the top of the crown
+    let apex_count = 14 + (rng.next_u64() % 9) as usize;
+    for i in 0..apex_count {
+        let lobe_id = (i % lobe_angles.len().max(1)) as u8;
+        let apex_t = i as f32 / apex_count.max(1) as f32;
+        let apex_spec = PrimaryBranchSpec {
+            style: PrimaryStyle::FillerLive,
+            // Distribute from 0.85 to 0.99 along trunk
+            trunk_frac: 0.85 + apex_t * 0.14,
+            azimuth: wrap_angle(lobe_angles[lobe_id as usize] + rng.next_f32_range(-0.50, 0.50)),
+            // Higher branches point more steeply upward
+            pitch_deg: rng.next_f32_range(25.0, 50.0) + apex_t * 20.0,
+            length: params.trunk_height * rng.next_f32_range(0.03, 0.08) * (1.0 - apex_t * 0.4),
+            lobe_id: Some(lobe_id),
+        };
+        grow_primary_branch(skeleton, params, rng, trunk_node_count, apex_spec);
+    }
 }
 
 fn build_lobe_angles(rng: &mut TreeRng) -> Vec<f32> {
-    let lobe_count = 6 + (rng.next_u64() % 2) as usize;
-    let gap_count = 1 + usize::from(rng.next_f32() < 0.35);
-    let gap_size = rng.next_f32_range(0.24, 0.42);
+    // More lobes for denser, more uniform coverage
+    let lobe_count = 10 + (rng.next_u64() % 3) as usize;
+    let gap_count = 1 + usize::from(rng.next_f32() < 0.40);
+    let gap_size = rng.next_f32_range(0.18, 0.35);
     let base_angle = rng.next_f32() * std::f32::consts::TAU;
     let mut gap_indices = Vec::with_capacity(gap_count);
     while gap_indices.len() < gap_count {
@@ -303,7 +279,7 @@ fn build_lobe_angles(rng: &mut TreeRng) -> Vec<f32> {
     let mut lobe_angles = Vec::with_capacity(lobe_count);
     let mut angle = base_angle;
     for i in 0..lobe_count {
-        lobe_angles.push(wrap_angle(angle + rng.next_f32_range(-0.12, 0.12)));
+        lobe_angles.push(wrap_angle(angle + rng.next_f32_range(-0.10, 0.10)));
         angle += base_step;
         if gap_indices.binary_search(&i).is_ok() {
             angle += gap_size;
@@ -318,14 +294,17 @@ fn build_primary_branch_specs(
     rng: &mut TreeRng,
 ) -> Vec<PrimaryBranchSpec> {
     let lobe_count = lobe_angles.len().max(1);
-    let desired_lower = 6 + (rng.next_u64() % 3) as usize;
-    let desired_upper = 14 + (rng.next_u64() % 5) as usize;
-    let desired_stub = 3 + (rng.next_u64() % 2) as usize;
+    let desired_lower = 16 + (rng.next_u64() % 4) as usize;
+    let desired_upper = 35 + (rng.next_u64() % 6) as usize;
+    let desired_stub = 8 + (rng.next_u64() % 3) as usize;
 
     let lower_count = desired_lower.min(params.branch_count.max(1));
     let remaining_after_lower = params.branch_count.saturating_sub(lower_count);
-    let upper_count = desired_upper.min(remaining_after_lower.saturating_sub(desired_stub.min(remaining_after_lower)));
-    let remaining_after_upper = params.branch_count.saturating_sub(lower_count + upper_count);
+    let upper_count = desired_upper
+        .min(remaining_after_lower.saturating_sub(desired_stub.min(remaining_after_lower)));
+    let remaining_after_upper = params
+        .branch_count
+        .saturating_sub(lower_count + upper_count);
     let stub_count = desired_stub.min(remaining_after_upper);
     let filler_count = params
         .branch_count
@@ -340,18 +319,17 @@ fn build_primary_branch_specs(
             0.0
         };
         let lobe_id = (i % lobe_count) as u8;
+        let height_frac = params.crown_start_frac + lower_t * 0.25;
         specs.push(PrimaryBranchSpec {
             style: PrimaryStyle::LowerScaffold,
-            trunk_frac: (params.crown_start_frac
-                + 0.010
-                + lower_t * 0.11
-                + rng.next_f32_range(-0.010, 0.010))
-            .clamp(params.crown_start_frac, 0.86),
-            azimuth: wrap_angle(lobe_angles[lobe_id as usize] + rng.next_f32_range(-0.24, 0.24)),
-            pitch_deg: rng.next_f32_range(-12.0, 5.0),
+            trunk_frac: (height_frac + rng.next_f32_range(-0.015, 0.015))
+                .clamp(params.crown_start_frac, params.crown_start_frac + 0.28),
+            azimuth: wrap_angle(lobe_angles[lobe_id as usize] + rng.next_f32_range(-0.35, 0.35)),
+            pitch_deg: rng.next_f32_range(-5.0, 12.0),
             length: params.trunk_height
-                * (0.28 - lower_t * 0.05)
-                * rng.next_f32_range(0.90, 1.10),
+                * crown_envelope(height_frac, params.crown_start_frac)
+                * 0.15
+                * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
     }
@@ -359,17 +337,17 @@ fn build_primary_branch_specs(
     for i in 0..upper_count {
         let upper_t = (i as f32 + 0.5) / upper_count.max(1) as f32;
         let lobe_id = ((i + lower_count) % lobe_count) as u8;
+        let upper_start = params.crown_start_frac + 0.25;
+        let height_frac = upper_start + upper_t * (0.92 - upper_start);
         specs.push(PrimaryBranchSpec {
             style: PrimaryStyle::UpperSecondary,
-            trunk_frac: (0.86
-                + upper_t * 0.10
-                + rng.next_f32_range(-0.012, 0.012))
-            .clamp(0.84, 0.97),
+            trunk_frac: (height_frac + rng.next_f32_range(-0.015, 0.015)).clamp(upper_start, 0.92),
             azimuth: wrap_angle(lobe_angles[lobe_id as usize] + rng.next_f32_range(-0.28, 0.28)),
-            pitch_deg: rng.next_f32_range(5.0, 20.0) + upper_t * 4.0,
+            pitch_deg: rng.next_f32_range(10.0, 35.0) + upper_t * 15.0,
             length: params.trunk_height
-                * (0.18 - upper_t * 0.04)
-                * rng.next_f32_range(0.90, 1.10),
+                * crown_envelope(height_frac, params.crown_start_frac)
+                * 0.13
+                * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
     }
@@ -377,15 +355,16 @@ fn build_primary_branch_specs(
     for i in 0..filler_count {
         let filler_t = (i as f32 + 0.5) / filler_count.max(1) as f32;
         let lobe_id = ((i * 2 + 1) % lobe_count) as u8;
+        let height_frac = 0.88 + filler_t * 0.10;
         specs.push(PrimaryBranchSpec {
             style: PrimaryStyle::FillerLive,
-            trunk_frac: (0.82 + filler_t * 0.12 + rng.next_f32_range(-0.016, 0.016))
-                .clamp(params.crown_start_frac, 0.95),
+            trunk_frac: (height_frac + rng.next_f32_range(-0.016, 0.016)).clamp(0.86, 0.98),
             azimuth: wrap_angle(lobe_angles[lobe_id as usize] + rng.next_f32_range(-0.30, 0.30)),
-            pitch_deg: rng.next_f32_range(-3.0, 15.0),
+            pitch_deg: rng.next_f32_range(35.0, 65.0),
             length: params.trunk_height
-                * rng.next_f32_range(0.12, 0.18)
-                * rng.next_f32_range(0.90, 1.10),
+                * crown_envelope(height_frac, params.crown_start_frac)
+                * 0.09
+                * rng.next_f32_range(0.85, 1.15),
             lobe_id: Some(lobe_id),
         });
     }
@@ -393,16 +372,28 @@ fn build_primary_branch_specs(
     for _ in 0..stub_count {
         specs.push(PrimaryBranchSpec {
             style: PrimaryStyle::DeadStub,
-            trunk_frac: rng.next_f32_range(0.64, 0.82),
+            trunk_frac: rng.next_f32_range(0.15, 0.58),
             azimuth: rng.next_f32() * std::f32::consts::TAU,
-            pitch_deg: rng.next_f32_range(-18.0, 4.0),
-            length: params.trunk_height * rng.next_f32_range(0.06, 0.10),
+            pitch_deg: rng.next_f32_range(-18.0, -5.0),
+            length: params.trunk_height * rng.next_f32_range(0.04, 0.08),
             lobe_id: None,
         });
     }
 
     specs.sort_by(|a, b| a.trunk_frac.total_cmp(&b.trunk_frac));
     specs
+}
+
+/// Conical crown envelope: widest near crown base, tapering toward top.
+/// Returns a scale factor [0, 1] for branch length at a given trunk fraction.
+/// Uses a softer taper to produce a fuller, more natural crown silhouette.
+fn crown_envelope(height_frac: f32, crown_start_frac: f32) -> f32 {
+    if height_frac < crown_start_frac {
+        return 0.0;
+    }
+    let t = (height_frac - crown_start_frac) / (1.0 - crown_start_frac);
+    // Softer taper: stays wider longer, then narrows near top
+    (1.0 - t * t).max(0.0)
 }
 
 fn grow_primary_branch(
@@ -416,49 +407,57 @@ fn grow_primary_branch(
     let trunk_pos = skeleton.nodes[trunk_idx].position;
     let trunk_r = skeleton.nodes[trunk_idx].radius;
 
-    let (seg_count, base_radius_factor, radius_curve, lift_per_seg, droop_per_seg, jitter_scale, branch_kind, vigor) =
-        match spec.style {
-            PrimaryStyle::LowerScaffold => (
-                6usize,     // More segments = smoother, more branch-like geometry
-                0.10f32,    // Thin relative to trunk — avoids blobby SDF junctions
-                1.60f32,    // Steep taper curve — thick base, thin tip
-                0.010f32,   // Slight upward tendency
-                0.025f32,   // Gentle droop along length
-                0.06f32,    // Subtle jitter for organic feel
-                BranchKind::LiveScaffold,
-                1.0f32,
-            ),
-            PrimaryStyle::UpperSecondary => (
-                5usize,
-                0.07f32,
-                1.50f32,
-                0.040f32,   // More lift — upper branches reach upward
-                0.012f32,
-                0.05f32,
-                BranchKind::LiveSecondary,
-                0.84f32,
-            ),
-            PrimaryStyle::FillerLive => (
-                4usize,
-                0.06f32,
-                1.40f32,
-                0.030f32,
-                0.010f32,
-                0.05f32,
-                BranchKind::LiveSecondary,
-                0.68f32,
-            ),
-            PrimaryStyle::DeadStub => (
-                3usize,
-                0.05f32,
-                1.20f32,
-                -0.015f32,  // Dead stubs droop
-                0.040f32,
-                0.04f32,
-                BranchKind::DeadStub,
-                0.0f32,
-            ),
-        };
+    let (
+        seg_count,
+        base_radius_factor,
+        radius_curve,
+        lift_per_seg,
+        droop_per_seg,
+        jitter_scale,
+        branch_kind,
+        vigor,
+    ) = match spec.style {
+        PrimaryStyle::LowerScaffold => (
+            8usize,
+            0.18f32,
+            1.50f32,
+            0.012f32,
+            0.018f32,
+            0.05f32,
+            BranchKind::LiveScaffold,
+            1.0f32,
+        ),
+        PrimaryStyle::UpperSecondary => (
+            6usize,
+            0.10f32,
+            1.50f32,
+            0.035f32,
+            0.008f32,
+            0.04f32,
+            BranchKind::LiveSecondary,
+            0.90f32,
+        ),
+        PrimaryStyle::FillerLive => (
+            4usize,
+            0.07f32,
+            1.40f32,
+            0.030f32,
+            0.006f32,
+            0.04f32,
+            BranchKind::LiveSecondary,
+            0.78f32,
+        ),
+        PrimaryStyle::DeadStub => (
+            3usize,
+            0.05f32,
+            1.20f32,
+            -0.015f32,
+            0.040f32,
+            0.04f32,
+            BranchKind::DeadStub,
+            0.0f32,
+        ),
+    };
 
     let pitch = spec.pitch_deg.to_radians();
     let mut dir = Vec3::new(
@@ -476,11 +475,15 @@ fn grow_primary_branch(
     for seg_i in 0..seg_count {
         let seg_t = (seg_i + 1) as f32 / seg_count as f32;
         let radial = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        let swirl = Vec3::new(-radial.z, 0.0, radial.x) * rng.next_f32_range(-jitter_scale, jitter_scale) * 0.5;
+        let swirl = Vec3::new(-radial.z, 0.0, radial.x)
+            * rng.next_f32_range(-jitter_scale, jitter_scale)
+            * 0.5;
         let lift = lift_per_seg - droop_per_seg * seg_t + rng.next_f32_range(-0.018, 0.022);
-        let lateral_jitter =
-            Vec3::new(rng.next_f32_range(-jitter_scale, jitter_scale), 0.0, rng.next_f32_range(-jitter_scale, jitter_scale))
-                * 0.35;
+        let lateral_jitter = Vec3::new(
+            rng.next_f32_range(-jitter_scale, jitter_scale),
+            0.0,
+            rng.next_f32_range(-jitter_scale, jitter_scale),
+        ) * 0.35;
         dir = (dir + Vec3::Y * lift + swirl + lateral_jitter).normalize_or_zero();
 
         let pos = prev_pos + dir * seg_len;
@@ -497,7 +500,9 @@ fn grow_primary_branch(
         if spec.style.is_live() && params.max_branch_depth > 1 {
             let spawn_here = match spec.style {
                 PrimaryStyle::LowerScaffold => seg_i >= 1,
-                PrimaryStyle::UpperSecondary => seg_i + 1 == seg_count || (seg_i >= 1 && seg_count > 2),
+                PrimaryStyle::UpperSecondary => {
+                    seg_i + 1 == seg_count || (seg_i >= 1 && seg_count > 2)
+                }
                 PrimaryStyle::FillerLive => {
                     seg_i + 1 == seg_count || (seg_i == 0 && seg_count > 1 && rng.next_f32() < 0.35)
                 }
@@ -533,16 +538,23 @@ fn grow_live_sub_branches(
     lobe_id: u8,
     vigor: f32,
 ) {
-    if depth > params.max_branch_depth || parent_length < 1.2 {
+    if depth > params.max_branch_depth || parent_length < 0.6 {
         return;
     }
 
     let child_count = match depth {
         2 => {
-            if vigor > 0.88 {
-                2 + usize::from(rng.next_f32() < 0.40)
-            } else if rng.next_f32() < 0.75 {
-                1 + usize::from(rng.next_f32() < 0.30 * vigor.max(0.5))
+            if vigor > 0.85 {
+                2 + usize::from(rng.next_f32() < 0.50)
+            } else if rng.next_f32() < 0.80 {
+                1 + usize::from(rng.next_f32() < 0.35 * vigor.max(0.5))
+            } else {
+                1
+            }
+        }
+        3 => {
+            if rng.next_f32() < 0.72 * vigor.max(0.48) {
+                1 + usize::from(rng.next_f32() < 0.25)
             } else {
                 0
             }
@@ -562,16 +574,22 @@ fn grow_live_sub_branches(
     let parent_pos = skeleton.nodes[parent_idx].position;
     let parent_r = skeleton.nodes[parent_idx].radius;
     let parent_dir = segment_direction(skeleton, parent_idx).unwrap_or(Vec3::Y);
-    let basis_up = if parent_dir.y.abs() > 0.85 { Vec3::X } else { Vec3::Y };
+    let basis_up = if parent_dir.y.abs() > 0.85 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
     let right = parent_dir.cross(basis_up).normalize_or_zero();
     let up = right.cross(parent_dir).normalize_or_zero();
 
     for child_i in 0..child_count {
         let spread = if depth == 2 { 0.72 } else { 0.92 };
-        let lateral = right * rng.next_f32_range(-spread, spread) + up * rng.next_f32_range(0.05, 0.28);
-        let mut dir =
-            (parent_dir * rng.next_f32_range(0.75, 1.05) + lateral + Vec3::Y * rng.next_f32_range(-0.04, 0.14))
-                .normalize_or_zero();
+        let lateral =
+            right * rng.next_f32_range(-spread, spread) + up * rng.next_f32_range(0.05, 0.28);
+        let mut dir = (parent_dir * rng.next_f32_range(0.75, 1.05)
+            + lateral
+            + Vec3::Y * rng.next_f32_range(-0.04, 0.14))
+        .normalize_or_zero();
         if depth == 2 {
             dir.y += rng.next_f32_range(0.01, 0.08);
         } else {
@@ -581,12 +599,14 @@ fn grow_live_sub_branches(
         let seg_count = match depth {
             2 => 4,
             3 => 3,
+            4..=5 => 2,
             _ => 2,
         };
         let base_radius = match depth {
             2 => parent_r * 0.65,
             3 => parent_r * 0.50,
-            _ => parent_r * 0.40,
+            4..=5 => parent_r * 0.35,
+            _ => parent_r * 0.35,
         };
         let child_len = parent_length
             * rng.next_f32_range(
@@ -605,7 +625,7 @@ fn grow_live_sub_branches(
             branch_dir = (branch_dir
                 + right * rng.next_f32_range(-0.10, 0.10) * 0.4
                 + Vec3::Y * rng.next_f32_range(-0.05, 0.08))
-                .normalize_or_zero();
+            .normalize_or_zero();
             let pos = prev_pos + branch_dir * seg_len;
             let radius = base_radius * (1.0 - seg_t).powf(1.40) + params.tip_radius * 0.02;
             let node_idx = skeleton.push(SkeletonNode {
@@ -766,8 +786,8 @@ fn skeleton_to_canopy_regions(
     params: &RedwoodParams,
     _rng: &mut TreeRng,
 ) -> Vec<CanopyRegionSeed> {
-    let min_y = params.trunk_height * (params.crown_start_frac - 0.05).max(0.70);
-    let dominant_min_y = params.trunk_height * (params.crown_start_frac - 0.03).max(0.72);
+    let min_y = params.trunk_height * (params.crown_start_frac - 0.05).max(0.0);
+    let dominant_min_y = params.trunk_height * (params.crown_start_frac - 0.03).max(0.0);
     let children = crate::subjects::tube_mesh::build_children_index(skeleton);
     let mut candidates = Vec::new();
 
@@ -796,14 +816,15 @@ fn skeleton_to_canopy_regions(
         }
 
         let seg_len = (node.position - parent_pos).length();
-        let height_norm = ((node.position.y - min_y) / (params.trunk_height * 0.32)).clamp(0.0, 1.0);
+        let height_norm =
+            ((node.position.y - min_y) / (params.trunk_height * 0.32)).clamp(0.0, 1.0);
         let radial_dist = Vec2::new(node.position.x, node.position.z).length();
         let radial_norm = (radial_dist / (params.trunk_height * 0.22)).clamp(0.0, 1.2);
         let outward = Vec3::new(node.position.x, 0.0, node.position.z).normalize_or_zero();
         let lobe_id = node.lobe_id.unwrap_or(0);
         let height_band = (1.0 - (height_norm - 0.62).abs() * 0.95).clamp(0.25, 1.0);
         let base_score = height_band * 0.72
-            + radial_norm * 1.05
+            + radial_norm * 1.40
             + if dominant { 0.55 } else { 0.0 }
             + if terminal { 0.28 } else { 0.0 }
             + node.depth as f32 * 0.12;
@@ -815,8 +836,8 @@ fn skeleton_to_canopy_regions(
 
         // Large cluster centered on branch, wrapping the whole segment
         candidates.push(CanopyRegionSeed {
-            anchor: mid_anchor + outward * 0.2 + Vec3::Y * 0.2,
-            radius: (seg_len * 2.0 + 1.5).clamp(3.5, 7.0),
+            anchor: mid_anchor + outward * 0.3 + Vec3::Y * 0.3,
+            radius: (seg_len * 2.5 + 2.0).clamp(4.0, 9.0),
             axis: (axis + Vec3::Y * 0.18).normalize_or_zero(),
             _interior_weight: 0.50,
             lobe_id,
@@ -825,8 +846,8 @@ fn skeleton_to_canopy_regions(
 
         // Tip cluster wrapping branch end
         candidates.push(CanopyRegionSeed {
-            anchor: node.position + outward * 0.15 + Vec3::NEG_Y * 0.15,
-            radius: (seg_len * 1.5 + 1.0).clamp(2.8, 5.5),
+            anchor: node.position + outward * 0.25 + Vec3::NEG_Y * 0.1,
+            radius: (seg_len * 2.0 + 1.5).clamp(3.5, 7.0),
             axis: (axis + outward * 0.12 + Vec3::NEG_Y * 0.08).normalize_or_zero(),
             _interior_weight: if terminal { 0.18 } else { 0.35 },
             lobe_id,
@@ -836,8 +857,8 @@ fn skeleton_to_canopy_regions(
         // Under-branch drape: fills the gap below horizontal branches
         if dominant || terminal {
             candidates.push(CanopyRegionSeed {
-                anchor: mid_anchor + Vec3::NEG_Y * 0.6 + outward * 0.3,
-                radius: (seg_len * 1.4 + 0.8).clamp(2.5, 5.0),
+                anchor: mid_anchor + Vec3::NEG_Y * 0.5 + outward * 0.4,
+                radius: (seg_len * 1.8 + 1.2).clamp(3.0, 6.5),
                 axis: (axis + Vec3::NEG_Y * 0.25).normalize_or_zero(),
                 _interior_weight: 0.60,
                 lobe_id,
@@ -845,24 +866,75 @@ fn skeleton_to_canopy_regions(
             });
         }
 
-        // Inner fill: between trunk and mid-branch
-        if dominant {
+        // Inner fill: clusters centered on/near trunk at branch junction height
+        // This is critical for hiding the trunk through the crown interior
+        {
+            // Large cluster right at branch base, barely offset from trunk
             candidates.push(CanopyRegionSeed {
-                anchor: parent_pos.lerp(node.position, 0.25) + outward * 0.1 + Vec3::Y * 0.15,
-                radius: (seg_len * 1.6 + 1.0).clamp(3.0, 6.0),
-                axis: (axis + Vec3::Y * 0.22).normalize_or_zero(),
-                _interior_weight: 0.65,
+                anchor: parent_pos + outward * 0.4 + Vec3::Y * 0.2,
+                radius: (seg_len * 2.2 + 2.5).clamp(4.0, 9.0),
+                axis: (outward * 0.2 + Vec3::Y * 0.5).normalize_or_zero(),
+                _interior_weight: 0.75,
                 lobe_id,
-                score: base_score + 0.18,
+                score: base_score + 0.28,
+            });
+
+            // Opposite-side fill to wrap around trunk
+            candidates.push(CanopyRegionSeed {
+                anchor: parent_pos - outward * 0.3 + Vec3::Y * 0.15,
+                radius: (seg_len * 1.5 + 2.0).clamp(3.5, 7.0),
+                axis: (-outward * 0.15 + Vec3::Y * 0.4).normalize_or_zero(),
+                _interior_weight: 0.80,
+                lobe_id,
+                score: base_score + 0.15,
             });
         }
+    }
+
+    // Crown-tip clusters: wrap the trunk leader with foliage at the top
+    let max_lobe = candidates
+        .iter()
+        .map(|c| c.lobe_id as usize)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    for tip_i in 0..12 {
+        let angle = (tip_i as f32 / 12.0) * std::f32::consts::TAU;
+        let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
+        let tip_y = params.trunk_height * (0.90 + (tip_i as f32 / 12.0) * 0.08);
+        candidates.push(CanopyRegionSeed {
+            anchor: Vec3::new(outward.x * 0.6, tip_y, outward.z * 0.6),
+            radius: 4.5,
+            axis: (outward * 0.2 + Vec3::Y * 0.8).normalize_or_zero(),
+            _interior_weight: 0.40,
+            lobe_id: (tip_i % max_lobe) as u8,
+            score: 4.5,
+        });
+    }
+
+    // Interior trunk-hugging clusters: fill the gap where trunk shows through crown
+    let crown_base_y = params.trunk_height * params.crown_start_frac;
+    let crown_top_y = params.trunk_height * 0.92;
+    for fill_i in 0..24 {
+        let fill_t = fill_i as f32 / 24.0;
+        let y = crown_base_y + fill_t * (crown_top_y - crown_base_y);
+        let angle = (fill_i as f32 / 24.0) * std::f32::consts::TAU * 3.7; // spiral
+        let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
+        candidates.push(CanopyRegionSeed {
+            anchor: Vec3::new(outward.x * 0.8, y, outward.z * 0.8),
+            radius: 6.0,
+            axis: (outward * 0.15 + Vec3::Y * 0.40).normalize_or_zero(),
+            _interior_weight: 0.80,
+            lobe_id: (fill_i % max_lobe) as u8,
+            score: 3.8,
+        });
     }
 
     if candidates.is_empty() {
         return Vec::new();
     }
 
-    let target_count = 80usize;
+    let target_count = 260usize;
     let bucket_count = candidates
         .iter()
         .map(|candidate| candidate.lobe_id as usize)
@@ -923,8 +995,13 @@ fn skeleton_to_canopy_regions(
                 });
             }
             bucket.push(CanopyRegionSeed {
-                anchor: Vec3::new(outward.x * 1.25, centroid.y.clamp(params.trunk_height * 0.82, params.trunk_height * 0.95), outward.z * 1.25)
-                    + axis * 0.12,
+                anchor: Vec3::new(
+                    outward.x * 1.25,
+                    centroid
+                        .y
+                        .clamp(params.trunk_height * 0.82, params.trunk_height * 0.95),
+                    outward.z * 1.25,
+                ) + axis * 0.12,
                 radius: (max_radius * 0.72 + 0.14).clamp(1.35, 2.5),
                 axis: (axis + outward * 0.18 + Vec3::Y * 0.20).normalize_or_zero(),
                 _interior_weight: 0.40,
@@ -997,14 +1074,16 @@ pub fn generate_foliage_anchors_grown(params: &RedwoodParams) -> Vec<(Vec3, f32)
 }
 
 /// Generate foliage anchors from a pre-built skeleton (avoids rebuilding when skeleton is shared).
-pub(crate) fn generate_foliage_anchors_from_skeleton(params: &RedwoodParams, skeleton: &TreeSkeleton) -> Vec<(Vec3, f32)> {
+pub(crate) fn generate_foliage_anchors_from_skeleton(
+    params: &RedwoodParams,
+    skeleton: &TreeSkeleton,
+) -> Vec<(Vec3, f32)> {
     let mut foliage_rng = TreeRng::new(params.seed.wrapping_add(0xdeadbeef));
     skeleton_to_canopy_regions(skeleton, params, &mut foliage_rng)
         .into_iter()
         .map(|region| (region.anchor, region.radius))
         .collect()
 }
-
 
 // ──────────────────────── Tests ────────────────────────
 
@@ -1054,8 +1133,7 @@ mod tests {
             seed: 2,
             ..Default::default()
         });
-        let differs = a.len() != b.len()
-            || a.iter().zip(b.iter()).any(|(ca, cb)| ca.0 != cb.0);
+        let differs = a.len() != b.len() || a.iter().zip(b.iter()).any(|(ca, cb)| ca.0 != cb.0);
         assert!(differs, "different seeds should produce different trees");
     }
 
@@ -1063,24 +1141,16 @@ mod tests {
     fn capsule_budget_in_range() {
         let params = RedwoodParams::default();
         let capsules = trunk_capsule_data_grown(&params);
-        assert!(capsules.len() >= 80, "too few capsules: {}", capsules.len());
-        assert!(capsules.len() <= 650, "too many capsules: {}", capsules.len());
-    }
-
-    #[test]
-    fn buttress_capsules_present() {
-        let params = RedwoodParams::default();
-        let capsules = trunk_capsule_data_grown(&params);
-        let buttress_capsules = capsules
-            .iter()
-            .filter(|(a, b, _, _)| {
-                a.y <= 1.6
-                    && b.y <= 1.8
-                    && (Vec2::new(a.x, a.z).length() > params.base_radius * 0.75
-                        || Vec2::new(b.x, b.z).length() > params.base_radius * 0.75)
-            })
-            .count();
-        assert!(buttress_capsules >= 6, "expected buttress capsules, got {buttress_capsules}");
+        assert!(
+            capsules.len() >= 200,
+            "too few capsules: {}",
+            capsules.len()
+        );
+        assert!(
+            capsules.len() <= 20000,
+            "too many capsules: {}",
+            capsules.len()
+        );
     }
 
     #[test]
@@ -1178,7 +1248,7 @@ mod tests {
         let anchors = generate_foliage_anchors_grown(&params);
         assert!(!anchors.is_empty(), "should produce foliage anchors");
 
-        let min_y = params.trunk_height * 0.68;
+        let min_y = params.trunk_height * (params.crown_start_frac - 0.10).max(0.0);
         for (pos, r) in &anchors {
             assert!(
                 pos.y > min_y,
@@ -1192,9 +1262,7 @@ mod tests {
     fn count_smooth_union_radius(tree: &SdfTree, radius: f32) -> usize {
         match tree {
             SdfTree::Primitive(_) => 0,
-            SdfTree::Union(a, b)
-            | SdfTree::Intersection(a, b)
-            | SdfTree::Difference(a, b) => {
+            SdfTree::Union(a, b) | SdfTree::Intersection(a, b) | SdfTree::Difference(a, b) => {
                 count_smooth_union_radius(a, radius) + count_smooth_union_radius(b, radius)
             }
             SdfTree::SmoothUnion { a, b, radius: r } => {

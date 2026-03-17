@@ -1,10 +1,13 @@
-use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
 use super::hw_raster_pass::DispatchLists;
+use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
 
-/// CPU-side DAG traversal + GPU meshlet culling.
+/// CPU-side adaptive DAG traversal + GPU per-meshlet culling.
 ///
-/// The DAG cut is computed on the CPU (simple iteration over groups).
-/// Per-meshlet frustum + cone culling is done on the GPU via compute shader.
+/// Each frame the CPU traverses the meshlet DAG from root groups, projecting
+/// each group's simplification error to screen-space pixels. Groups whose error
+/// is below the threshold are selected; otherwise their children are visited.
+/// Selected group indices are uploaded to the GPU, where a compute shader does
+/// per-meshlet frustum culling, writing survivors to the HW dispatch list.
 pub struct CullPass {
     /// Group queue buffer (CPU → GPU).
     group_queue_buffer: wgpu::Buffer,
@@ -15,10 +18,7 @@ pub struct CullPass {
 }
 
 impl CullPass {
-    pub fn new(
-        device: &wgpu::Device,
-        frame_bgl: &wgpu::BindGroupLayout,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, frame_bgl: &wgpu::BindGroupLayout) -> Self {
         let cull_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("cull-data-bgl"),
@@ -38,7 +38,7 @@ impl CullPass {
                     super::storage_entry(2, false, wgpu::ShaderStages::COMPUTE), // sw_dispatch_list
                     super::storage_entry(3, false, wgpu::ShaderStages::COMPUTE), // sw_dispatch_count
                     super::storage_entry(4, true, wgpu::ShaderStages::COMPUTE),  // group_queue
-                    super::storage_entry(5, true, wgpu::ShaderStages::COMPUTE),  // group_queue_count (uniform-like)
+                    super::storage_entry(5, true, wgpu::ShaderStages::COMPUTE), // group_queue_count (uniform-like)
                 ],
             });
 
@@ -51,7 +51,11 @@ impl CullPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cull-pipeline-layout"),
-            bind_group_layouts: &[frame_bgl, &cull_bind_group_layout, &dispatch_bind_group_layout],
+            bind_group_layouts: &[
+                frame_bgl,
+                &cull_bind_group_layout,
+                &dispatch_bind_group_layout,
+            ],
             immediate_size: 0,
         });
 
@@ -87,49 +91,68 @@ impl CullPass {
         }
     }
 
-    /// Perform CPU-side DAG cut and upload the group queue.
+    /// Perform adaptive CPU-side DAG cut and upload the selected group queue.
     ///
-    /// Returns the number of groups to process on the GPU.
-    /// Perform CPU-side DAG cut and write meshlet dispatch list directly.
+    /// Traverses the DAG top-down from root groups. For each group, projects its
+    /// simplification error to screen-space pixels. If the error is below the
+    /// threshold (or the group is a leaf), the group is selected for rendering.
+    /// Otherwise its children are visited recursively.
     ///
-    /// Bypasses the GPU cull shader — writes the HW dispatch list and count
-    /// directly from the CPU for maximum reliability.
-    pub fn cpu_dag_cut(
+    /// Returns the number of selected groups (to dispatch the GPU cull shader).
+    pub fn cpu_dag_cut_adaptive(
         &self,
         queue: &wgpu::Queue,
         dag: &MeshletDag,
-        dispatch: &super::hw_raster_pass::DispatchLists,
+        camera_position: glam::Vec3,
+        screen_height: f32,
+        fov_factor: f32,
+        error_threshold_px: f32,
     ) -> u32 {
-        // Collect all meshlet indices from leaf groups (level 0)
-        let mut meshlet_indices = Vec::new();
+        if dag.groups.is_empty() {
+            queue.write_buffer(&self.group_queue_count_buffer, 0, bytemuck::bytes_of(&0u32));
+            return 0;
+        }
 
-        for group in &dag.groups {
-            if group.child_count == 0 {
-                // Leaf group — emit all its meshlets
-                for mi in group.meshlet_start..group.meshlet_start + group.meshlet_count {
-                    meshlet_indices.push(mi);
+        let mut selected_groups: Vec<u32> = Vec::new();
+        let mut stack = root_group_indices(dag);
+
+        while let Some(group_idx) = stack.pop() {
+            let group = &dag.groups[group_idx as usize];
+            let center = glam::Vec3::from_array(group.bounds.center);
+            let dist = camera_position.distance(center);
+
+            let projected_error = if dist < 0.001 {
+                1000.0
+            } else {
+                group.error * screen_height * fov_factor / dist
+            };
+
+            let is_leaf = group.child_count == 0;
+            let should_render = is_leaf || projected_error < error_threshold_px;
+
+            if should_render {
+                selected_groups.push(group_idx);
+            } else {
+                // Recurse to finer-detail children
+                for ci in 0..group.child_count {
+                    stack.push(group.child_start + ci);
                 }
             }
         }
 
-        // Deduplicate (groups may overlap)
-        meshlet_indices.sort_unstable();
-        meshlet_indices.dedup();
+        let count = selected_groups
+            .len()
+            .min(self.group_queue_buffer.size() as usize / 4) as u32;
 
-        let count = meshlet_indices.len().min(dispatch.max_meshlets as usize) as u32;
-
-        // Write meshlet indices directly to HW dispatch list
         if count > 0 {
             queue.write_buffer(
-                &dispatch.hw_dispatch_buffer,
+                &self.group_queue_buffer,
                 0,
-                bytemuck::cast_slice(&meshlet_indices[..count as usize]),
+                bytemuck::cast_slice(&selected_groups[..count as usize]),
             );
         }
-
-        // Write the count directly to HW count buffer
         queue.write_buffer(
-            &dispatch.hw_count_buffer,
+            &self.group_queue_count_buffer,
             0,
             bytemuck::bytes_of(&count),
         );
@@ -222,3 +245,102 @@ impl CullPass {
     }
 }
 
+fn root_group_indices(dag: &MeshletDag) -> Vec<u32> {
+    if dag.groups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut has_parent = vec![false; dag.groups.len()];
+    for group in &dag.groups {
+        for child_idx in group.child_start..group.child_start + group.child_count {
+            if let Some(slot) = has_parent.get_mut(child_idx as usize) {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut roots: Vec<u32> = has_parent
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, has_parent)| (!*has_parent).then_some(idx as u32))
+        .collect();
+
+    if roots.is_empty() {
+        let max_level = dag.groups.iter().map(|g| g.level).max().unwrap_or(0);
+        roots = dag
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, group)| (group.level == max_level).then_some(idx as u32))
+            .collect();
+    }
+
+    roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::root_group_indices;
+    use crate::meshlet::bounds::MeshletBounds;
+    use crate::meshlet::{MeshletDag, MeshletGroup};
+
+    fn bounds() -> MeshletBounds {
+        MeshletBounds {
+            center: [0.0, 0.0, 0.0],
+            radius: 1.0,
+            cone_axis: [0.0, 1.0, 0.0],
+            cone_cutoff: 1.0,
+        }
+    }
+
+    #[test]
+    fn root_group_detection_handles_merged_dags_with_different_heights() {
+        let dag = MeshletDag {
+            meshlets: Vec::new(),
+            meshlet_vertices: Vec::new(),
+            meshlet_triangles: Vec::new(),
+            groups: vec![
+                MeshletGroup {
+                    meshlet_start: 0,
+                    meshlet_count: 1,
+                    child_start: 0,
+                    child_count: 0,
+                    error: 0.0,
+                    bounds: bounds(),
+                    level: 0,
+                },
+                MeshletGroup {
+                    meshlet_start: 1,
+                    meshlet_count: 1,
+                    child_start: 0,
+                    child_count: 0,
+                    error: 0.0,
+                    bounds: bounds(),
+                    level: 0,
+                },
+                MeshletGroup {
+                    meshlet_start: 2,
+                    meshlet_count: 1,
+                    child_start: 0,
+                    child_count: 2,
+                    error: 1.0,
+                    bounds: bounds(),
+                    level: 1,
+                },
+                MeshletGroup {
+                    meshlet_start: 3,
+                    meshlet_count: 1,
+                    child_start: 0,
+                    child_count: 0,
+                    error: 0.0,
+                    bounds: bounds(),
+                    level: 0,
+                },
+            ],
+            vertices: Vec::new(),
+            level_offsets: vec![0],
+        };
+
+        assert_eq!(root_group_indices(&dag), vec![2, 3]);
+    }
+}

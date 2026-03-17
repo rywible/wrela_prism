@@ -19,7 +19,9 @@ fn signed_hash(n: u32) -> f32 {
 
 /// Number of polygon sides for a tube ring, based on max radius.
 fn segment_sides(max_radius: f32) -> usize {
-    if max_radius > 2.0 {
+    if max_radius > 3.0 {
+        20
+    } else if max_radius > 2.0 {
         16
     } else if max_radius > 0.8 {
         12
@@ -28,6 +30,18 @@ fn segment_sides(max_radius: f32) -> usize {
     } else {
         6
     }
+}
+
+/// Fluting profile modulation for base of trunk. Returns a radius multiplier in [1.0 - depth, 1.0].
+/// `fade` attenuates the fluting above the base (0 at ground, gone by ~15% height).
+fn fluting_profile(flute_count: u32, flute_depth: f32, height_ratio: f32, around_t: f32) -> f32 {
+    let fade = 1.0 - crate::util::smoothstep(0.0, 0.15, height_ratio);
+    if fade < 1e-4 {
+        return 1.0;
+    }
+    let theta = around_t * std::f32::consts::TAU;
+    let sin_sq = (theta * flute_count as f32).sin().powi(2);
+    1.0 - flute_depth * fade * sin_sq
 }
 
 // ──────────────────────── Path Collection ────────────────────────
@@ -247,6 +261,8 @@ fn append_tube_along_path(
     path: &[usize],
     seed: u32,
     is_main_trunk: bool,
+    flute_count: u32,
+    flute_depth: f32,
 ) {
     if path.len() < 2 {
         return;
@@ -301,7 +317,12 @@ fn append_tube_along_path(
 
             let bark_scale = bark_profile(seed, frame, around_t, is_main_trunk);
 
-            let r = frame.radius * bark_scale;
+            let flute_scale = if is_main_trunk {
+                fluting_profile(flute_count, flute_depth, frame.height_ratio, around_t)
+            } else {
+                1.0
+            };
+            let r = frame.radius * bark_scale * flute_scale;
             let offset = frame.right * (theta.cos() * r) + frame.up * (theta.sin() * r);
             let position = frame.center + offset;
             let normal = offset.normalize_or_zero();
@@ -529,6 +550,8 @@ pub(crate) fn build_trunk_mesh_from_skeleton(
             &trunk_path,
             params.seed as u32,
             true,
+            params.flute_count,
+            params.flute_depth,
         );
 
         // 2. Trunk tip cap.
@@ -558,10 +581,6 @@ pub(crate) fn build_trunk_mesh_from_skeleton(
             continue;
         }
 
-        if matches!(skeleton.nodes[path[0]].kind, BranchKind::Buttress) {
-            continue;
-        }
-
         let branch_seed = params.seed as u32 + 1000 + path_i as u32;
         let branch_root_kind = skeleton.nodes[path[0]].kind;
         let use_structural_bark = branch_root_kind.is_structural_trunk();
@@ -574,12 +593,13 @@ pub(crate) fn build_trunk_mesh_from_skeleton(
             path,
             branch_seed,
             use_structural_bark,
+            0,
+            0.0,
         );
 
-        // Branch collars help aerial limbs, but buttresses should blend into the
-        // trunk base instead of creating a visible ring.
+        // Branch collars.
         let first_node = &skeleton.nodes[path[0]];
-        if !matches!(first_node.kind, BranchKind::Buttress) {
+        {
             if let Some(parent_idx) = first_node.parent {
                 let parent_pos = skeleton.nodes[parent_idx].position;
                 let parent_radius = skeleton.nodes[parent_idx].radius;
@@ -593,6 +613,18 @@ pub(crate) fn build_trunk_mesh_from_skeleton(
                     branch_radius,
                     branch_seed,
                     path_i as u32,
+                    params.trunk_height,
+                );
+
+                // Junction cap: fills gap between trunk surface and branch collar
+                let branch_dir = (first_node.position - parent_pos).normalize_or_zero();
+                let disc_center = parent_pos + branch_dir * parent_radius * 0.95;
+                append_cap_disk(
+                    &mut verts,
+                    &mut indices,
+                    disc_center,
+                    branch_dir,
+                    branch_radius * 1.3,
                     params.trunk_height,
                 );
             }
@@ -717,7 +749,7 @@ mod tests {
         let mut verts = Vec::new();
         let mut indices = Vec::new();
 
-        append_tube_along_path(&mut verts, &mut indices, &nodes, &path, 42, true);
+        append_tube_along_path(&mut verts, &mut indices, &nodes, &path, 42, true, 0, 0.0);
 
         // 2 rings * (sides + 1) columns (extra column for UV seam wrap)
         let sides = segment_sides(1.0);
