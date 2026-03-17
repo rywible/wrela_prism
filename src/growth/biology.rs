@@ -209,9 +209,9 @@ pub fn extend_meristems(
         .max(1);
     let lateral_count = meristems.len().saturating_sub(leader_count).max(1);
 
-    // Leader gets 35% of budget, laterals share 65%.
-    let leader_budget = resource_budget * 0.35 / leader_count as f32;
-    let lateral_budget = resource_budget * 0.65 / lateral_count as f32;
+    // Leader gets 40% of budget, laterals share 60%.
+    let leader_budget = resource_budget * 0.40 / leader_count as f32;
+    let lateral_budget = resource_budget * 0.60 / lateral_count as f32;
 
     for &meristem_idx in &meristems {
         let seg = &tree.segments[meristem_idx];
@@ -234,11 +234,9 @@ pub fn extend_meristems(
             lateral_budget
         };
         let mut extension = growth_rate * vigor * available.min(1.0);
-        // Meristems always extend at least a minimum (juvenile vigor).
+        // Leader meristems always extend at least a minimum (juvenile vigor).
         if is_leader {
-            extension = extension.max(species.leader_extension_rate * 0.15 * vigor);
-        } else {
-            extension = extension.max(species.lateral_extension_rate * 0.08 * vigor);
+            extension = extension.max(species.leader_extension_rate * 0.3 * vigor);
         }
         if extension < 0.001 {
             continue;
@@ -290,46 +288,85 @@ pub fn extend_meristems(
 // ──────────────────────── 6. Lateral Budding ────────────────────────
 
 pub fn lateral_budding(tree: &mut GrowthTree, species: &RedwoodSpecies, rng: &mut TreeRng) {
-    let candidates: Vec<(usize, Vec3, f32, u8)> = tree
+    // Find trunk height for height-dependent branching.
+    let trunk_height = tree
+        .segments
+        .iter()
+        .filter(|s| s.branch_order == 0 && s.is_alive)
+        .map(|s| s.position.y)
+        .fold(0.0f32, |a, b| a.max(b))
+        .max(1.0);
+
+    let candidates: Vec<(usize, Vec3, f32, u8, f32)> = tree
         .segments
         .iter()
         .enumerate()
         .filter(|(_, seg)| {
             seg.is_alive
                 && !seg.is_meristem
+                && seg.branch_order < 3
                 && seg.age_years >= species.min_bud_age
                 && seg.auxin_level < species.auxin_suppression_threshold
         })
-        .map(|(idx, seg)| (idx, seg.position, seg.azimuth, seg.branch_order))
+        .map(|(idx, seg)| (idx, seg.position, seg.azimuth, seg.branch_order, seg.vigor))
         .collect();
 
     let golden_angle = species.phyllotactic_angle;
 
-    for (parent_idx, parent_pos, parent_azimuth, parent_order) in candidates {
+    for (parent_idx, parent_pos, parent_azimuth, parent_order, parent_vigor) in candidates {
         if rng.next_f32() > species.bud_activation_probability {
             continue;
         }
 
-        // New branch at golden angle offset from parent.
         let new_azimuth = (parent_azimuth + golden_angle) % std::f32::consts::TAU;
-        let insertion_angle = species.insertion_angle.to_radians();
+        let new_order = (parent_order + 1).min(5);
 
-        let dir = Vec3::new(
+        // Height-dependent branching: conical crown shape.
+        // Lower branches: more horizontal, longer.
+        // Upper branches: more upright, shorter.
+        let height_frac = (parent_pos.y / trunk_height).clamp(0.0, 1.0);
+
+        // Insertion angle: nearly horizontal at bottom (5°), steep at top (55°).
+        let insertion_angle = (5.0 + height_frac * 50.0).to_radians();
+
+        // Branch length: long at bottom, short at top (conical envelope).
+        let length_scale = (1.0 - height_frac * 0.7).max(0.3);
+        let seg_count = match new_order {
+            1 => 6,
+            2 => 4,
+            _ => 3,
+        };
+        let branch_length = species.lateral_extension_rate * parent_vigor * 4.0 * length_scale;
+        let seg_len = branch_length / seg_count as f32;
+
+        let mut dir = Vec3::new(
             new_azimuth.cos() * insertion_angle.cos(),
             insertion_angle.sin(),
             new_azimuth.sin() * insertion_angle.cos(),
         )
         .normalize_or_zero();
 
-        let new_pos = parent_pos + dir * species.lateral_extension_rate * 1.5;
-        let new_order = (parent_order + 1).min(5);
+        let mut prev_idx = parent_idx;
+        let mut prev_pos = parent_pos;
 
-        let mut new_seg = GrowthSegment::new(new_pos, Some(parent_idx), new_order);
-        new_seg.azimuth = new_azimuth;
-        new_seg.is_meristem = true;
-        new_seg.vigor = tree.segments[parent_idx].vigor * 0.7;
-        new_seg.leaf_area = species.leaf_area_per_meter * 0.1;
-        tree.push(new_seg);
+        for seg_i in 0..seg_count {
+            // Gradually droop and spread outward.
+            let outward = Vec3::new(new_azimuth.cos(), 0.0, new_azimuth.sin());
+            let droop = species.droop_rate * seg_i as f32 * 0.02;
+            dir = (dir + outward * 0.06 + Vec3::Y * (rng.next_f32_range(-0.04, 0.02) - droop))
+                .normalize_or_zero();
+
+            let pos = prev_pos + dir * seg_len;
+            let is_tip = seg_i == seg_count - 1;
+
+            let mut new_seg = GrowthSegment::new(pos, Some(prev_idx), new_order);
+            new_seg.azimuth = new_azimuth;
+            new_seg.is_meristem = is_tip;
+            new_seg.vigor = parent_vigor * (0.7 - seg_i as f32 * 0.04);
+            new_seg.leaf_area = species.leaf_area_per_meter * seg_len * parent_vigor;
+            prev_idx = tree.push(new_seg);
+            prev_pos = pos;
+        }
     }
 }
 
@@ -455,7 +492,7 @@ pub fn check_reiteration(tree: &mut GrowthTree, species: &RedwoodSpecies, rng: &
 // ──────────────────────── 10. Self-Pruning ────────────────────────
 
 pub fn self_pruning(tree: &mut GrowthTree, species: &RedwoodSpecies) {
-    let vigor_threshold = 0.08;
+    let vigor_threshold = 0.03;
 
     for seg in &mut tree.segments {
         if !seg.is_alive {
@@ -494,14 +531,27 @@ pub fn self_pruning(tree: &mut GrowthTree, species: &RedwoodSpecies) {
 
 // ──────────────────────── Aging ────────────────────────
 
-/// Age all segments by one year and update leaf area with needle lifespan.
+/// Age all segments by one year, decay old needles, and regrow foliage on lit branches.
 pub fn age_segments(tree: &mut GrowthTree, species: &RedwoodSpecies) {
     for seg in &mut tree.segments {
         seg.age_years = seg.age_years.saturating_add(1);
+
+        if !seg.is_alive {
+            continue;
+        }
+
         // Needles die after lifespan — reduce leaf area gradually.
-        if seg.is_alive && seg.age_years > species.needle_lifespan && seg.leaf_area > 0.0 {
+        if seg.age_years > species.needle_lifespan && seg.leaf_area > 0.0 {
             let decay = 1.0 / species.needle_lifespan as f32;
-            seg.leaf_area = (seg.leaf_area - seg.leaf_area * decay).max(0.0);
+            seg.leaf_area -= seg.leaf_area * decay;
+        }
+
+        // Foliage renewal: living branch segments with light regrow needles.
+        // This represents continuous needle replacement on healthy branches.
+        if seg.branch_order > 0 && seg.light_exposure > 0.05 {
+            let renewal = species.leaf_area_per_meter * 0.15 * seg.light_exposure * seg.vigor;
+            let max_leaf = species.leaf_area_per_meter * 1.2;
+            seg.leaf_area = (seg.leaf_area + renewal).min(max_leaf);
         }
     }
     tree.age_years = tree.age_years.saturating_add(1);

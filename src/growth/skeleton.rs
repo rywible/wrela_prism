@@ -43,28 +43,97 @@ pub(crate) fn growth_to_skeleton(tree: &GrowthTree) -> TreeSkeleton {
     skeleton
 }
 
-/// Generate foliage anchors from the growth tree.
-/// Selects the top segments by leaf_area, capped at 300 to keep foliage mesh
-/// within GPU buffer limits while maintaining crown coverage.
+/// Generate foliage anchors as a crown envelope around the growth tree.
+/// Instead of tracking individual branches, builds rings of overlapping
+/// clusters at each height band to form a continuous conical crown.
 pub fn growth_foliage_anchors(tree: &GrowthTree) -> Vec<(Vec3, f32)> {
-    const MAX_ANCHORS: usize = 300;
+    const MAX_ANCHORS: usize = 200;
+    const HEIGHT_BANDS: usize = 14;
 
-    let mut candidates: Vec<(Vec3, f32)> = tree
+    // Gather branch extent at each height.
+    let branch_segs: Vec<&super::tree::GrowthSegment> = tree
         .segments
         .iter()
-        .filter(|seg| seg.is_alive && seg.leaf_area > 0.1)
-        .map(|seg| (seg.position, seg.leaf_area))
+        .filter(|s| s.is_alive && s.branch_order > 0 && s.leaf_area > 0.05)
         .collect();
 
-    // Sort by leaf_area descending, take the densest clusters.
-    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
-    candidates.truncate(MAX_ANCHORS);
+    if branch_segs.is_empty() {
+        return Vec::new();
+    }
 
-    // Convert leaf_area to radius with minimum size for visual coverage.
-    candidates
-        .into_iter()
-        .map(|(pos, area)| (pos, (area.sqrt() * 2.5).max(3.0)))
-        .collect()
+    let min_y = branch_segs
+        .iter()
+        .map(|s| s.position.y)
+        .fold(f32::MAX, f32::min);
+    let max_y = branch_segs
+        .iter()
+        .map(|s| s.position.y)
+        .fold(f32::MIN, f32::max);
+    let range_y = (max_y - min_y).max(1.0);
+
+    // Measure max radial extent and total leaf area per height band.
+    let mut band_max_radius = vec![0.0f32; HEIGHT_BANDS];
+    let mut band_leaf_area = vec![0.0f32; HEIGHT_BANDS];
+    let mut band_count = vec![0u32; HEIGHT_BANDS];
+
+    for seg in &branch_segs {
+        let band = (((seg.position.y - min_y) / range_y) * (HEIGHT_BANDS - 1) as f32) as usize;
+        let band = band.min(HEIGHT_BANDS - 1);
+        let radial = Vec3::new(seg.position.x, 0.0, seg.position.z).length();
+        band_max_radius[band] = band_max_radius[band].max(radial);
+        band_leaf_area[band] += seg.leaf_area;
+        band_count[band] += 1;
+    }
+
+    // Build crown envelope: rings of clusters at each height band.
+    let anchors_per_band = MAX_ANCHORS / HEIGHT_BANDS;
+    let mut result = Vec::with_capacity(MAX_ANCHORS);
+
+    for band_idx in 0..HEIGHT_BANDS {
+        if band_count[band_idx] == 0 {
+            continue;
+        }
+
+        let band_y = min_y + (band_idx as f32 + 0.5) / HEIGHT_BANDS as f32 * range_y;
+        let height_frac = (band_idx as f32 + 0.5) / HEIGHT_BANDS as f32;
+
+        // Crown radius: conical taper — widest at bottom, narrow at top.
+        let measured = band_max_radius[band_idx].max(2.0);
+        let taper = (1.0 - height_frac * height_frac).max(0.15); // Quadratic taper
+        let crown_radius = (measured + 5.0) * taper;
+
+        // Cluster radius: larger clusters for denser bands.
+        let density = band_leaf_area[band_idx] / band_count[band_idx].max(1) as f32;
+        let cluster_radius = (density.sqrt() * 1.8 + 2.5).clamp(3.5, 9.0);
+
+        // Place clusters in a ring around the trunk at this height.
+        let ring_count = anchors_per_band.min(
+            ((crown_radius * std::f32::consts::TAU / cluster_radius) as usize)
+                .clamp(4, anchors_per_band),
+        );
+
+        for i in 0..ring_count {
+            let angle = (i as f32 / ring_count as f32) * std::f32::consts::TAU + height_frac * 0.7; // Spiral offset between bands.
+            let r = crown_radius;
+            let pos = Vec3::new(angle.cos() * r, band_y, angle.sin() * r);
+            result.push((pos, cluster_radius));
+        }
+
+        // Interior fill: cluster near trunk to hide trunk through canopy.
+        if crown_radius > 4.0 {
+            let inner_angle = height_frac * 2.3;
+            let inner_r = crown_radius * 0.3;
+            let pos = Vec3::new(
+                inner_angle.cos() * inner_r,
+                band_y,
+                inner_angle.sin() * inner_r,
+            );
+            result.push((pos, cluster_radius * 0.8));
+        }
+    }
+
+    result.truncate(MAX_ANCHORS);
+    result
 }
 
 /// Provide the RedwoodParams subset needed by tube_mesh.

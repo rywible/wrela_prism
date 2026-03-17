@@ -213,7 +213,7 @@ impl SourceSceneBuilder {
             "hero_redwood_growth",
             SourceGeometry::ProceduralSubject(ProceduralSubject::GrowthTree {
                 params,
-                foliage_tier: 2,
+                foliage_tier: 1,
             }),
             SourceTransform::IDENTITY,
         );

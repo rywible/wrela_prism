@@ -75,16 +75,16 @@ impl Default for RedwoodSpecies {
             max_height: 65.0,
             base_diameter: 9.0,
 
-            leader_extension_rate: 0.45,
-            lateral_extension_rate: 0.7,
+            leader_extension_rate: 1.5,
+            lateral_extension_rate: 2.5,
 
             phyllotactic_angle: 137.508_f32.to_radians(), // golden angle
-            bud_activation_probability: 0.15,
-            auxin_decay_per_meter: 0.4,
-            auxin_suppression_threshold: 2.0,
-            leader_auxin_strength: 5.0,
-            min_bud_age: 3,
-            insertion_angle: 25.0,
+            bud_activation_probability: 0.14,
+            auxin_decay_per_meter: 0.6,
+            auxin_suppression_threshold: 1.5,
+            leader_auxin_strength: 3.0,
+            min_bud_age: 2,
+            insertion_angle: 10.0,
 
             water_stress_per_meter: 0.008,
             fog_drip_coefficient: 0.15,
@@ -97,17 +97,17 @@ impl Default for RedwoodSpecies {
             droop_rate: 0.35,
             reaction_wood_strength: 0.08,
             reaction_wood_decay: 0.02,
-            sapwood_area_per_leaf: 0.08,
+            sapwood_area_per_leaf: 0.03,
 
             reiteration_min_age: 50,
             reiteration_min_radius: 0.3,
             reiteration_probability: 0.02,
 
-            shade_death_years: 8,
+            shade_death_years: 25,
             dead_stub_persistence: 30,
 
-            leaf_area_per_meter: 2.5,
-            needle_lifespan: 5,
+            leaf_area_per_meter: 4.0,
+            needle_lifespan: 8,
 
             flute_count: 8,
             flute_depth: 0.20,
@@ -131,7 +131,7 @@ impl Default for GrowthParams {
         Self {
             seed: 42,
             species: RedwoodSpecies::default(),
-            target_age: 500,
+            target_age: 150,
             enable_light_field: false,
         }
     }
@@ -162,10 +162,21 @@ pub fn grow_tree_cpu(params: &GrowthParams) -> GrowthTree {
     let mut rng = TreeRng::new(params.seed);
     let mut tree = initialize_seedling(&params.species);
 
+    const MAX_SEGMENTS: usize = 20000;
+
     for year in 0..params.target_age {
         simulate_year_cpu(&mut tree, &params.species, &mut rng);
 
-        // Log progress at milestones.
+        // Cap segment count to prevent combinatorial explosion.
+        if tree.segments.len() > MAX_SEGMENTS {
+            tracing::debug!(
+                "growth year {}: segment cap reached ({} segments), stopping",
+                year + 1,
+                tree.segments.len(),
+            );
+            break;
+        }
+
         if (year + 1) % 100 == 0 {
             tracing::debug!(
                 "growth year {}: {} segments, {:.0} leaf area",
