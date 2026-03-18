@@ -373,6 +373,11 @@ impl TaaPass {
         self.write_to_a = !self.write_to_a;
     }
 
+    /// Returns the motion vector texture view for use by motion blur.
+    pub fn motion_view(&self) -> &wgpu::TextureView {
+        &self.motion_view
+    }
+
     /// Returns the most recently written history texture (TAA output for tonemap).
     pub fn output_view(&self) -> &wgpu::TextureView {
         // After encode(), write_to_a has been flipped, so the just-written

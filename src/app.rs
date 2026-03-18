@@ -499,6 +499,42 @@ impl ApplicationHandler for App {
                             KeyCode::F4 => runtime
                                 .toggle_debug_overlay(crate::pipeline::DebugOverlay::LodHeatmap),
                             KeyCode::F5 => {
+                                runtime.scene_settings.dof_enabled =
+                                    !runtime.scene_settings.dof_enabled;
+                                info!(
+                                    "depth of field: {}",
+                                    if runtime.scene_settings.dof_enabled {
+                                        "ON"
+                                    } else {
+                                        "OFF"
+                                    }
+                                );
+                            }
+                            KeyCode::F6 => {
+                                runtime.scene_settings.motion_blur_enabled =
+                                    !runtime.scene_settings.motion_blur_enabled;
+                                info!(
+                                    "motion blur: {}",
+                                    if runtime.scene_settings.motion_blur_enabled {
+                                        "ON"
+                                    } else {
+                                        "OFF"
+                                    }
+                                );
+                            }
+                            KeyCode::F7 => {
+                                runtime.scene_settings.fxaa_enabled =
+                                    !runtime.scene_settings.fxaa_enabled;
+                                info!(
+                                    "FXAA: {}",
+                                    if runtime.scene_settings.fxaa_enabled {
+                                        "ON"
+                                    } else {
+                                        "OFF"
+                                    }
+                                );
+                            }
+                            KeyCode::F8 => {
                                 let styles = ArtDirection::named_styles();
                                 runtime.art_direction.named_style_index =
                                     (runtime.art_direction.named_style_index + 1) % styles.len();
@@ -511,7 +547,7 @@ impl ApplicationHandler for App {
                                 );
                                 info!("art direction: transitioning to '{}'", name);
                             }
-                            KeyCode::F6 => {
+                            KeyCode::F9 => {
                                 let axes = runtime.art_direction.current_axes();
                                 info!(
                                     "art direction axes: soft={:.2} exag={:.2} shadow={:.2} warm={:.2} atmo={:.2} detail={:.2} outline={:.2} palette={:.2}",

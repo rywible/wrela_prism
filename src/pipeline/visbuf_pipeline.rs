@@ -9,7 +9,9 @@ use super::bloom_pass::BloomPass;
 use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
 use super::dag_traverse_pass::DagTraversePass;
+use super::dof_pass::DofPass;
 use super::forward_character::ForwardCharacterPass;
+use super::fxaa_pass::FxaaPass;
 use super::gtao_pass::GtaoPass;
 use super::hw_raster_pass::{
     extract_frustum_planes, DispatchLists, HwRasterPass, VisbufFrameUniforms, VisibilityBuffer,
@@ -17,6 +19,7 @@ use super::hw_raster_pass::{
 use super::hzb_pass::HzbPass;
 use super::ibl_pass::IblPass;
 use super::material_pass::MaterialPass;
+use super::motion_blur_pass::MotionBlurPass;
 use super::noise_textures::NoiseTextures;
 use super::outline_pass::OutlinePass;
 use super::shadow_pass::ShadowPass;
@@ -99,6 +102,11 @@ pub struct VisbufPipeline {
     // Temporal anti-aliasing
     pub taa_pass: Option<TaaPass>,
 
+    // Cinematic post-processing (Phase 7)
+    pub dof_pass: Option<DofPass>,
+    pub motion_blur_pass: Option<MotionBlurPass>,
+    pub fxaa_pass: Option<FxaaPass>,
+
     // Forward-rendered character capsule
     pub forward_character: ForwardCharacterPass,
     forward_char_scene_bg: Option<wgpu::BindGroup>,
@@ -111,6 +119,9 @@ pub struct VisbufPipeline {
     last_manual_exposure: f32,
     last_dt: f32,
     last_elapsed: f32,
+    /// Which HDR source was actually fed to tonemap last frame:
+    /// 0 = tonemap_source() (TAA/raw), 1 = DoF output, 2 = motion blur output
+    last_hdr_source_stage: u8,
 
     // Sky probe cache — avoids recomputing 1,872 optical depth evaluations when params unchanged
     sky_probe_cache: crate::scene::sky_probe::SkyProbeCache,
@@ -264,6 +275,10 @@ impl VisbufPipeline {
 
         let taa_pass = Some(TaaPass::new(&gpu.device, gpu.width(), gpu.height()));
 
+        let dof_pass = Some(DofPass::new(&gpu.device, gpu.width(), gpu.height()));
+        let motion_blur_pass = Some(MotionBlurPass::new(&gpu.device, gpu.width(), gpu.height()));
+        let fxaa_pass = Some(FxaaPass::new(gpu));
+
         let forward_character = ForwardCharacterPass::new(&gpu.device, &lighting_uniform_buffer);
         let forward_char_scene_bg =
             Some(forward_character.create_scene_bind_group(&gpu.device, &lighting_uniform_buffer));
@@ -287,6 +302,9 @@ impl VisbufPipeline {
             bloom_pass,
             tonemap_pass,
             taa_pass,
+            dof_pass,
+            motion_blur_pass,
+            fxaa_pass,
             shadow_map,
             vis_buffer,
             dispatch_lists,
@@ -321,6 +339,7 @@ impl VisbufPipeline {
             last_manual_exposure: 1.0,
             last_dt: 0.0,
             last_elapsed: 0.0,
+            last_hdr_source_stage: 0,
             sky_probe_cache: crate::scene::sky_probe::SkyProbeCache::new(),
             hzb_ready: false,
             frame_index: 0,
@@ -452,6 +471,15 @@ impl VisbufPipeline {
         self.tonemap_pass = TonemapPass::new(gpu);
         if let Some(taa) = &mut self.taa_pass {
             taa.resize(&gpu.device, gpu.width(), gpu.height());
+        }
+        if let Some(dof) = &mut self.dof_pass {
+            dof.resize(&gpu.device, gpu.width(), gpu.height());
+        }
+        if let Some(mb) = &mut self.motion_blur_pass {
+            mb.resize(&gpu.device, gpu.width(), gpu.height());
+        }
+        if let Some(fxaa) = &mut self.fxaa_pass {
+            fxaa.resize(gpu);
         }
         self.hzb_ready = false;
 
@@ -955,26 +983,114 @@ impl VisbufPipeline {
             );
         }
 
+        // Determine which HDR post-processing stages are active this frame.
+        let dof_active = settings.dof_enabled && self.dof_pass.is_some();
+        let mb_active = settings.motion_blur_enabled
+            && self.motion_blur_pass.is_some()
+            && self.taa_pass.is_some();
+        let fxaa_active = settings.fxaa_enabled && self.taa_pass.is_none();
+
+        // -- Pass 8.6: DoF (after TAA, reads HDR, outputs HDR blurred) --
+        if dof_active {
+            let dof = self.dof_pass.as_ref().unwrap();
+            let hdr_in = self.tonemap_source();
+            dof.encode(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                &self.vis_buffer.depth_view,
+                hdr_in,
+                settings.focus_distance,
+                settings.aperture,
+            );
+        }
+
+        // -- Pass 8.7: Motion blur (after DoF, reads HDR, outputs HDR blurred) --
+        if mb_active {
+            let mb = self.motion_blur_pass.as_ref().unwrap();
+            let taa = self.taa_pass.as_ref().unwrap();
+            let hdr_in = if dof_active {
+                self.dof_pass.as_ref().unwrap().output_view()
+            } else {
+                self.tonemap_source()
+            };
+            mb.encode(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                taa.motion_view(),
+                hdr_in,
+            );
+        }
+
+        // Resolve final HDR source for tonemap
+        let hdr_stage: u8 = if mb_active {
+            2
+        } else if dof_active {
+            1
+        } else {
+            0
+        };
+
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Determine tonemap target: if FXAA is active (and TAA is off), write to
+        // intermediate LDR texture; otherwise write directly to the swapchain.
+        let tonemap_target = if fxaa_active {
+            self.fxaa_pass
+                .as_ref()
+                .map(|f| f.ldr_input_view())
+                .unwrap_or(&frame_view)
+        } else {
+            &frame_view
+        };
+
+        let dt = (elapsed_secs - self.last_elapsed).max(0.0).min(0.25);
+
+        // Scope to consume `final_hdr_source` borrow before mutating self fields
+        {
+            let final_hdr_source = match hdr_stage {
+                2 => self.motion_blur_pass.as_ref().unwrap().output_view(),
+                1 => self.dof_pass.as_ref().unwrap().output_view(),
+                _ => self.tonemap_source(),
+            };
+
+            self.tonemap_pass.encode(
+                &gpu.device,
+                &mut encoder,
+                &gpu.queue,
+                final_hdr_source,
+                self.gtao_pass.as_ref().map(|gtao| gtao.ao_view()),
+                tonemap_target,
+                gpu.width(),
+                gpu.height(),
+                elapsed_secs,
+                settings.exposure,
+                dt,
+                self.art_direction_color_grade,
+            );
+        }
+
+        self.last_hdr_source_stage = hdr_stage;
         self.last_manual_exposure = settings.exposure;
-        self.last_dt = (elapsed_secs - self.last_elapsed).max(0.0).min(0.25);
+        self.last_dt = dt;
         self.last_elapsed = elapsed_secs;
-        self.tonemap_pass.encode(
-            &gpu.device,
-            &mut encoder,
-            &gpu.queue,
-            self.tonemap_source(),
-            self.gtao_pass.as_ref().map(|gtao| gtao.ao_view()),
-            &frame_view,
-            gpu.width(),
-            gpu.height(),
-            elapsed_secs,
-            settings.exposure,
-            self.last_dt,
-            self.art_direction_color_grade,
-        );
+
+        // -- Pass 9: FXAA (after tonemap, only when TAA is off, reads LDR, outputs LDR) --
+        if fxaa_active {
+            if let Some(fxaa) = &self.fxaa_pass {
+                fxaa.encode(
+                    &gpu.device,
+                    &mut encoder,
+                    &gpu.queue,
+                    &frame_view,
+                    gpu.width(),
+                    gpu.height(),
+                );
+            }
+        }
 
         // Resolve GPU timing queries
         if let Some(timing) = &self.timing {
@@ -1031,7 +1147,7 @@ impl VisbufPipeline {
             &gpu.device,
             &mut encoder,
             &gpu.queue,
-            self.tonemap_source(),
+            self.last_tonemap_hdr_source(),
             self.gtao_pass.as_ref().map(|gtao| gtao.ao_view()),
             &capture_view,
             width,
@@ -1052,6 +1168,24 @@ impl VisbufPipeline {
             .as_ref()
             .map(|t| t.output_view())
             .unwrap_or(&self.scene_color.view)
+    }
+
+    /// The HDR source that was actually used for tonemap last frame (accounts for
+    /// DoF and motion blur being active).
+    fn last_tonemap_hdr_source(&self) -> &wgpu::TextureView {
+        match self.last_hdr_source_stage {
+            2 => self
+                .motion_blur_pass
+                .as_ref()
+                .map(|mb| mb.output_view())
+                .unwrap_or_else(|| self.tonemap_source()),
+            1 => self
+                .dof_pass
+                .as_ref()
+                .map(|dof| dof.output_view())
+                .unwrap_or_else(|| self.tonemap_source()),
+            _ => self.tonemap_source(),
+        }
     }
 }
 

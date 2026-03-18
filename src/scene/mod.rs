@@ -291,6 +291,11 @@ pub struct SceneSettings {
     pub fog_volume_density: f32,
     pub fog_volume_albedo: Vec3,
     pub fog_volume_anisotropy: f32,
+    pub focus_distance: f32,
+    pub aperture: f32,
+    pub dof_enabled: bool,
+    pub motion_blur_enabled: bool,
+    pub fxaa_enabled: bool,
 }
 
 /// Wind settings for foliage animation.
