@@ -35,6 +35,10 @@ pub struct GpuMeshletGroup {
     /// LOD level.
     pub level: u32,
     pub _pad: [u32; 2],
+    /// Bounding sphere center (world space). Used by GPU DAG traversal for error projection.
+    pub bound_center: [f32; 3],
+    /// Bounding sphere radius (world space).
+    pub bound_radius: f32,
 }
 
 /// All GPU buffers needed to render the meshlet DAG.
@@ -120,6 +124,8 @@ impl GpuMeshletBuffers {
                 error: g.error,
                 level: g.level,
                 _pad: [0; 2],
+                bound_center: g.bounds.center,
+                bound_radius: g.bounds.radius,
             })
             .collect();
 

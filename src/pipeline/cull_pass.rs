@@ -1,5 +1,7 @@
 use super::hw_raster_pass::DispatchLists;
-use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
+use crate::meshlet::GpuMeshletBuffers;
+#[cfg(any(feature = "cpu_dag_cut", test))]
+use crate::meshlet::MeshletDag;
 
 /// CPU-side adaptive DAG traversal + GPU per-meshlet culling.
 ///
@@ -181,6 +183,10 @@ impl CullPass {
     /// Otherwise its children are visited recursively.
     ///
     /// Returns the number of selected groups (to dispatch the GPU cull shader).
+    ///
+    /// Retained for debugging/validation. The default code path now uses
+    /// `DagTraversePass` for GPU-driven DAG traversal.
+    #[cfg(feature = "cpu_dag_cut")]
     pub fn cpu_dag_cut_adaptive(
         &self,
         queue: &wgpu::Queue,
@@ -319,6 +325,88 @@ impl CullPass {
         })
     }
 
+    /// Create the dispatch bind group for GPU-driven DAG traversal mode.
+    ///
+    /// Binds the DAG traverse pass's output buffers as the group queue input
+    /// instead of the CPU-uploaded buffers. All other bindings are the same.
+    pub fn create_dispatch_bind_group_gpu_driven(
+        &self,
+        device: &wgpu::Device,
+        dispatch: &DispatchLists,
+        hzb_view: &wgpu::TextureView,
+        gpu_group_queue: &wgpu::Buffer,
+        gpu_group_count: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cull-dispatch-bg-gpu-driven"),
+            layout: &self.dispatch_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dispatch.hw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dispatch.hw_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dispatch.sw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dispatch.sw_count_buffer.as_entire_binding(),
+                },
+                // GPU-produced group queue from DAG traverse pass
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_group_queue.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: gpu_group_count.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(hzb_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.phase2_queue_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.phase2_count_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Encode phase 1 cull pass using indirect dispatch (GPU-driven DAG traversal mode).
+    ///
+    /// Instead of a CPU-provided group count, reads the workgroup count from
+    /// the indirect args buffer produced by the DAG traverse pass.
+    pub fn encode_indirect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_bg: &wgpu::BindGroup,
+        cull_bg: &wgpu::BindGroup,
+        dispatch_bg: &wgpu::BindGroup,
+        indirect_buffer: &wgpu::Buffer,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("meshlet-cull-phase1-indirect"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, frame_bg, &[]);
+        pass.set_bind_group(1, cull_bg, &[]);
+        pass.set_bind_group(2, dispatch_bg, &[]);
+
+        pass.dispatch_workgroups_indirect(indirect_buffer, 0);
+    }
+
     /// Create the dispatch bind group for phase 2 culling.
     ///
     /// Re-uses the same layout but swaps bindings so the phase2 reject list
@@ -443,6 +531,7 @@ impl CullPass {
     }
 }
 
+#[cfg(any(feature = "cpu_dag_cut", test))]
 fn root_group_indices(dag: &MeshletDag) -> Vec<u32> {
     if dag.groups.is_empty() {
         return Vec::new();

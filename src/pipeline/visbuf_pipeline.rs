@@ -8,6 +8,7 @@ use crate::scene::{LightingUniforms, SceneSettings};
 use super::bloom_pass::BloomPass;
 use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
+use super::dag_traverse_pass::DagTraversePass;
 use super::forward_character::ForwardCharacterPass;
 use super::gtao_pass::GtaoPass;
 use super::hw_raster_pass::{
@@ -38,6 +39,7 @@ pub struct VisbufPipeline {
     // Core passes
     pub hw_raster: HwRasterPass,
     pub cull_pass: CullPass,
+    pub dag_traverse: DagTraversePass,
     pub sw_raster: SwRasterPass,
     pub material_pass: MaterialPass,
     pub hzb_pass: HzbPass,
@@ -65,6 +67,7 @@ pub struct VisbufPipeline {
     frame_bg: wgpu::BindGroup,
     mesh_bg: Option<wgpu::BindGroup>,
     cull_bg: Option<wgpu::BindGroup>,
+    dag_bg: Option<wgpu::BindGroup>,
     dispatch_bg: Option<wgpu::BindGroup>,
     phase2_dispatch_bg: Option<wgpu::BindGroup>,
     vis_bg: Option<wgpu::BindGroup>,
@@ -139,6 +142,7 @@ impl VisbufPipeline {
         let frame_bg = hw_raster.create_frame_bind_group(&gpu.device);
 
         let cull_pass = CullPass::new(&gpu.device, hw_raster.frame_bind_group_layout());
+        let dag_traverse = DagTraversePass::new(&gpu.device, hw_raster.frame_bind_group_layout());
         let sw_raster = SwRasterPass::new(
             &gpu.device,
             hw_raster.frame_bind_group_layout(),
@@ -267,6 +271,7 @@ impl VisbufPipeline {
         Self {
             hw_raster,
             cull_pass,
+            dag_traverse,
             sw_raster,
             material_pass,
             hzb_pass,
@@ -289,6 +294,7 @@ impl VisbufPipeline {
             frame_bg,
             mesh_bg: None,
             cull_bg: None,
+            dag_bg: None,
             dispatch_bg: None,
             phase2_dispatch_bg: None,
             vis_bg: None,
@@ -342,15 +348,26 @@ impl VisbufPipeline {
             self.cull_pass
                 .create_cull_bind_group(device, &scene.meshlet_buffers),
         );
+
+        // GPU DAG traversal: compute root group indices and create bind group
+        self.dag_traverse.sync_roots(&scene.dag);
+        self.dag_bg = Some(
+            self.dag_traverse
+                .create_bind_group(device, &scene.meshlet_buffers),
+        );
+
         let hzb_view = self
             .hzb_pass
             .hzb_full_view
             .as_ref()
             .expect("HZB not initialized");
-        self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
+        // GPU-driven mode: cull pass reads from DAG traverse output buffers
+        self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group_gpu_driven(
             device,
             &self.dispatch_lists,
             hzb_view,
+            self.dag_traverse.output_queue_buffer(),
+            self.dag_traverse.output_count_buffer(),
         ));
         self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
             device,
@@ -372,8 +389,6 @@ impl VisbufPipeline {
             &scene.bark_textures.normal_ao_view,
             &scene.bark_textures.height_view,
         );
-
-        // Adaptive DAG cut runs per-frame in render().
     }
 
     /// Rebuild visibility-dependent bind groups (after resize).
@@ -459,10 +474,12 @@ impl VisbufPipeline {
                     .hzb_full_view
                     .as_ref()
                     .expect("HZB not initialized");
-                self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
+                self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group_gpu_driven(
                     &gpu.device,
                     &self.dispatch_lists,
                     hzb_view,
+                    self.dag_traverse.output_queue_buffer(),
+                    self.dag_traverse.output_count_buffer(),
                 ));
                 self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
                     &gpu.device,
@@ -626,29 +643,26 @@ impl VisbufPipeline {
         // Phase 2: Re-test HZB-rejected meshlets against fresh HZB → raster
         // Final HZB build (for next frame's phase 1)
 
-        // -- Phase 1: Adaptive DAG cut (CPU) + GPU per-meshlet cull --
+        // -- Phase 1: GPU DAG traversal + GPU per-meshlet cull --
         self.vis_buffer.clear(&mut encoder);
         self.dispatch_lists.clear(&mut encoder);
         self.cull_pass.clear_phase2(&mut encoder);
 
-        let fov_factor = visbuf_uniforms.error_threshold[1];
-        let error_threshold_px = visbuf_uniforms.error_threshold[0];
-        let group_count = self.cull_pass.cpu_dag_cut_adaptive(
-            &gpu.queue,
-            &scene.dag,
-            cam_pos,
-            gpu.height() as f32,
-            fov_factor,
-            error_threshold_px,
-        );
+        // GPU DAG traversal: seed work queue with roots, then dispatch
+        self.dag_traverse.seed_work_queue(&gpu.queue);
+        if let Some(dag_bg) = &self.dag_bg {
+            self.dag_traverse
+                .encode(&mut encoder, &self.frame_bg, dag_bg);
+        }
 
+        // Cull pass now reads GPU-produced group queue via indirect dispatch
         if let (Some(cull_bg), Some(dispatch_bg)) = (&self.cull_bg, &self.dispatch_bg) {
-            self.cull_pass.encode(
+            self.cull_pass.encode_indirect(
                 &mut encoder,
                 &self.frame_bg,
                 cull_bg,
                 dispatch_bg,
-                group_count,
+                self.dag_traverse.indirect_args_buffer(),
             );
         }
 

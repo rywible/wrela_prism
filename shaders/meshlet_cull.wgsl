@@ -32,6 +32,8 @@ struct MeshletGroup {
     level: u32,
     _pad0: u32,
     _pad1: u32,
+    bound_center: vec3<f32>,
+    bound_radius: f32,
 };
 
 struct MeshletDescriptor {
