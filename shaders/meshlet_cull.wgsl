@@ -1,8 +1,10 @@
 // Per-meshlet frustum + HZB occlusion culling (compute shader).
 //
-// CPU selects groups via adaptive DAG cut; this shader iterates each group's
-// meshlets, applies frustum culling and HZB occlusion test, writing survivors
-// to the HW dispatch list.
+// Two-phase occlusion culling to eliminate 1-frame popping:
+//   Phase 1 (meshlet_cull): Cull with prev-frame HZB. Survivors → hw_dispatch_list.
+//          HZB-rejected meshlets → phase2_reject_list for re-testing.
+//   Phase 2 (meshlet_cull_phase2): Re-test rejects against fresh mid-frame HZB.
+//          Survivors → hw_dispatch_list for a second raster pass.
 
 struct FrameUniforms {
     view_proj: mat4x4<f32>,
@@ -53,8 +55,12 @@ struct MeshletDescriptor {
 @group(2) @binding(4) var<storage, read> group_queue: array<u32>;
 @group(2) @binding(5) var<storage, read> group_queue_count: u32;
 
-// HZB texture (previous frame, all mip levels)
+// HZB texture (previous frame for phase 1, fresh mid-frame for phase 2)
 @group(2) @binding(6) var hzb_tex: texture_2d<f32>;
+
+// Phase 2 reject list — meshlets that failed HZB in phase 1, to be re-tested
+@group(2) @binding(7) var<storage, read_write> phase2_reject_list: array<u32>;
+@group(2) @binding(8) var<storage, read_write> phase2_reject_count: atomic<u32>;
 
 fn project_sphere_diameter(center: vec3<f32>, radius: f32) -> f32 {
     let dist = distance(frame.camera_position.xyz, center);
@@ -137,6 +143,8 @@ fn hzb_occlusion_cull(center: vec3<f32>, radius: f32) -> bool {
     return sphere_z < hzb_depth;
 }
 
+// Phase 1: Cull with previous frame's HZB.
+// Survivors go to hw_dispatch_list, HZB-occluded meshlets go to phase2_reject_list.
 @compute @workgroup_size(64)
 fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let queue_idx = gid.x;
@@ -154,13 +162,16 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         let meshlet_idx = group.meshlet_start + mi;
         let bounds = meshlet_bounds[meshlet_idx];
 
-        // Frustum cull
+        // Frustum cull — definitely invisible, discard permanently
         if frustum_cull_sphere(bounds.center, bounds.radius) {
             continue;
         }
 
-        // HZB occlusion cull (uses previous frame's HZB, 1-frame lag)
+        // HZB occlusion cull (uses previous frame's HZB)
         if hzb_occlusion_cull(bounds.center, bounds.radius) {
+            // Not definitely invisible — queue for phase 2 re-test with fresh HZB
+            let reject_slot = atomicAdd(&phase2_reject_count, 1u);
+            phase2_reject_list[reject_slot] = meshlet_idx;
             continue;
         }
 
@@ -169,4 +180,31 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         let slot = atomicAdd(&hw_dispatch_count, 1u);
         hw_dispatch_list[slot] = meshlet_idx;
     }
+}
+
+// Phase 2: Re-test HZB-rejected meshlets against the fresh mid-frame HZB.
+// Survivors go to hw_dispatch_list for a second raster pass.
+// Note: uses the SAME bind group layout — phase2_reject_list is now the input
+// (read via group_queue bindings are unused), and hzb_tex points to the fresh HZB.
+// We dispatch one thread per rejected meshlet.
+@compute @workgroup_size(64)
+fn meshlet_cull_phase2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    // group_queue_count is reused to hold the phase2 reject count for this dispatch
+    if idx >= group_queue_count {
+        return;
+    }
+
+    // Read meshlet index from the reject list (bound at group_queue binding)
+    let meshlet_idx = group_queue[idx];
+    let bounds = meshlet_bounds[meshlet_idx];
+
+    // Re-test against fresh HZB (built after phase 1 raster)
+    if hzb_occlusion_cull(bounds.center, bounds.radius) {
+        return; // Still occluded — discard
+    }
+
+    // Survivor — add to HW dispatch list for phase 2 raster
+    let slot = atomicAdd(&hw_dispatch_count, 1u);
+    hw_dispatch_list[slot] = meshlet_idx;
 }

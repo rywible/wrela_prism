@@ -63,6 +63,7 @@ pub struct VisbufPipeline {
     mesh_bg: Option<wgpu::BindGroup>,
     cull_bg: Option<wgpu::BindGroup>,
     dispatch_bg: Option<wgpu::BindGroup>,
+    phase2_dispatch_bg: Option<wgpu::BindGroup>,
     vis_bg: Option<wgpu::BindGroup>,
     sw_dispatch_bg: Option<wgpu::BindGroup>,
     hw_dispatch_bg: Option<wgpu::BindGroup>,
@@ -280,6 +281,7 @@ impl VisbufPipeline {
             mesh_bg: None,
             cull_bg: None,
             dispatch_bg: None,
+            phase2_dispatch_bg: None,
             vis_bg: None,
             sw_dispatch_bg: None,
             hw_dispatch_bg: None,
@@ -330,13 +332,20 @@ impl VisbufPipeline {
             self.cull_pass
                 .create_cull_bind_group(device, &scene.meshlet_buffers),
         );
+        let hzb_view = self
+            .hzb_pass
+            .hzb_full_view
+            .as_ref()
+            .expect("HZB not initialized");
         self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
             device,
             &self.dispatch_lists,
-            self.hzb_pass
-                .hzb_full_view
-                .as_ref()
-                .expect("HZB not initialized"),
+            hzb_view,
+        ));
+        self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
+            device,
+            &self.dispatch_lists,
+            hzb_view,
         ));
         self.sw_dispatch_bg = Some(self.sw_raster.create_dispatch_bind_group(
             device,
@@ -432,15 +441,22 @@ impl VisbufPipeline {
                 self.hw_raster
                     .create_dispatch_bind_group(&gpu.device, &self.dispatch_lists),
             );
-            // Rebuild cull dispatch bind group (depends on HZB view which changed)
+            // Rebuild cull dispatch bind groups (depend on HZB view which changed)
             if self.dispatch_bg.is_some() {
+                let hzb_view = self
+                    .hzb_pass
+                    .hzb_full_view
+                    .as_ref()
+                    .expect("HZB not initialized");
                 self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
                     &gpu.device,
                     &self.dispatch_lists,
-                    self.hzb_pass
-                        .hzb_full_view
-                        .as_ref()
-                        .expect("HZB not initialized"),
+                    hzb_view,
+                ));
+                self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
+                    &gpu.device,
+                    &self.dispatch_lists,
+                    hzb_view,
                 ));
             }
         }
@@ -581,9 +597,18 @@ impl VisbufPipeline {
             &scene.shadow_opaque_list,
         );
 
-        // -- Pass 2: Adaptive DAG cut (CPU group selection) + GPU per-meshlet cull --
+        // =====================================================================
+        // Two-Phase Occlusion Culling
+        // =====================================================================
+        //
+        // Phase 1: Cull with prev-frame HZB → raster survivors → mid-frame HZB
+        // Phase 2: Re-test HZB-rejected meshlets against fresh HZB → raster
+        // Final HZB build (for next frame's phase 1)
+
+        // -- Phase 1: Adaptive DAG cut (CPU) + GPU per-meshlet cull --
         self.vis_buffer.clear(&mut encoder);
         self.dispatch_lists.clear(&mut encoder);
+        self.cull_pass.clear_phase2(&mut encoder);
 
         let fov_factor = visbuf_uniforms.error_threshold[1];
         let error_threshold_px = visbuf_uniforms.error_threshold[0];
@@ -608,7 +633,7 @@ impl VisbufPipeline {
 
         self.dispatch_lists.prepare_indirect(&mut encoder);
 
-        // -- Pass 3: HW rasterize --
+        // -- Phase 1: HW rasterize (clears vis buffer + depth) --
         if let (Some(mesh_bg), Some(hw_dispatch_bg)) = (&self.mesh_bg, &self.hw_dispatch_bg) {
             self.hw_raster.encode(
                 &mut encoder,
@@ -620,10 +645,64 @@ impl VisbufPipeline {
             );
         }
 
-        // -- Pass 4: SW rasterize --
+        // -- Mid-frame HZB build (from phase 1 raster depth) --
+        self.hzb_pass.encode(
+            &gpu.device,
+            &mut encoder,
+            &self.vis_buffer.depth_view,
+            gpu.width(),
+            gpu.height(),
+        );
+        self.hzb_ready = true;
+
+        // -- Phase 2: Re-test HZB-rejected meshlets against fresh HZB --
+        // Copy phase2_reject_count → a CPU-accessible path is not needed here.
+        // We use a conservative upper bound: the total meshlet count from all
+        // selected groups serves as a safe dispatch size. The phase2 shader
+        // reads group_queue_count (which holds the reject count) and bounds-checks.
+        //
+        // We need to copy phase2_reject_count into the group_queue_count slot
+        // of the phase2 dispatch bind group. Since phase2_dispatch_bg already
+        // binds phase2_count_buffer at binding 5, the shader reads it directly.
+        //
+        // We must clear hw_count before phase 2 cull writes new survivors.
+        self.dispatch_lists.clear_hw_count(&mut encoder);
+
+        // Dispatch phase 2 cull with a safe upper bound on workgroups.
+        // The shader itself checks idx < group_queue_count (= phase2_reject_count).
+        // Upper bound: total meshlets across all selected groups. In practice
+        // this is bounded by the phase2_queue_buffer capacity (65536).
+        let phase2_max_rejects = scene.dag.total_meshlet_count().min(65536) as u32;
+
+        if let (Some(cull_bg), Some(phase2_dispatch_bg)) = (&self.cull_bg, &self.phase2_dispatch_bg)
+        {
+            self.cull_pass.encode_phase2(
+                &mut encoder,
+                &self.frame_bg,
+                cull_bg,
+                phase2_dispatch_bg,
+                phase2_max_rejects,
+            );
+        }
+
+        self.dispatch_lists.prepare_indirect(&mut encoder);
+
+        // -- Phase 2: HW rasterize (loads existing vis buffer + depth, no clear) --
+        if let (Some(mesh_bg), Some(hw_dispatch_bg)) = (&self.mesh_bg, &self.hw_dispatch_bg) {
+            self.hw_raster.encode_phase2(
+                &mut encoder,
+                &self.frame_bg,
+                mesh_bg,
+                hw_dispatch_bg,
+                &self.vis_buffer,
+                &self.dispatch_lists,
+            );
+        }
+
+        // -- SW rasterize --
         // TODO: re-enable when GPU cull pass routes meshlets to SW path.
 
-        // -- Pass 5: Material resolve --
+        // -- Material resolve --
         if let (Some(mesh_bg), Some(vis_bg), Some(material_frame_bg)) =
             (&self.mesh_bg, &self.vis_bg, &self.material_frame_bg)
         {
@@ -637,7 +716,7 @@ impl VisbufPipeline {
             );
         }
 
-        // -- Pass 5.1: Forward character (capsule) --
+        // -- Forward character (capsule) --
         if self.character_visible {
             if let Some(scene_bg) = &self.forward_char_scene_bg {
                 self.forward_character
@@ -651,7 +730,7 @@ impl VisbufPipeline {
             }
         }
 
-        // -- Pass 5.15: HZB build (after character depth, for next frame's occlusion cull) --
+        // -- Final HZB build (after phase 2 raster + character, for next frame) --
         self.hzb_pass.encode(
             &gpu.device,
             &mut encoder,
@@ -659,7 +738,6 @@ impl VisbufPipeline {
             gpu.width(),
             gpu.height(),
         );
-        self.hzb_ready = true;
 
         // -- Pass 5.5: Sky pass (fills empty vis pixels with atmospheric sky) --
         if let Some(sky_bg) = &self.sky_bg {

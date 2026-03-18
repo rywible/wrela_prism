@@ -88,6 +88,11 @@ impl DispatchLists {
         // We'll copy from hw_count_buffer after cull pass.
     }
 
+    /// Clear only the HW dispatch count (for reuse between phase 1 and phase 2).
+    pub fn clear_hw_count(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.hw_count_buffer, 0, None);
+    }
+
     /// After cull pass: copy hw_count into indirect buffer's instance_count field.
     pub fn prepare_indirect(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.copy_buffer_to_buffer(
@@ -372,7 +377,7 @@ impl HwRasterPass {
         })
     }
 
-    /// Encode the HW visibility buffer fill pass.
+    /// Encode the HW visibility buffer fill pass (phase 1 — clears attachments).
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -402,6 +407,49 @@ impl HwRasterPass {
                 view: &vis_buffer.depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&self.render_pipeline);
+        pass.set_bind_group(0, frame_bg, &[]);
+        pass.set_bind_group(1, mesh_bg, &[]);
+        pass.set_bind_group(2, dispatch_bg, &[]);
+        pass.draw_indirect(&dispatch.hw_indirect_buffer, 0);
+    }
+
+    /// Encode phase 2 HW raster pass — loads existing vis buffer + depth (no clear).
+    ///
+    /// Phase 2 meshlets blend naturally via depth test against phase 1 output.
+    pub fn encode_phase2(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_bg: &wgpu::BindGroup,
+        mesh_bg: &wgpu::BindGroup,
+        dispatch_bg: &wgpu::BindGroup,
+        vis_buffer: &VisibilityBuffer,
+        dispatch: &DispatchLists,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hw-vis-pass-phase2"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &vis_buffer.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &vis_buffer.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,

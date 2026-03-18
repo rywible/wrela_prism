@@ -41,6 +41,13 @@ pub struct MeshletDag {
     pub level_offsets: Vec<u32>,
 }
 
+impl MeshletDag {
+    /// Total number of meshlets across all LOD levels.
+    pub fn total_meshlet_count(&self) -> usize {
+        self.meshlets.len()
+    }
+}
+
 /// Target group size when partitioning meshlets for simplification.
 const GROUP_TARGET_SIZE: usize = 4;
 /// Target simplification ratio per level.
