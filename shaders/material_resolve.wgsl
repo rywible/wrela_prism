@@ -285,6 +285,7 @@ const MATERIAL_TRUNK: u32 = 0u;
 const MATERIAL_FOLIAGE: u32 = 1u;
 const MATERIAL_GROUND: u32 = 2u;
 const MATERIAL_SKIN: u32 = 3u;
+const MATERIAL_EMISSIVE: u32 = 4u;
 
 // -- Helpers --
 
@@ -859,6 +860,34 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     let ao = v0.ao * bary.x + v1.ao * bary.y + v2.ao * bary.z;
     let material = v0.material;
 
+    // Unpack alpha from semantic_channels for foliage (bits 0-7: 0-255 → 0.0-1.0).
+    // Only foliage uses byte 0 as alpha; trunk uses it for art-direction curvature.
+    if material == MATERIAL_FOLIAGE {
+        let alpha0 = f32(v0.semantic_channels & 0xFFu) / 255.0;
+        let alpha1 = f32(v1.semantic_channels & 0xFFu) / 255.0;
+        let alpha2 = f32(v2.semantic_channels & 0xFFu) / 255.0;
+        var alpha = alpha0 * bary.x + alpha1 * bary.y + alpha2 * bary.z;
+        // semantic_channels == 0 means legacy fully-opaque foliage
+        if v0.semantic_channels == 0u && v1.semantic_channels == 0u && v2.semantic_channels == 0u {
+            alpha = 1.0;
+        }
+        if alpha < 0.5 {
+            discard;
+        }
+    }
+
+    // Unpack emissive intensity from semantic_channels (bits 8-15).
+    // For emissive materials, byte 1 stores emissive intensity.
+    // Safe for all materials: trunk byte 1 = edge_sharpness (won't cause emission
+    // unless material == MATERIAL_EMISSIVE).
+    var emissive_intensity = 0.0;
+    if material == MATERIAL_EMISSIVE {
+        let e0 = f32((v0.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        let e1 = f32((v1.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        let e2 = f32((v2.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        emissive_intensity = e0 * bary.x + e1 * bary.y + e2 * bary.z;
+    }
+
     // -- Lighting Setup --
 
     let sun_dir = normalize(uniforms.sun_direction.xyz);
@@ -1175,6 +1204,12 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     if material == MATERIAL_GROUND {
         let distance_lift = smoothstep(uniforms.fog_params.z * 0.55, uniforms.fog_params.w * 0.92, cam_dist);
         color = mix(color, color + vec3<f32>(0.12, 0.09, 0.05), distance_lift * 0.22);
+    }
+
+    // Emissive contribution: bypasses shadow and AO, added as unlit self-illumination
+    if emissive_intensity > 0.001 {
+        let base_emissive = material_color(material, world_pos, normal);
+        color += base_emissive * emissive_intensity;
     }
 
     // -- Aerial perspective from shared atmosphere model --

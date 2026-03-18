@@ -45,9 +45,13 @@ fn load_tri_idx(desc: MeshletDescriptor, tri: u32, vert: u32) -> u32 {
     return (meshlet_triangle_indices[word_idx] >> (byte_off * 8u)) & 0xFFu;
 }
 
+const MATERIAL_FOLIAGE: u32 = 1u;
+
 struct VsOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) visibility_id: u32,
+    @location(1) alpha: f32,
+    @location(2) @interpolate(flat) material_id: u32,
 };
 
 @vertex
@@ -66,6 +70,8 @@ fn vs_main(
         var out: VsOutput;
         out.position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         out.visibility_id = 0u;
+        out.alpha = 1.0;
+        out.material_id = 0u;
         return out;
     }
 
@@ -76,14 +82,28 @@ fn vs_main(
     let world_pos = vec4<f32>(v.pos_x, v.pos_y, v.pos_z, 1.0);
     let clip_pos = frame.view_proj * world_pos;
 
+    // Unpack alpha from semantic_channels (bits 0-7: 0-255 → 0.0-1.0)
+    // Only meaningful for foliage; other materials use semantic_channels for art direction.
+    var alpha = 1.0;
+    if v.material == MATERIAL_FOLIAGE {
+        let raw_alpha = v.semantic_channels & 0xFFu;
+        alpha = select(f32(raw_alpha) / 255.0, 1.0, v.semantic_channels == 0u);
+    }
+
     var out: VsOutput;
     out.position = clip_pos;
     // Bias by 1 so 0 remains the "empty pixel" sentinel in the vis buffer.
     out.visibility_id = ((meshlet_idx << 8u) | tri_idx) + 1u;
+    out.alpha = alpha;
+    out.material_id = v.material;
     return out;
 }
 
 @fragment
 fn fs_main(input: VsOutput) -> @location(0) u32 {
+    // Alpha test: discard transparent foliage fragments
+    if input.alpha < 0.5 {
+        discard;
+    }
     return input.visibility_id;
 }
