@@ -21,9 +21,9 @@ pub struct CullPass {
     cull_bind_group_layout: wgpu::BindGroupLayout,
     dispatch_bind_group_layout: wgpu::BindGroupLayout,
     /// Phase 2 reject list: meshlet indices that failed HZB in phase 1.
-    pub phase2_queue_buffer: wgpu::Buffer,
+    phase2_queue_buffer: wgpu::Buffer,
     /// Atomic counter for the reject list.
-    pub phase2_count_buffer: wgpu::Buffer,
+    phase2_count_buffer: wgpu::Buffer,
     /// Scratch buffer for binding slot 7 in the phase2 dispatch bind group.
     /// Prevents aliasing phase2_queue_buffer as both read-only (binding 4) and
     /// read_write (binding 7) in the same bind group, which WebGPU forbids.

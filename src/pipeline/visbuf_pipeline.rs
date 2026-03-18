@@ -656,23 +656,13 @@ impl VisbufPipeline {
         self.hzb_ready = true;
 
         // -- Phase 2: Re-test HZB-rejected meshlets against fresh HZB --
-        // Copy phase2_reject_count → a CPU-accessible path is not needed here.
-        // We use a conservative upper bound: the total meshlet count from all
-        // selected groups serves as a safe dispatch size. The phase2 shader
-        // reads group_queue_count (which holds the reject count) and bounds-checks.
-        //
-        // We need to copy phase2_reject_count into the group_queue_count slot
-        // of the phase2 dispatch bind group. Since phase2_dispatch_bg already
-        // binds phase2_count_buffer at binding 5, the shader reads it directly.
-        //
-        // We must clear hw_count before phase 2 cull writes new survivors.
+        // WebGPU does not support reading phase2_reject_count back to the CPU for an
+        // indirect compute dispatch, so we over-dispatch using total DAG meshlet count
+        // as a conservative upper bound. Over-dispatched threads exit early via the
+        // `idx >= group_queue_count` guard in the shader.
         self.dispatch_lists.clear_hw_count(&mut encoder);
 
-        // Dispatch phase 2 cull with a safe upper bound on workgroups.
-        // The shader itself checks idx < group_queue_count (= phase2_reject_count).
-        // Upper bound: total meshlets across all selected groups. In practice
-        // this is bounded by the phase2_queue_buffer capacity (65536).
-        let phase2_max_rejects = scene.dag.total_meshlet_count().min(65536) as u32;
+        let phase2_max_rejects = scene.dag.total_dag_meshlet_count().min(65536) as u32;
 
         if let (Some(cull_bg), Some(phase2_dispatch_bg)) = (&self.cull_bg, &self.phase2_dispatch_bg)
         {

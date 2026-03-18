@@ -183,7 +183,9 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Route all surviving meshlets to the HW visibility buffer path.
         _ = project_sphere_diameter(bounds.center, bounds.radius);
         let slot = atomicAdd(&hw_dispatch_count, 1u);
-        hw_dispatch_list[slot] = meshlet_idx;
+        if slot < arrayLength(&hw_dispatch_list) {
+            hw_dispatch_list[slot] = meshlet_idx;
+        }
     }
 }
 
@@ -211,5 +213,7 @@ fn meshlet_cull_phase2(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Survivor — add to HW dispatch list for phase 2 raster
     let slot = atomicAdd(&hw_dispatch_count, 1u);
-    hw_dispatch_list[slot] = meshlet_idx;
+    if slot < arrayLength(&hw_dispatch_list) {
+        hw_dispatch_list[slot] = meshlet_idx;
+    }
 }

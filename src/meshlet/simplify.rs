@@ -42,8 +42,9 @@ pub struct MeshletDag {
 }
 
 impl MeshletDag {
-    /// Total number of meshlets across all LOD levels.
-    pub fn total_meshlet_count(&self) -> usize {
+    /// Total number of meshlets across ALL LOD levels in the DAG, not just the
+    /// current frame's selected groups. Used as a conservative dispatch upper bound.
+    pub fn total_dag_meshlet_count(&self) -> usize {
         self.meshlets.len()
     }
 }
