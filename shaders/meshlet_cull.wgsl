@@ -169,9 +169,14 @@ fn meshlet_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // HZB occlusion cull (uses previous frame's HZB)
         if hzb_occlusion_cull(bounds.center, bounds.radius) {
-            // Not definitely invisible — queue for phase 2 re-test with fresh HZB
+            // Not definitely invisible — queue for phase 2 re-test with fresh HZB.
+            // Bounds-check before writing: the reject list holds at most 65536 entries.
+            // If the list is full we silently drop the meshlet (it will be absent for
+            // one frame rather than causing an out-of-bounds GPU write).
             let reject_slot = atomicAdd(&phase2_reject_count, 1u);
-            phase2_reject_list[reject_slot] = meshlet_idx;
+            if reject_slot < 65536u {
+                phase2_reject_list[reject_slot] = meshlet_idx;
+            }
             continue;
         }
 

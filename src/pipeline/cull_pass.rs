@@ -24,6 +24,12 @@ pub struct CullPass {
     pub phase2_queue_buffer: wgpu::Buffer,
     /// Atomic counter for the reject list.
     pub phase2_count_buffer: wgpu::Buffer,
+    /// Scratch buffer for binding slot 7 in the phase2 dispatch bind group.
+    /// Prevents aliasing phase2_queue_buffer as both read-only (binding 4) and
+    /// read_write (binding 7) in the same bind group, which WebGPU forbids.
+    phase2_scratch_list_buffer: wgpu::Buffer,
+    /// Scratch buffer for binding slot 8 in the phase2 dispatch bind group.
+    phase2_scratch_count_buffer: wgpu::Buffer,
 }
 
 impl CullPass {
@@ -133,6 +139,26 @@ impl CullPass {
             mapped_at_creation: false,
         });
 
+        // Small scratch buffers used only to satisfy the phase2 dispatch bind group
+        // layout at slots 7 and 8 (the phase2_reject_list / phase2_reject_count
+        // write targets). The phase2 shader never writes to these slots, so a
+        // single-element buffer is sufficient. This avoids the WebGPU validation
+        // hazard that would arise from binding phase2_queue_buffer as both
+        // read-only (binding 4) and read_write (binding 7) in the same bind group.
+        let phase2_scratch_list_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-scratch-list"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let phase2_scratch_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-scratch-count"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         Self {
             group_queue_buffer,
             group_queue_count_buffer,
@@ -142,6 +168,8 @@ impl CullPass {
             dispatch_bind_group_layout,
             phase2_queue_buffer,
             phase2_count_buffer,
+            phase2_scratch_list_buffer,
+            phase2_scratch_count_buffer,
         }
     }
 
@@ -338,14 +366,18 @@ impl CullPass {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(hzb_view),
                 },
-                // Phase 2 reject list (unused in phase 2 shader, but must be bound)
+                // Scratch buffers for slots 7/8: the phase2 shader never writes to
+                // these, but they must be bound to satisfy the layout. Using dedicated
+                // scratch buffers avoids aliasing phase2_queue_buffer / phase2_count_buffer
+                // as both read-only (bindings 4/5) and read_write (bindings 7/8) within
+                // the same bind group, which WebGPU validation forbids.
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: self.phase2_queue_buffer.as_entire_binding(),
+                    resource: self.phase2_scratch_list_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: self.phase2_count_buffer.as_entire_binding(),
+                    resource: self.phase2_scratch_count_buffer.as_entire_binding(),
                 },
             ],
         })
