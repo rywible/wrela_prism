@@ -106,7 +106,9 @@ fn sample_auto_exposure() -> f32 {
 @fragment
 fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(input.position.xy);
-    let ao = textureLoad(ao_tex, pixel, 0).r;
+    let ao_raw = textureLoad(ao_tex, pixel, 0).r;
+    // Multi-bounce AO correction — recovers energy lost to single-bounce approximation
+    let ao = ao_raw + 0.2 * ao_raw * (1.0 - ao_raw);
 
     // Unified exposure: manual * temporally-smoothed auto-exposure
     let manual_exposure = tu.time_params.y;

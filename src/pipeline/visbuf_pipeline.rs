@@ -9,6 +9,7 @@ use super::bloom_pass::BloomPass;
 use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
 use super::forward_character::ForwardCharacterPass;
+use super::gtao_pass::GtaoPass;
 use super::hw_raster_pass::{
     extract_frustum_planes, DispatchLists, HwRasterPass, VisbufFrameUniforms, VisibilityBuffer,
 };
@@ -19,7 +20,6 @@ use super::outline_pass::OutlinePass;
 use super::shadow_pass::ShadowPass;
 use super::sky_lut_pass::SkyLutPass;
 use super::sky_pass::SkyPass;
-use super::ssao_pass::SsaoPass;
 use super::ssgi_pass::SsgiPass;
 use super::sun_shaft_pass::SunShaftPass;
 use super::sw_raster_pass::SwRasterPass;
@@ -46,7 +46,7 @@ pub struct VisbufPipeline {
     pub sky_pass: SkyPass,
     pub cloud_pass: CloudPass,
     pub ssgi_pass: Option<SsgiPass>,
-    pub ssao_pass: Option<SsaoPass>,
+    pub gtao_pass: Option<GtaoPass>,
     pub sun_shaft_pass: SunShaftPass,
     pub outline_pass: OutlinePass,
     pub bloom_pass: Option<BloomPass>,
@@ -146,7 +146,7 @@ impl VisbufPipeline {
         let noise_textures = NoiseTextures::new(&gpu.device);
         let cloud_pass = CloudPass::new(&gpu.device, gpu.width(), gpu.height());
         let ssgi_pass = Some(SsgiPass::new(&gpu.device, gpu.width(), gpu.height()));
-        let ssao_pass = Some(SsaoPass::new(&gpu.device, gpu.width(), gpu.height()));
+        let gtao_pass = Some(GtaoPass::new(&gpu.device, gpu.width(), gpu.height()));
         let sun_shaft_pass = SunShaftPass::new(gpu);
         let bloom_pass = Some(BloomPass::new(&gpu.device, gpu.width(), gpu.height()));
         let tonemap_pass = TonemapPass::new(gpu);
@@ -267,7 +267,7 @@ impl VisbufPipeline {
             sky_pass,
             cloud_pass,
             ssgi_pass,
-            ssao_pass,
+            gtao_pass,
             sun_shaft_pass,
             outline_pass,
             bloom_pass,
@@ -415,8 +415,8 @@ impl VisbufPipeline {
         if let Some(ssgi) = &mut self.ssgi_pass {
             ssgi.resize(&gpu.device, gpu.width(), gpu.height());
         }
-        if self.ssao_pass.is_some() {
-            self.ssao_pass = Some(SsaoPass::new(&gpu.device, gpu.width(), gpu.height()));
+        if let Some(gtao) = &mut self.gtao_pass {
+            gtao.resize(&gpu.device, gpu.width(), gpu.height());
         }
         if self.bloom_pass.is_some() {
             self.bloom_pass = Some(BloomPass::new(&gpu.device, gpu.width(), gpu.height()));
@@ -815,11 +815,11 @@ impl VisbufPipeline {
             }
         }
 
-        // -- Pass 6: SSAO --
-        if let Some(ssao) = &self.ssao_pass {
+        // -- Pass 6: GTAO (horizon-based AO with bent normals) --
+        if let Some(gtao) = &self.gtao_pass {
             let projection = camera.projection_matrix();
             let view = camera.view_matrix();
-            ssao.write_uniforms(
+            gtao.write_uniforms(
                 &gpu.queue,
                 projection,
                 view,
@@ -827,7 +827,7 @@ impl VisbufPipeline {
                 gpu.height(),
                 self.frame_index,
             );
-            ssao.execute(
+            gtao.execute(
                 &gpu.device,
                 &mut encoder,
                 &self.material_pass.normal_view,
@@ -896,7 +896,7 @@ impl VisbufPipeline {
             &mut encoder,
             &gpu.queue,
             self.tonemap_source(),
-            self.ssao_pass.as_ref().map(|ssao| ssao.ao_view()),
+            self.gtao_pass.as_ref().map(|gtao| gtao.ao_view()),
             &frame_view,
             gpu.width(),
             gpu.height(),
@@ -962,7 +962,7 @@ impl VisbufPipeline {
             &mut encoder,
             &gpu.queue,
             self.tonemap_source(),
-            self.ssao_pass.as_ref().map(|ssao| ssao.ao_view()),
+            self.gtao_pass.as_ref().map(|gtao| gtao.ao_view()),
             &capture_view,
             width,
             height,
@@ -1022,4 +1022,3 @@ fn create_scene_color_target(
         view,
     }
 }
-

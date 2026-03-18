@@ -2,6 +2,7 @@ pub mod bloom_pass;
 pub mod cloud_pass;
 pub mod cull_pass;
 pub mod forward_character;
+pub mod gtao_pass;
 pub mod hw_raster_pass;
 pub mod hzb_pass;
 pub mod material_pass;
