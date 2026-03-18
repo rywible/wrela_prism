@@ -58,11 +58,8 @@ impl ThirdPersonState {
         let (pitch_sin, pitch_cos) = self.orbit_pitch.sin_cos();
 
         // Camera sits behind and above the character.
-        let arm_back = Vec3::new(
-            -yaw_cos * pitch_cos,
-            pitch_sin,
-            -yaw_sin * pitch_cos,
-        ) * self.config.arm_length;
+        let arm_back = Vec3::new(-yaw_cos * pitch_cos, pitch_sin, -yaw_sin * pitch_cos)
+            * self.config.arm_length;
 
         // Shoulder offset (rightward from camera's perspective).
         let right = Vec3::new(-yaw_sin, 0.0, yaw_cos);

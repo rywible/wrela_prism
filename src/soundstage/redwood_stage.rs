@@ -74,6 +74,9 @@ pub fn hero() -> SoundstageConfig {
                 temporal_blend: 0.90,
                 resolution: CloudResolution::Quarter,
             },
+            fog_volume_density: 0.02,
+            fog_volume_albedo: Vec3::new(0.9, 0.9, 0.95),
+            fog_volume_anisotropy: 0.3,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -135,6 +138,9 @@ pub fn low_angle() -> SoundstageConfig {
                 temporal_blend: 0.88,
                 resolution: CloudResolution::Quarter,
             },
+            fog_volume_density: 0.02,
+            fog_volume_albedo: Vec3::new(0.9, 0.9, 0.95),
+            fog_volume_anisotropy: 0.3,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -196,6 +202,9 @@ pub fn silhouette() -> SoundstageConfig {
                 temporal_blend: 0.88,
                 resolution: CloudResolution::Quarter,
             },
+            fog_volume_density: 0.02,
+            fog_volume_albedo: Vec3::new(0.9, 0.9, 0.95),
+            fog_volume_anisotropy: 0.3,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -257,6 +266,9 @@ pub fn neutral_debug() -> SoundstageConfig {
                 temporal_blend: 0.88,
                 resolution: CloudResolution::Quarter,
             },
+            fog_volume_density: 0.02,
+            fog_volume_albedo: Vec3::new(0.9, 0.9, 0.95),
+            fog_volume_anisotropy: 0.3,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {

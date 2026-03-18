@@ -343,8 +343,7 @@ impl RuntimeState {
                 );
 
                 // Compute camera position from orbit
-                let (cam_pos, yaw, pitch) =
-                    self.third_person.compute_camera(self.character_pos);
+                let (cam_pos, yaw, pitch) = self.third_person.compute_camera(self.character_pos);
                 self.camera.position = cam_pos;
                 self.camera.yaw = yaw;
                 self.camera.pitch = pitch;

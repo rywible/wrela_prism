@@ -288,6 +288,9 @@ pub struct SceneSettings {
     pub cloud_coverage: f32,
     pub cloud_profile: CloudProfile,
     pub wind: WindSettings,
+    pub fog_volume_density: f32,
+    pub fog_volume_albedo: Vec3,
+    pub fog_volume_anisotropy: f32,
 }
 
 /// Wind settings for foliage animation.

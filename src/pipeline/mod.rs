@@ -19,6 +19,7 @@ pub mod sw_raster_pass;
 pub mod taa_pass;
 pub mod tonemap_pass;
 pub mod visbuf_pipeline;
+pub mod volumetric_fog_pass;
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 

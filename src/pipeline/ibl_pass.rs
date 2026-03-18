@@ -142,9 +142,7 @@ impl IblPass {
 
         let brdf_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ibl-brdf-lut-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/brdf_lut.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/brdf_lut.wgsl").into()),
         });
 
         let brdf_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -250,15 +248,14 @@ impl IblPass {
                 cache: None,
             });
 
-        let prefilter_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("ibl-prefilter-pipeline"),
-                layout: Some(&prefilter_layout),
-                module: &prefilter_shader,
-                entry_point: Some("prefilter_mip"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+        let prefilter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ibl-prefilter-pipeline"),
+            layout: Some(&prefilter_layout),
+            module: &prefilter_shader,
+            entry_point: Some("prefilter_mip"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
 
         // -- Uniform buffer --
         let prefilter_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -316,11 +313,7 @@ impl IblPass {
             });
             pass.set_pipeline(&self.brdf_lut_pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(
-                BRDF_LUT_SIZE.div_ceil(8),
-                BRDF_LUT_SIZE.div_ceil(8),
-                1,
-            );
+            pass.dispatch_workgroups(BRDF_LUT_SIZE.div_ceil(8), BRDF_LUT_SIZE.div_ceil(8), 1);
         }
         queue.submit([encoder.finish()]);
     }
@@ -453,11 +446,7 @@ impl IblPass {
                 });
                 pass.set_pipeline(&self.sky_to_cubemap_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(
-                    CUBEMAP_SIZE.div_ceil(8),
-                    CUBEMAP_SIZE.div_ceil(8),
-                    1,
-                );
+                pass.dispatch_workgroups(CUBEMAP_SIZE.div_ceil(8), CUBEMAP_SIZE.div_ceil(8), 1);
             }
         }
 

@@ -791,31 +791,35 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
 }
 
 // -- Height fog with per-material attenuation --
+// DISABLED: Froxel volumetric fog (fog_composite pass) now handles atmospheric scattering.
+// The function is kept for reference but returns 0.0 to disable analytical fog.
 
 fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
-    let density = uniforms.fog_params.x;
-    let falloff = uniforms.fog_params.y;
-    let fog_start = uniforms.fog_params.z;
-    let fog_end = uniforms.fog_params.w;
+    // Volumetric fog composite replaces analytical height fog.
+    return 0.0;
 
-    let distance_factor = clamp((dist - fog_start) / max(fog_end - fog_start, 0.001), 0.0, 1.0);
-    let distance_fog = 1.0 - exp(-pow(distance_factor, 2.2) * density * 1500.0);
-    let ground_mist = exp(-max(world_pos.y, 0.0) * falloff);
-    var fog = clamp(distance_fog * (0.24 + ground_mist * 0.76), 0.0, 1.0);
-
-    // Per-material fog attenuation
-    if material == MATERIAL_FOLIAGE {
-        fog *= 0.84;
-    } else if material == MATERIAL_TRUNK {
-        fog *= 0.90;
-    }
-    // Ground: fade into atmospheric haze earlier so the slab edge doesn't read as a horizon stripe.
-    if material == MATERIAL_GROUND {
-        let edge_fade = smoothstep(fog_start * 0.70, fog_end * 1.05, dist);
-        fog = max(fog, edge_fade * 0.88);
-    }
-
-    return fog;
+    // Original analytical fog (kept for reference):
+    // let density = uniforms.fog_params.x;
+    // let falloff = uniforms.fog_params.y;
+    // let fog_start = uniforms.fog_params.z;
+    // let fog_end = uniforms.fog_params.w;
+    //
+    // let distance_factor = clamp((dist - fog_start) / max(fog_end - fog_start, 0.001), 0.0, 1.0);
+    // let distance_fog = 1.0 - exp(-pow(distance_factor, 2.2) * density * 1500.0);
+    // let ground_mist = exp(-max(world_pos.y, 0.0) * falloff);
+    // var fog = clamp(distance_fog * (0.24 + ground_mist * 0.76), 0.0, 1.0);
+    //
+    // if material == MATERIAL_FOLIAGE {
+    //     fog *= 0.84;
+    // } else if material == MATERIAL_TRUNK {
+    //     fog *= 0.90;
+    // }
+    // if material == MATERIAL_GROUND {
+    //     let edge_fade = smoothstep(fog_start * 0.70, fog_end * 1.05, dist);
+    //     fog = max(fog, edge_fade * 0.88);
+    // }
+    //
+    // return fog;
 }
 
 // -- Fragment shader --

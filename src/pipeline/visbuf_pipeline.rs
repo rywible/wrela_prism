@@ -26,6 +26,7 @@ use super::sun_shaft_pass::SunShaftPass;
 use super::sw_raster_pass::SwRasterPass;
 use super::taa_pass::TaaPass;
 use super::tonemap_pass::TonemapPass;
+use super::volumetric_fog_pass::VolumetricFogPass;
 use super::HDR_FORMAT;
 struct SceneColorTarget {
     _texture: wgpu::Texture,
@@ -111,6 +112,9 @@ pub struct VisbufPipeline {
     // Sky probe cache — avoids recomputing 1,872 optical depth evaluations when params unchanged
     sky_probe_cache: crate::scene::sky_probe::SkyProbeCache,
 
+    // Froxel volumetric fog
+    pub volumetric_fog_pass: VolumetricFogPass,
+
     // 3D noise textures for volumetric clouds
     pub noise_textures: NoiseTextures,
 
@@ -147,6 +151,7 @@ impl VisbufPipeline {
         let sky_lut_pass = SkyLutPass::new(&gpu.device);
         let ibl_pass = IblPass::new(&gpu.device);
         let noise_textures = NoiseTextures::new(&gpu.device);
+        let volumetric_fog_pass = VolumetricFogPass::new(&gpu.device);
         let cloud_pass = CloudPass::new(&gpu.device, gpu.width(), gpu.height());
         let ssgi_pass = Some(SsgiPass::new(&gpu.device, gpu.width(), gpu.height()));
         let gtao_pass = Some(GtaoPass::new(&gpu.device, gpu.width(), gpu.height()));
@@ -313,6 +318,7 @@ impl VisbufPipeline {
             sky_probe_cache: crate::scene::sky_probe::SkyProbeCache::new(),
             hzb_ready: false,
             frame_index: 0,
+            volumetric_fog_pass,
             noise_textures,
             timing: if gpu.timestamp_supported {
                 Some(GpuTimingContext::new(&gpu.device, &gpu.queue))
@@ -802,6 +808,41 @@ impl VisbufPipeline {
                 timing_ref,
                 &self.sky_lut_pass.sky_view_view,
                 &self.sky_lut_pass.lut_sampler,
+            );
+        }
+
+        // -- Pass 5.57: Froxel volumetric fog (inject → integrate → composite) --
+        if settings.fog_volume_density > 0.0001 {
+            // Use sky probe ambient for fog ambient scattering
+            let fog_ambient = glam::Vec3::new(
+                lighting.ambient_up[0],
+                lighting.ambient_up[1],
+                lighting.ambient_up[2],
+            ) * settings.ambient_intensity
+                * 0.3;
+
+            self.volumetric_fog_pass.encode(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                &self.shadow_map,
+                &self.vis_buffer.depth_view,
+                &self.scene_color.view,
+                inv_vp,
+                view_proj,
+                cam_pos,
+                settings.sun_direction,
+                settings.sun_color,
+                settings.sun_strength,
+                fog_ambient,
+                settings.fog_volume_density,
+                settings.fog_height_falloff,
+                settings.fog_volume_albedo,
+                settings.fog_volume_anisotropy,
+                &cascade_vps,
+                &cascade_splits,
+                camera.near_plane,
+                camera.far_plane,
             );
         }
 

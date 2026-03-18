@@ -61,9 +61,9 @@ impl SsgiPass {
             label: Some("prism-ssgi-sample-bgl"),
             entries: &[
                 uniform_entry(0),
-                texture_entry(1), // normals
+                texture_entry(1),       // normals
                 depth_texture_entry(2), // depth
-                texture_entry(3), // scene color
+                texture_entry(3),       // scene color
                 storage_texture_entry(4, wgpu::TextureFormat::Rgba16Float),
             ],
         });
@@ -73,9 +73,9 @@ impl SsgiPass {
             label: Some("prism-ssgi-blur-bgl"),
             entries: &[
                 uniform_entry(0),
-                texture_entry(1), // normals
+                texture_entry(1),       // normals
                 depth_texture_entry(2), // depth
-                texture_entry(3), // raw GI input
+                texture_entry(3),       // raw GI input
                 storage_texture_entry(4, wgpu::TextureFormat::Rgba16Float),
             ],
         });
