@@ -22,7 +22,7 @@ const FROXEL_D: u32 = 128;
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct FogInjectUniforms {
     inv_view_proj: [[f32; 4]; 4],
-    prev_inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
     camera_position: [f32; 4],
     sun_direction: [f32; 4],
     sun_color: [f32; 4],
@@ -82,7 +82,7 @@ pub struct VolumetricFogPass {
 
     // State
     frame_index: u32,
-    prev_inv_view_proj: Mat4,
+    prev_view_proj: Mat4,
 }
 
 impl VolumetricFogPass {
@@ -401,7 +401,7 @@ impl VolumetricFogPass {
             integrate_uniform_buffer,
             composite_uniform_buffer,
             frame_index: 0,
-            prev_inv_view_proj: Mat4::IDENTITY,
+            prev_view_proj: Mat4::IDENTITY,
         }
     }
 
@@ -444,7 +444,7 @@ impl VolumetricFogPass {
         // Write inject uniforms
         let inject_uniforms = FogInjectUniforms {
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
-            prev_inv_view_proj: self.prev_inv_view_proj.to_cols_array_2d(),
+            prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
             camera_position: [camera_position.x, camera_position.y, camera_position.z, 1.0],
             sun_direction: [sun_direction.x, sun_direction.y, sun_direction.z, 0.0],
             sun_color: [sun_color.x, sun_color.y, sun_color.z, sun_strength],
@@ -621,8 +621,8 @@ impl VolumetricFogPass {
             pass.draw(0..3, 0..1);
         }
 
-        // Update state for next frame
-        self.prev_inv_view_proj = inv_view_proj;
+        // Update state for next frame: store current view_proj for next frame's reprojection
+        self.prev_view_proj = view_proj;
         self.frame_index = self.frame_index.wrapping_add(1);
     }
 }

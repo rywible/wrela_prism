@@ -9,7 +9,7 @@
 
 struct FogUniforms {
     inv_view_proj: mat4x4<f32>,
-    prev_inv_view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     sun_color: vec4<f32>,          // rgb = color, a = strength
@@ -163,24 +163,51 @@ fn fog_inject(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let total_scatter = sun_scatter + ambient;
 
-    // Temporal reprojection: reproject to previous frame's froxel space
+    // Temporal reprojection: reproject current world position into previous
+    // frame's froxel space and blend for temporal stability.
     let temporal_weight = u.fog_params.w;
     let frame_index = u32(u.ambient_color.w);
 
     var result = vec4<f32>(total_scatter, extinction);
 
     if temporal_weight > 0.001 && frame_index > 0u {
-        // Reproject world position to previous frame's froxel coords
-        let prev_clip = u.prev_inv_view_proj * vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        // Actually reproject: compute previous frame screen UV
-        let prev_vp_clip = u.view_proj * vec4<f32>(world_pos, 1.0);
-        // For temporal stability, we blend with the previous frame's injection
-        // using the same froxel coordinates (assuming camera didn't move much)
-        let prev_uv = (coord + 0.5) / vec3<f32>(f32(grid_w), f32(grid_h), f32(grid_d));
-        let prev_sample = textureSampleLevel(prev_scatter_volume, prev_sampler, prev_uv, 0.0);
+        // Project current world position into previous frame's clip space
+        let prev_clip = u.prev_view_proj * vec4<f32>(world_pos, 1.0);
 
-        // Blend current with previous
-        result = mix(result, prev_sample, temporal_weight);
+        // Only reproject if the point was in front of the previous camera
+        if prev_clip.w > 0.001 {
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+
+            // Convert NDC to screen UV
+            let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+
+            // Check if the reprojected position is on-screen
+            if prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0 {
+                // Convert world-space depth to previous frame's froxel slice
+                // We need the linear distance from the previous camera.
+                // prev_clip.w gives the view-space depth in the previous frame.
+                let prev_linear_depth = prev_clip.w;
+                let prev_slice = depth_to_slice(prev_linear_depth);
+                let num_slices = f32(grid_d);
+
+                if prev_slice >= 0.0 && prev_slice < num_slices {
+                    // 3D UVW into previous scatter volume
+                    let prev_uvw = vec3<f32>(
+                        prev_uv.x,
+                        prev_uv.y,
+                        clamp(prev_slice / num_slices, 0.0, 1.0 - 0.5 / num_slices),
+                    );
+
+                    let prev_sample = textureSampleLevel(prev_scatter_volume, prev_sampler, prev_uvw, 0.0);
+
+                    // Sanitize: reject NaN/inf from previous frame
+                    let s_ok = all(prev_sample == clamp(prev_sample, vec4<f32>(-100.0), vec4<f32>(100.0)));
+                    if s_ok {
+                        result = mix(result, prev_sample, temporal_weight);
+                    }
+                }
+            }
+        }
     }
 
     textureStore(scatter_volume, gid, result);

@@ -54,9 +54,11 @@ fn screen_edge_fade(uv: vec2<f32>) -> f32 {
     return smoothstep(fade_end, fade_start, dist);
 }
 
-// Per-pixel hash for jittering
+// Per-pixel hash for jittering.
+// Wrap frame to avoid f32 precision loss at high frame counts (>16M).
 fn hash_pixel(pixel: vec2<u32>, frame: f32) -> f32 {
-    let p = vec2<f32>(f32(pixel.x), f32(pixel.y)) + frame * 1.618;
+    let wrapped_frame = frame % 512.0;
+    let p = vec2<f32>(f32(pixel.x), f32(pixel.y)) + wrapped_frame * 1.618;
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 

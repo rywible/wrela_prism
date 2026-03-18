@@ -104,11 +104,13 @@ fn gtao_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let intensity = u.params.z;
     let frame_index = u.params.w;
 
-    // Per-pixel jitter: spatial noise + temporal golden angle rotation
+    // Per-pixel jitter: spatial noise + temporal golden angle rotation.
+    // Wrap frame_index to avoid f32 precision loss at high counts (>16M frames).
     let golden_angle = 2.3999632; // pi * (3 - sqrt(5))
     let spatial_noise = hash_pixel(gid.xy);
     let step_noise = hash_pixel2(gid.xy);
-    let angle_offset = spatial_noise * PI + frame_index * golden_angle;
+    let wrapped_frame = frame_index % 512.0;
+    let angle_offset = spatial_noise * PI + wrapped_frame * golden_angle;
 
     // Screen-space radius: project world-space radius to pixels
     // Use the z-depth of the pixel to determine how many pixels the radius covers
