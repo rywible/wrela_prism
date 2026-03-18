@@ -2,7 +2,6 @@ pub mod redwood_stage;
 
 use crate::camera::{CameraBookmark, CameraNavigationConfig, CameraState, ThirdPersonConfig};
 use crate::scene::SceneSettings;
-use glam::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LookDevPreset {
@@ -32,8 +31,6 @@ impl LookDevPreset {
 pub struct SoundstageLayout {
     pub ground_radius: f32,
     pub ground_thickness: f32,
-    pub shadow_center: Vec3,
-    pub shadow_focus_radius: f32,
     pub shadow_depth: f32,
 }
 

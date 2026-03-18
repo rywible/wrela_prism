@@ -14,6 +14,7 @@ pub mod ssao_pass;
 pub mod ssgi_pass;
 pub mod sun_shaft_pass;
 pub mod sw_raster_pass;
+pub mod taa_pass;
 pub mod tonemap_pass;
 pub mod visbuf_pipeline;
 

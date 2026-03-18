@@ -81,8 +81,8 @@ struct MeshletDescriptor {
 @group(2) @binding(5) var bark_sampler: sampler;
 @group(2) @binding(6) var bark_height: texture_2d<f32>;
 
-// Depth buffer (R32Float, for contact shadows)
-@group(2) @binding(7) var depth_float: texture_2d<f32>;
+// Depth buffer (native Depth32Float, for contact shadows)
+@group(2) @binding(7) var depth_float: texture_depth_2d;
 
 // Sky-view LUT for aerial perspective (must match sky_pass.wgsl parameterization)
 @group(2) @binding(8) var sky_view_lut: texture_2d<f32>;
@@ -237,8 +237,10 @@ fn apply_palette_remap(base_color: vec3<f32>, material: u32, discipline: f32) ->
     }
 
     // Compute target chrominance: blend tonal hue with material hint
-    // Ground uses more material hint to stay earthy, trunk/foliage use more tonal
-    let hint_weight = select(0.45, 0.70, material == MATERIAL_GROUND);
+    // Foliage & ground need strong material identity to stay green/earthy
+    var hint_weight = 0.45;
+    if material == MATERIAL_GROUND { hint_weight = 0.70; }
+    if material == MATERIAL_FOLIAGE { hint_weight = 0.65; }
     let target_chroma = mix(tonal, hint, hint_weight);
     let target_lum = max(dot(target_chroma, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.001);
 
@@ -314,7 +316,11 @@ fn compute_barycentrics(
     let dp1 = dot(ep, e1);
     let dp2 = dot(ep, e2);
 
-    let inv_denom = 1.0 / (d11 * d22 - d12 * d12);
+    let denom = d11 * d22 - d12 * d12;
+    if abs(denom) < 1e-10 {
+        return vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let inv_denom = 1.0 / denom;
     let u = (d22 * dp1 - d12 * dp2) * inv_denom;
     let v = (d11 * dp2 - d12 * dp1) * inv_denom;
 
@@ -322,8 +328,12 @@ fn compute_barycentrics(
     let w_inv = vec3<f32>(1.0 / v0.w, 1.0 / v1.w, 1.0 / v2.w);
     let corrected = lambda * w_inv;
     let sum = corrected.x + corrected.y + corrected.z;
+    var bary = corrected / max(sum, 1e-10);
 
-    return corrected / sum;
+    // Clamp and renormalize to prevent NaN from degenerate edge pixels
+    bary = clamp(bary, vec3<f32>(0.0), vec3<f32>(1.0));
+    bary /= max(dot(bary, vec3<f32>(1.0)), 1e-6);
+    return bary;
 }
 
 fn six_face_ambient(normal: vec3<f32>) -> vec3<f32> {
@@ -488,7 +498,8 @@ fn contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
     var ray_screen = screen_start;
     var ray_depth = depth_start;
 
-    // Adaptive thickness based on depth (thicker when further away)
+    // Adaptive thickness based on depth. With reversed-Z, ray_depth is higher
+    // for near surfaces — this gives thicker bias near camera where precision is best.
     let base_thickness = 0.0005;
 
     for (var i = 1; i <= 16; i++) {
@@ -501,10 +512,10 @@ fn contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
             break;
         }
 
-        let scene_depth = textureLoad(depth_float, vec2<u32>(vec2<i32>(pixel)), 0).r;
+        let scene_depth = textureLoad(depth_float, vec2<u32>(vec2<i32>(pixel)), 0);
         let thickness = base_thickness * (1.0 + ray_depth * 5.0);
 
-        if ray_depth > scene_depth && (ray_depth - scene_depth) < thickness {
+        if ray_depth < scene_depth && (scene_depth - ray_depth) < thickness {
             // Fade out shadow for samples near the end of the ray
             let fade = 1.0 - f32(i) / 16.0;
             return 1.0 - fade;
@@ -713,10 +724,10 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
             + 0.25 * sin(position.y * 10.0 + position.x * 8.0);
         let tuft_shadow = 0.5 + 0.5 * sin(position.y * 15.0 + position.x * 6.0 - position.z * 7.0);
         let sun_tip_noise = 0.5 + 0.5 * sin(position.x * 2.1 - position.z * 2.7 + position.y * 1.4);
-        let deep = vec3<f32>(0.018, 0.042, 0.022);
-        let mid = vec3<f32>(0.034, 0.074, 0.036);
-        let lit = vec3<f32>(0.080, 0.118, 0.048);
-        let warm_tip = vec3<f32>(0.140, 0.150, 0.055);
+        let deep = vec3<f32>(0.038, 0.120, 0.032);
+        let mid = vec3<f32>(0.065, 0.210, 0.055);
+        let lit = vec3<f32>(0.110, 0.300, 0.080);
+        let warm_tip = vec3<f32>(0.180, 0.340, 0.095);
         let shadow_mix = clamp(tuft_shadow * 0.62 + canopy_noise * 0.16, 0.0, 1.0);
         let lit_mix = clamp(canopy_noise * 0.18 + normal.y * 0.16, 0.0, 1.0);
         let tip_mix = clamp(sun_tip_noise * 0.28 + normal.y * 0.24, 0.0, 1.0);
@@ -865,8 +876,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     var shadow = sample_shadow(world_pos);
 
     // Art direction: band the NdotL * shadow term for cel-shading
-    // This creates the discrete light-to-shadow transition ufotable is known for
-    if art.shading_bands > 0.01 {
+    // Ufotable-style: discrete bands with lifted shadows (never pure black)
+    // Skip banding for foliage — thin geometry reads as metallic with hard bands
+    if art.shading_bands > 0.01 && material != MATERIAL_FOLIAGE {
         let light_factor = NdotL * shadow;
         let bands = art.shading_bands;
         let softness = art.band_softness;
@@ -874,7 +886,8 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         let band_idx = floor(scaled);
         let frac = scaled - band_idx;
         let t = smoothstep(0.5 - softness, 0.5 + softness, frac);
-        let banded = (band_idx + t) / bands;
+        // Floor of 0.18: even the darkest band retains some light (anime shadow fill)
+        let banded = max((band_idx + t) / bands, 0.18);
         // Split banded result back into NdotL and shadow
         // Keep shadow as-is for shadow color shift, adjust NdotL
         if NdotL > 0.001 {
@@ -1030,10 +1043,10 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         var sss_strength: f32;
 
         if material == MATERIAL_FOLIAGE {
-            roughness = 0.74;
+            roughness = 0.82;
             metallic = 0.0;
-            f0 = vec3<f32>(0.025);
-            sss_strength = 0.35;
+            f0 = vec3<f32>(0.018);
+            sss_strength = 0.50;
         } else if material == MATERIAL_SKIN {
             roughness = 0.65;
             metallic = 0.0;
@@ -1080,17 +1093,21 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
             }
 
             // View-dependent transmission (NOT gated by shadow map)
-            let subsurface_color = vec3<f32>(0.46, 0.60, 0.16);
+            let subsurface_color = vec3<f32>(0.52, 0.68, 0.22);
             let transmission = subsurface_color
-                * pow(max(dot(view_dir, -sun_dir), 0.0), 4.0)
-                * sun_color * sun_energy * 0.75;
+                * pow(max(dot(view_dir, -sun_dir), 0.0), 3.0)
+                * sun_color * sun_energy * 0.90;
 
             // Diffuse with wrap lighting
             let wrap_NdotL = dot(foliage_normal, sun_dir) * 0.3 + 0.7;
             let foliage_diffuse = kD * max(wrap_NdotL, 0.0) * sun_color * sun_energy * shadow;
 
-            diffuse_term = mix(diffuse, foliage_diffuse, 0.92);
-            ambient_term = ambient * (1.10 + max(normal.y, 0.0) * 0.38);
+            // Attenuate shadow on foliage — self-shadowing from dense canopy
+            // would otherwise crush foliage. Moderate shadow leak.
+            let foliage_shadow = mix(0.18, 1.0, shadow);
+            let foliage_diffuse2 = kD * max(wrap_NdotL, 0.0) * sun_color * sun_energy * foliage_shadow;
+            diffuse_term = mix(diffuse, foliage_diffuse2, 0.92);
+            ambient_term = ambient * (1.25 + max(normal.y, 0.0) * 0.40);
             sky_fill_term = sky_fill * 2.20;
             sss = transmission * sss_strength;
         } else {
@@ -1113,7 +1130,7 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         var extra = vec3<f32>(0.0);
         if material == MATERIAL_FOLIAGE {
             let rim = pow(1.0 - max(dot(normal, view_dir), 0.0), 2.0);
-            extra = rim * vec3<f32>(0.010, 0.014, 0.006);
+            extra = rim * vec3<f32>(0.025, 0.035, 0.015);
         }
 
         // Ground bounce: sunlit earth scatters warm light upward
@@ -1129,15 +1146,24 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         // Compose lighting
         color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra) * ground_darken
               + (ground_bounce + canopy_scatter) * ao;
+
+        // Foliage minimum floor: prevent complete shadow crush in dense canopy.
+        if material == MATERIAL_FOLIAGE {
+            let floor_color = base_color * 0.12;
+            color = max(color, floor_color);
+        }
     }
 
     // -- Art Direction Style Transforms --
     // Applied after PBR lighting, before fog. All no-ops at identity (default values).
     // (Light banding is applied earlier, to NdotL, for correct cel-shading)
 
-    // 1. Shadow color shift — only on trunk/foliage (ground keeps warm shadow)
-    if material != MATERIAL_GROUND {
+    // 1. Shadow color shift — full on trunk, subtle on foliage (preserves green)
+    if material == MATERIAL_TRUNK || material == MATERIAL_SKIN {
         color = apply_shadow_color_shift(color, NdotL, shadow, art.shadow_color_shift.rgb);
+    } else if material == MATERIAL_FOLIAGE {
+        // Subtle shadow shift for foliage — preserves green identity
+        color = apply_shadow_color_shift(color, NdotL, shadow, art.shadow_color_shift.rgb * 0.25);
     }
 
     // 2. Rim lighting
@@ -1160,17 +1186,21 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
     let fog_dir = normalize(world_pos - camera_pos);
     var aerial = sample_aerial_sky(fog_dir);
     if material == MATERIAL_GROUND {
-        let ground_haze = lower_atmosphere_haze(fog_dir, sun_dir) + vec3<f32>(0.18, 0.15, 0.10);
-        let sky_lift = smoothstep(-0.18, 0.16, fog_dir.y);
-        aerial = mix(ground_haze, aerial * 1.08, sky_lift);
+        // Distant ground converges toward horizon sky color for smooth transition.
+        // Lift the fog direction upward with distance so ground blends to horizon.
+        let dist_t = smoothstep(100.0, 600.0, cam_dist);
+        let lifted_dir = normalize(fog_dir + vec3<f32>(0.0, dist_t * 0.12, 0.0));
+        aerial = sample_aerial_sky(lifted_dir) + vec3<f32>(0.10, 0.08, 0.05);
     }
     color = mix(color, aerial, fog_factor);
 
-    // -- Apply exposure --
-    color *= uniforms.lighting_params.x;
+    // Exposure is applied once in the tonemap pass — output raw HDR here.
 
     var out: MaterialOutput;
     out.color = vec4<f32>(color, 1.0);
-    out.normal = vec4<f32>(final_normal * 0.5 + 0.5, 1.0);
+    // Encode material type in normal alpha: 0.0 = foliage, 1.0 = other
+    // Used by outline pass to suppress ink lines on dense foliage geometry
+    let outline_mask = select(1.0, 0.0, material == MATERIAL_FOLIAGE);
+    out.normal = vec4<f32>(final_normal * 0.5 + 0.5, outline_mask);
     return out;
 }

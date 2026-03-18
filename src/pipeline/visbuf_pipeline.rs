@@ -23,6 +23,7 @@ use super::ssao_pass::SsaoPass;
 use super::ssgi_pass::SsgiPass;
 use super::sun_shaft_pass::SunShaftPass;
 use super::sw_raster_pass::SwRasterPass;
+use super::taa_pass::TaaPass;
 use super::tonemap_pass::TonemapPass;
 use super::HDR_FORMAT;
 struct SceneColorTarget {
@@ -69,8 +70,6 @@ pub struct VisbufPipeline {
     sky_bg: Option<wgpu::BindGroup>,
 
     // Shadow parameters
-    pub shadow_center: glam::Vec3,
-    pub shadow_base_radius: f32,
     pub shadow_depth: f32,
 
     // Lighting uniform buffer (shared between material pass and post-processing)
@@ -90,6 +89,9 @@ pub struct VisbufPipeline {
     pub art_direction_color_grade: [f32; 4],
     pub art_direction_lod_bias: f32,
 
+    // Temporal anti-aliasing
+    pub taa_pass: Option<TaaPass>,
+
     // Forward-rendered character capsule
     pub forward_character: ForwardCharacterPass,
     forward_char_scene_bg: Option<wgpu::BindGroup>,
@@ -98,13 +100,22 @@ pub struct VisbufPipeline {
     /// Whether to draw the character (third-person mode).
     pub character_visible: bool,
 
-    // Depth copy (Depth32Float → R32Float via compute)
-    depth_copy_pipeline: wgpu::ComputePipeline,
-    depth_copy_bgl: wgpu::BindGroupLayout,
-    depth_copy_bg: Option<wgpu::BindGroup>,
+    // Cached per-frame values (set during render, used by capture_frame)
+    last_manual_exposure: f32,
+    last_dt: f32,
+    last_elapsed: f32,
+
+    // Sky probe cache — avoids recomputing 1,872 optical depth evaluations when params unchanged
+    sky_probe_cache: crate::scene::sky_probe::SkyProbeCache,
 
     // 3D noise textures for volumetric clouds
     pub noise_textures: NoiseTextures,
+
+    // HZB occlusion culling state
+    hzb_ready: bool,
+
+    // Frame counter for temporal effects (SSAO/SSGI rotation, etc.)
+    frame_index: u32,
 
     // GPU timing (None if TIMESTAMP_QUERY unsupported)
     pub timing: Option<GpuTimingContext>,
@@ -115,7 +126,7 @@ impl VisbufPipeline {
         let shadow_map = ShadowMap::new(&gpu.device);
         let shadow_pass = ShadowPass::new(gpu, &shadow_map);
         let vis_buffer = VisibilityBuffer::new(&gpu.device, gpu.width(), gpu.height());
-        let dispatch_lists = DispatchLists::new(&gpu.device, 8192);
+        let dispatch_lists = DispatchLists::new(&gpu.device, 65536);
 
         let hw_raster = HwRasterPass::new(&gpu.device);
         let frame_bg = hw_raster.create_frame_bind_group(&gpu.device);
@@ -238,65 +249,7 @@ impl VisbufPipeline {
             &sky_lut_pass,
         ));
 
-        // Depth copy compute pipeline (Depth32Float → R32Float)
-        let depth_copy_bgl =
-            gpu.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("depth-copy-bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Depth,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::StorageTexture {
-                                access: wgpu::StorageTextureAccess::WriteOnly,
-                                format: wgpu::TextureFormat::R32Float,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-        let depth_copy_shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("depth-copy-shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../../shaders/depth_to_float.wgsl").into(),
-                ),
-            });
-        let depth_copy_layout =
-            gpu.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("depth-copy-layout"),
-                    bind_group_layouts: &[&depth_copy_bgl],
-                    immediate_size: 0,
-                });
-        let depth_copy_pipeline =
-            gpu.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("depth-copy-pipeline"),
-                    layout: Some(&depth_copy_layout),
-                    module: &depth_copy_shader,
-                    entry_point: Some("depth_copy"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                });
-
-        let depth_copy_bg = Some(create_depth_copy_bind_group(
-            &gpu.device,
-            &depth_copy_bgl,
-            &vis_buffer,
-        ));
+        let taa_pass = Some(TaaPass::new(&gpu.device, gpu.width(), gpu.height()));
 
         let forward_character = ForwardCharacterPass::new(&gpu.device, &lighting_uniform_buffer);
         let forward_char_scene_bg =
@@ -318,6 +271,7 @@ impl VisbufPipeline {
             outline_pass,
             bloom_pass,
             tonemap_pass,
+            taa_pass,
             shadow_map,
             vis_buffer,
             dispatch_lists,
@@ -331,8 +285,6 @@ impl VisbufPipeline {
             hw_dispatch_bg: None,
             material_frame_bg,
             sky_bg,
-            shadow_center: glam::Vec3::new(0.0, 10.0, 0.0),
-            shadow_base_radius: 30.0,
             shadow_depth: 140.0,
             lighting_uniform_buffer,
             bark_uniform_buffer,
@@ -349,9 +301,12 @@ impl VisbufPipeline {
             forward_char_scene_bg,
             character_model: glam::Mat4::IDENTITY,
             character_visible: false,
-            depth_copy_pipeline,
-            depth_copy_bgl,
-            depth_copy_bg,
+            last_manual_exposure: 1.0,
+            last_dt: 0.0,
+            last_elapsed: 0.0,
+            sky_probe_cache: crate::scene::sky_probe::SkyProbeCache::new(),
+            hzb_ready: false,
+            frame_index: 0,
             noise_textures,
             timing: if gpu.timestamp_supported {
                 Some(GpuTimingContext::new(&gpu.device, &gpu.queue))
@@ -375,10 +330,14 @@ impl VisbufPipeline {
             self.cull_pass
                 .create_cull_bind_group(device, &scene.meshlet_buffers),
         );
-        self.dispatch_bg = Some(
-            self.cull_pass
-                .create_dispatch_bind_group(device, &self.dispatch_lists),
-        );
+        self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
+            device,
+            &self.dispatch_lists,
+            self.hzb_pass
+                .hzb_full_view
+                .as_ref()
+                .expect("HZB not initialized"),
+        ));
         self.sw_dispatch_bg = Some(self.sw_raster.create_dispatch_bind_group(
             device,
             &self.dispatch_lists,
@@ -413,7 +372,7 @@ impl VisbufPipeline {
             bark_albedo_rough_view,
             bark_normal_ao_view,
             bark_height_view,
-            &self.vis_buffer.depth_float_view,
+            &self.vis_buffer.depth_view,
             &self.sky_lut_pass,
         ));
         // Sky bind group depends on vis_buffer + LUTs
@@ -456,13 +415,10 @@ impl VisbufPipeline {
         self.sun_shaft_pass
             .resize(&gpu.device, gpu.width(), gpu.height());
         self.tonemap_pass = TonemapPass::new(gpu);
-
-        // Rebuild depth copy bind group (depends on vis_buffer)
-        self.depth_copy_bg = Some(create_depth_copy_bind_group(
-            &gpu.device,
-            &self.depth_copy_bgl,
-            &self.vis_buffer,
-        ));
+        if let Some(taa) = &mut self.taa_pass {
+            taa.resize(&gpu.device, gpu.width(), gpu.height());
+        }
+        self.hzb_ready = false;
 
         if self.mesh_bg.is_some() {
             // SW dispatch bind group depends on vis_buffer
@@ -476,6 +432,17 @@ impl VisbufPipeline {
                 self.hw_raster
                     .create_dispatch_bind_group(&gpu.device, &self.dispatch_lists),
             );
+            // Rebuild cull dispatch bind group (depends on HZB view which changed)
+            if self.dispatch_bg.is_some() {
+                self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
+                    &gpu.device,
+                    &self.dispatch_lists,
+                    self.hzb_pass
+                        .hzb_full_view
+                        .as_ref()
+                        .expect("HZB not initialized"),
+                ));
+            }
         }
     }
 
@@ -512,9 +479,21 @@ impl VisbufPipeline {
         let cam_pos = camera.position();
         let fov_y = camera.fov_y_radians;
 
-        // Update frame uniforms
+        // Compute TAA jitter (Halton 2,3 sequence, ±0.5 pixel)
+        let (jx, jy) = self
+            .taa_pass
+            .as_ref()
+            .map(|t| t.jitter())
+            .unwrap_or((0.0, 0.0));
+        let jittered_vp = if self.taa_pass.is_some() {
+            apply_jitter(view_proj, jx, jy, gpu.width(), gpu.height())
+        } else {
+            view_proj
+        };
+
+        // Update frame uniforms (jittered VP for rasterization, unjittered for culling)
         let visbuf_uniforms = VisbufFrameUniforms {
-            view_proj: view_proj.to_cols_array_2d(),
+            view_proj: jittered_vp.to_cols_array_2d(),
             camera_position: [cam_pos.x, cam_pos.y, cam_pos.z, 1.0],
             screen_size: [
                 gpu.width() as f32,
@@ -529,6 +508,12 @@ impl VisbufPipeline {
                 0.0,
             ],
             frustum_planes: extract_frustum_planes(view_proj),
+            hzb_params: [
+                if self.hzb_ready { 1.0 } else { 0.0 },
+                self.hzb_pass.mip_count as f32,
+                gpu.width() as f32,
+                gpu.height() as f32,
+            ],
         };
         self.hw_raster.write_uniforms(&gpu.queue, &visbuf_uniforms);
 
@@ -545,6 +530,7 @@ impl VisbufPipeline {
             elapsed_secs,
             gpu.width(),
             gpu.height(),
+            &mut self.sky_probe_cache,
         );
         gpu.queue.write_buffer(
             &self.lighting_uniform_buffer,
@@ -637,19 +623,6 @@ impl VisbufPipeline {
         // -- Pass 4: SW rasterize --
         // TODO: re-enable when GPU cull pass routes meshlets to SW path.
 
-        // Copy Depth32Float → R32Float via compute (formats not copy-compatible)
-        if let Some(depth_copy_bg) = &self.depth_copy_bg {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("depth-copy-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.depth_copy_pipeline);
-            pass.set_bind_group(0, depth_copy_bg, &[]);
-            let w = (self.vis_buffer.width + 7) / 8;
-            let h = (self.vis_buffer.height + 7) / 8;
-            pass.dispatch_workgroups(w, h, 1);
-        }
-
         // -- Pass 5: Material resolve --
         if let (Some(mesh_bg), Some(vis_bg), Some(material_frame_bg)) =
             (&self.mesh_bg, &self.vis_bg, &self.material_frame_bg)
@@ -676,26 +649,26 @@ impl VisbufPipeline {
                     &self.vis_buffer.depth_view,
                 );
             }
-
-            // Re-copy depth after character was drawn (character writes to depth)
-            if let Some(depth_copy_bg) = &self.depth_copy_bg {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("depth-copy-pass-post-char"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.depth_copy_pipeline);
-                pass.set_bind_group(0, depth_copy_bg, &[]);
-                let w = (self.vis_buffer.width + 7) / 8;
-                let h = (self.vis_buffer.height + 7) / 8;
-                pass.dispatch_workgroups(w, h, 1);
-            }
         }
+
+        // -- Pass 5.15: HZB build (after character depth, for next frame's occlusion cull) --
+        self.hzb_pass.encode(
+            &gpu.device,
+            &mut encoder,
+            &self.vis_buffer.depth_view,
+            gpu.width(),
+            gpu.height(),
+        );
+        self.hzb_ready = true;
 
         // -- Pass 5.5: Sky pass (fills empty vis pixels with atmospheric sky) --
         if let Some(sky_bg) = &self.sky_bg {
             self.sky_pass
                 .encode(&mut encoder, sky_bg, &self.scene_color.view);
         }
+
+        // Unjittered inverse view-projection (shared by cloud pass + TAA)
+        let inv_vp = view_proj.inverse();
 
         // -- Pass 5.55: Cloud pass (volumetric clouds at profile resolution) --
         {
@@ -713,7 +686,6 @@ impl VisbufPipeline {
             // Sky ambient is now sampled from sky-view LUT in the shader.
             // Pass a placeholder — the shader overrides with LUT values.
             let sky_amb = glam::Vec3::splat(0.15);
-            let inv_vp = view_proj.inverse();
             self.cloud_pass.write_uniforms(
                 &gpu.queue,
                 inv_vp,
@@ -742,7 +714,7 @@ impl VisbufPipeline {
                 &mut encoder,
                 &self.noise_textures,
                 &self.scene_color.view,
-                &self.vis_buffer.depth_float_view,
+                &self.vis_buffer.depth_view,
                 view_proj,
                 timing_ref,
                 &self.sky_lut_pass.sky_view_view,
@@ -763,12 +735,13 @@ impl VisbufPipeline {
                     gpu.width(),
                     gpu.height(),
                     gi_intensity,
+                    self.frame_index,
                 );
                 ssgi.execute(
                     &gpu.device,
                     &mut encoder,
                     &self.material_pass.normal_view,
-                    &self.vis_buffer.depth_float_view,
+                    &self.vis_buffer.depth_view,
                     &self.scene_color.view,
                 );
             }
@@ -778,12 +751,19 @@ impl VisbufPipeline {
         if let Some(ssao) = &self.ssao_pass {
             let projection = camera.projection_matrix();
             let view = camera.view_matrix();
-            ssao.write_uniforms(&gpu.queue, projection, view, gpu.width(), gpu.height());
+            ssao.write_uniforms(
+                &gpu.queue,
+                projection,
+                view,
+                gpu.width(),
+                gpu.height(),
+                self.frame_index,
+            );
             ssao.execute(
                 &gpu.device,
                 &mut encoder,
                 &self.material_pass.normal_view,
-                &self.vis_buffer.depth_float_view,
+                &self.vis_buffer.depth_view,
             );
         }
 
@@ -791,7 +771,7 @@ impl VisbufPipeline {
         self.sun_shaft_pass.encode(
             &gpu.device,
             &mut encoder,
-            &self.vis_buffer.depth_float_view,
+            &self.vis_buffer.depth_view,
             &self.scene_color.view,
         );
 
@@ -801,7 +781,7 @@ impl VisbufPipeline {
             self.outline_pass.encode(
                 &gpu.device,
                 &mut encoder,
-                &self.vis_buffer.depth_float_view,
+                &self.vis_buffer.depth_view,
                 &self.material_pass.normal_view,
                 &self.scene_color.view,
                 &self.art_direction_bg,
@@ -823,19 +803,38 @@ impl VisbufPipeline {
             );
         }
 
+        // -- Pass 8.5: TAA (temporal resolve after bloom, before tonemap) --
+        if let Some(taa) = &mut self.taa_pass {
+            taa.encode(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                &self.vis_buffer.depth_view,
+                &self.scene_color.view,
+                inv_vp,
+                view_proj,
+                [jx, jy],
+            );
+        }
+
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        self.last_manual_exposure = settings.exposure;
+        self.last_dt = (elapsed_secs - self.last_elapsed).max(0.0).min(0.25);
+        self.last_elapsed = elapsed_secs;
         self.tonemap_pass.encode(
             &gpu.device,
             &mut encoder,
             &gpu.queue,
-            &self.scene_color.view,
+            self.tonemap_source(),
             self.ssao_pass.as_ref().map(|ssao| ssao.ao_view()),
             &frame_view,
             gpu.width(),
             gpu.height(),
             elapsed_secs,
+            settings.exposure,
+            self.last_dt,
             self.art_direction_color_grade,
         );
 
@@ -852,6 +851,7 @@ impl VisbufPipeline {
         }
 
         frame.present();
+        self.frame_index = self.frame_index.wrapping_add(1);
         Ok(())
     }
 
@@ -893,18 +893,38 @@ impl VisbufPipeline {
             &gpu.device,
             &mut encoder,
             &gpu.queue,
-            &self.scene_color.view,
+            self.tonemap_source(),
             self.ssao_pass.as_ref().map(|ssao| ssao.ao_view()),
             &capture_view,
             width,
             height,
             elapsed_secs,
+            self.last_manual_exposure,
+            self.last_dt,
             self.art_direction_color_grade,
         );
         gpu.queue.submit([encoder.finish()]);
 
         super::readback_texture(gpu, &capture_texture, width, height)
     }
+
+    /// HDR source for tonemap: TAA output when active, otherwise raw scene color.
+    fn tonemap_source(&self) -> &wgpu::TextureView {
+        self.taa_pass
+            .as_ref()
+            .map(|t| t.output_view())
+            .unwrap_or(&self.scene_color.view)
+    }
+}
+
+fn apply_jitter(vp: glam::Mat4, jx: f32, jy: f32, w: u32, h: u32) -> glam::Mat4 {
+    // Add sub-pixel offset to the projection. Modifying z_axis (column 2) adds a
+    // term that scales with clip.w, producing a constant NDC shift after perspective
+    // division — independent of depth.
+    let mut j = vp;
+    j.z_axis.x += jx * 2.0 / w as f32;
+    j.z_axis.y += jy * 2.0 / h as f32;
+    j
 }
 
 fn create_scene_color_target(
@@ -935,23 +955,3 @@ fn create_scene_color_target(
     }
 }
 
-fn create_depth_copy_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    vis_buffer: &VisibilityBuffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("depth-copy-bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&vis_buffer.depth_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&vis_buffer.depth_float_view),
-            },
-        ],
-    })
-}

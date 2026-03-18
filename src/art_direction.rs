@@ -293,34 +293,34 @@ pub const IDENTITY: StyleSnapshot = StyleSnapshot {
 
 pub const DEMON_SLAYER: StyleSnapshot = StyleSnapshot {
     axes: StyleAxes {
-        softness: 0.55,
-        exaggeration: 0.80,
-        shadow_graphicness: 0.85,
-        palette_warmth: 0.35,
+        softness: 0.45,
+        exaggeration: 0.70,
+        shadow_graphicness: 0.70,
+        palette_warmth: 0.40,
         atmospheric_depth: 0.3,
-        surface_detail: 0.3,
-        outline_presence: 0.90,
-        color_discipline: 0.75,
+        surface_detail: 0.4,
+        outline_presence: 0.80,
+        color_discipline: 0.30,
     },
     palette: StylePalette {
-        // ufotable shadows: deep blue-violet
-        shadow: [0.08, 0.04, 0.16, 0.0],
-        // dark midtone: cool indigo
-        dark: [0.16, 0.10, 0.24, 0.0],
-        // primary midtone: muted purple-grey
-        mid: [0.40, 0.32, 0.48, 0.0],
+        // ufotable shadows: rich blue-violet, not crushed
+        shadow: [0.16, 0.12, 0.26, 0.0],
+        // dark midtone: warm indigo
+        dark: [0.28, 0.22, 0.36, 0.0],
+        // primary midtone: natural with violet shift
+        mid: [0.52, 0.46, 0.56, 0.0],
         // highlights: warm cream
         light: [1.0, 0.92, 0.82, 0.0],
         // accent: ufotable warm red-pink for rim lights
         accent: [1.0, 0.40, 0.50, 0.0],
         // bark: warm reddish-brown
         bark: [0.38, 0.20, 0.14, 0.0],
-        // foliage: saturated green
-        foliage: [0.14, 0.28, 0.10, 0.0],
+        // foliage: vivid saturated green
+        foliage: [0.30, 0.50, 0.22, 0.0],
         // earth: warm ochre-brown
         earth: [0.30, 0.22, 0.14, 0.0],
-        // sky_tint: cool blue atmospheric
-        sky_tint: [0.10, 0.08, 0.18, 0.0],
+        // sky_tint: subtle cool atmospheric grade (values near 1.0 for multiplicative)
+        sky_tint: [0.92, 0.88, 0.96, 0.0],
     },
 };
 
@@ -408,23 +408,6 @@ impl ArtDirection {
         });
     }
 
-    pub fn set_blend(&mut self, sources: Vec<(Arc<StyleSnapshot>, f32)>) {
-        self.blend_sources = sources;
-    }
-
-    pub fn drive_axis(&mut self, axis: Axis, value: f32) {
-        match axis {
-            Axis::Softness => self.current_axes.softness = value,
-            Axis::Exaggeration => self.current_axes.exaggeration = value,
-            Axis::ShadowGraphicness => self.current_axes.shadow_graphicness = value,
-            Axis::PaletteWarmth => self.current_axes.palette_warmth = value,
-            Axis::AtmosphericDepth => self.current_axes.atmospheric_depth = value,
-            Axis::SurfaceDetail => self.current_axes.surface_detail = value,
-            Axis::OutlinePresence => self.current_axes.outline_presence = value,
-            Axis::ColorDiscipline => self.current_axes.color_discipline = value,
-        }
-    }
-
     pub fn current_axes(&self) -> &StyleAxes {
         &self.current_axes
     }
@@ -442,9 +425,9 @@ impl ArtDirection {
         if self.current_axes.color_discipline > 0.01 {
             let cd = self.current_axes.color_discipline;
             color_grade = [
-                lerp_f32(1.0, self.current_palette.sky_tint[0] + 0.88, cd * 0.3),
-                lerp_f32(1.0, self.current_palette.sky_tint[1] + 0.88, cd * 0.3),
-                lerp_f32(1.0, self.current_palette.sky_tint[2] + 0.88, cd * 0.3),
+                lerp(1.0, self.current_palette.sky_tint[0] + 0.88, cd * 0.3),
+                lerp(1.0, self.current_palette.sky_tint[1] + 0.88, cd * 0.3),
+                lerp(1.0, self.current_palette.sky_tint[2] + 0.88, cd * 0.3),
                 cd * 0.3,
             ];
         }
@@ -505,23 +488,23 @@ impl ArtDirection {
             let cd = self.current_axes.color_discipline;
             // Shadow color shift: target hue for shadow regions (blue-violet)
             uniforms.shadow_color_shift = [
-                lerp_f32(0.0, self.current_palette.shadow[0] + 0.08, cd),
-                lerp_f32(0.0, self.current_palette.shadow[1] + 0.04, cd),
-                lerp_f32(0.0, self.current_palette.shadow[2] + 0.18, cd),
+                lerp(0.0, self.current_palette.shadow[0] + 0.08, cd),
+                lerp(0.0, self.current_palette.shadow[1] + 0.04, cd),
+                lerp(0.0, self.current_palette.shadow[2] + 0.18, cd),
                 0.0,
             ];
             // Rim light: warm accent tint
             uniforms.rim_light_color = [
-                lerp_f32(1.0, self.current_palette.accent[0], cd * 0.8),
-                lerp_f32(1.0, self.current_palette.accent[1], cd * 0.8),
-                lerp_f32(1.0, self.current_palette.accent[2], cd * 0.8),
+                lerp(1.0, self.current_palette.accent[0], cd * 0.8),
+                lerp(1.0, self.current_palette.accent[1], cd * 0.8),
+                lerp(1.0, self.current_palette.accent[2], cd * 0.8),
                 0.0,
             ];
             // Overall color grade toward palette atmosphere
             uniforms.color_grade_tint = [
-                lerp_f32(1.0, self.current_palette.sky_tint[0] + 0.90, cd * 0.35),
-                lerp_f32(1.0, self.current_palette.sky_tint[1] + 0.90, cd * 0.35),
-                lerp_f32(1.0, self.current_palette.sky_tint[2] + 0.90, cd * 0.35),
+                lerp(1.0, self.current_palette.sky_tint[0] + 0.90, cd * 0.35),
+                lerp(1.0, self.current_palette.sky_tint[1] + 0.90, cd * 0.35),
+                lerp(1.0, self.current_palette.sky_tint[2] + 0.90, cd * 0.35),
                 cd * 0.3,
             ];
         }
@@ -535,23 +518,9 @@ impl ArtDirection {
     }
 }
 
-// ──────────────────────── Axis Enum ────────────────────────
-
-#[derive(Clone, Copy, Debug)]
-pub enum Axis {
-    Softness,
-    Exaggeration,
-    ShadowGraphicness,
-    PaletteWarmth,
-    AtmosphericDepth,
-    SurfaceDetail,
-    OutlinePresence,
-    ColorDiscipline,
-}
-
 // ──────────────────────── Interpolation Helpers ────────────────────────
 
-fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
@@ -565,24 +534,24 @@ pub fn blend_snapshots(a: &StyleSnapshot, b: &StyleSnapshot, t: f32) -> StyleSna
 
 fn lerp_axes(a: &StyleAxes, b: &StyleAxes, t: f32) -> StyleAxes {
     StyleAxes {
-        softness: lerp_f32(a.softness, b.softness, t),
-        exaggeration: lerp_f32(a.exaggeration, b.exaggeration, t),
-        shadow_graphicness: lerp_f32(a.shadow_graphicness, b.shadow_graphicness, t),
-        palette_warmth: lerp_f32(a.palette_warmth, b.palette_warmth, t),
-        atmospheric_depth: lerp_f32(a.atmospheric_depth, b.atmospheric_depth, t),
-        surface_detail: lerp_f32(a.surface_detail, b.surface_detail, t),
-        outline_presence: lerp_f32(a.outline_presence, b.outline_presence, t),
-        color_discipline: lerp_f32(a.color_discipline, b.color_discipline, t),
+        softness: lerp(a.softness, b.softness, t),
+        exaggeration: lerp(a.exaggeration, b.exaggeration, t),
+        shadow_graphicness: lerp(a.shadow_graphicness, b.shadow_graphicness, t),
+        palette_warmth: lerp(a.palette_warmth, b.palette_warmth, t),
+        atmospheric_depth: lerp(a.atmospheric_depth, b.atmospheric_depth, t),
+        surface_detail: lerp(a.surface_detail, b.surface_detail, t),
+        outline_presence: lerp(a.outline_presence, b.outline_presence, t),
+        color_discipline: lerp(a.color_discipline, b.color_discipline, t),
     }
 }
 
 fn lerp_palette(a: &StylePalette, b: &StylePalette, t: f32) -> StylePalette {
     fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
         [
-            lerp_f32(a[0], b[0], t),
-            lerp_f32(a[1], b[1], t),
-            lerp_f32(a[2], b[2], t),
-            lerp_f32(a[3], b[3], t),
+            lerp(a[0], b[0], t),
+            lerp(a[1], b[1], t),
+            lerp(a[2], b[2], t),
+            lerp(a[3], b[3], t),
         ]
     }
     StylePalette {

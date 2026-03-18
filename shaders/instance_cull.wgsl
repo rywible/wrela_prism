@@ -9,6 +9,7 @@ struct FrameUniforms {
     screen_size: vec4<f32>,
     error_threshold: vec4<f32>,
     frustum_planes: array<vec4<f32>, 6>,
+    hzb_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;

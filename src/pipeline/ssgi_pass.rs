@@ -62,7 +62,7 @@ impl SsgiPass {
             entries: &[
                 uniform_entry(0),
                 texture_entry(1), // normals
-                texture_entry(2), // depth
+                depth_texture_entry(2), // depth
                 texture_entry(3), // scene color
                 storage_texture_entry(4, wgpu::TextureFormat::Rgba16Float),
             ],
@@ -74,7 +74,7 @@ impl SsgiPass {
             entries: &[
                 uniform_entry(0),
                 texture_entry(1), // normals
-                texture_entry(2), // depth
+                depth_texture_entry(2), // depth
                 texture_entry(3), // raw GI input
                 storage_texture_entry(4, wgpu::TextureFormat::Rgba16Float),
             ],
@@ -192,6 +192,7 @@ impl SsgiPass {
         width: u32,
         height: u32,
         gi_intensity: f32,
+        frame_index: u32,
     ) {
         let uniforms = SsgiUniforms {
             view: view.to_cols_array_2d(),
@@ -204,7 +205,7 @@ impl SsgiPass {
                 1.0 / width as f32,
                 1.0 / height as f32,
             ],
-            params: [gi_intensity, 2.0, 0.0, 0.0], // gi_intensity, radius
+            params: [gi_intensity, 2.0, frame_index as f32, 0.0], // gi_intensity, radius, frame_index
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -366,6 +367,19 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn depth_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },

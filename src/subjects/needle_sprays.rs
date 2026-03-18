@@ -37,8 +37,8 @@ pub fn build_needle_sprays(
             twig_axis.y = twig_axis.y.abs() * 0.5 + 0.3; // upward bias
             twig_axis = twig_axis.normalize_or_zero();
 
-            // AO based on height
-            let ao = (pos.y / params.trunk_height).clamp(0.3, 1.0);
+            // AO based on height — raised minimum for better foliage readability
+            let ao = (pos.y / params.trunk_height).clamp(0.55, 1.0);
 
             // Build 6 quads in a radial fan around the twig axis
             for fan_i in 0..quads_per_spray {
@@ -67,13 +67,16 @@ pub fn build_needle_sprays(
                 let needle_right = rotated_right;
 
                 // Needle dimensions: elongated (length >> width)
-                let half_len = cluster_radius * rng.next_f32_range(0.18, 0.38);
-                let half_width = half_len * rng.next_f32_range(0.10, 0.22);
+                let half_len = cluster_radius * rng.next_f32_range(0.22, 0.42);
+                let half_width = half_len * rng.next_f32_range(0.16, 0.30);
 
                 let base_idx = verts.len() as u32;
 
-                // Compute face normal
+                // Hemisphere-biased normal: blend face normal with upward direction
+                // for softer, more realistic foliage lighting (standard technique
+                // in AAA game foliage rendering)
                 let face_normal = needle_dir.cross(needle_right).normalize_or_zero();
+                let hemisphere_normal = (face_normal + Vec3::Y * 0.6).normalize_or_zero();
 
                 // 4 corners of the elongated quad
                 let corners = [
@@ -86,7 +89,7 @@ pub fn build_needle_sprays(
                 for corner in &corners {
                     verts.push(Vertex {
                         position: (*corner).into(),
-                        normal: [face_normal.x, face_normal.y, face_normal.z],
+                        normal: [hemisphere_normal.x, hemisphere_normal.y, hemisphere_normal.z],
                         material: MATERIAL_FOLIAGE,
                         feature_id: 0,
                         uv: [0.0, 0.0],

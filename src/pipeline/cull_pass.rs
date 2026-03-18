@@ -39,6 +39,17 @@ impl CullPass {
                     super::storage_entry(3, false, wgpu::ShaderStages::COMPUTE), // sw_dispatch_count
                     super::storage_entry(4, true, wgpu::ShaderStages::COMPUTE),  // group_queue
                     super::storage_entry(5, true, wgpu::ShaderStages::COMPUTE), // group_queue_count (uniform-like)
+                    // HZB texture (previous frame, all mip levels)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -70,7 +81,7 @@ impl CullPass {
 
         let group_queue_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("group-queue"),
-            size: 4096 * 4, // up to 4096 groups
+            size: 16384 * 4, // up to 16384 groups
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -189,6 +200,7 @@ impl CullPass {
         &self,
         device: &wgpu::Device,
         dispatch: &DispatchLists,
+        hzb_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cull-dispatch-bg"),
@@ -217,6 +229,10 @@ impl CullPass {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.group_queue_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(hzb_view),
                 },
             ],
         })

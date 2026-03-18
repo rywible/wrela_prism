@@ -1,4 +1,7 @@
-// Fullscreen ACES tonemap pass — reads HDR scene_color, outputs LDR.
+// Fullscreen tonemap pass — reads HDR scene_color, applies unified exposure, outputs LDR.
+//
+// All exposure is applied here. Material resolve and sky pass output raw HDR.
+// Mirrors TonemapUniforms in src/pipeline/tonemap_pass.rs.
 
 @group(0) @binding(0)
 var hdr_tex: texture_2d<f32>;
@@ -9,7 +12,8 @@ var nearest_sampler: sampler;
 
 struct TonemapUniforms {
     screen_size: vec4<f32>,  // width, height, 0, 0
-    time_params: vec4<f32>,  // elapsed_secs, 0, 0, 0
+    // x = elapsed_secs, y = manual_exposure, z = prev_auto_exposure, w = dt
+    time_params: vec4<f32>,
     color_grade: vec4<f32>,  // xyz = tint, w = strength (0 = no grading)
 };
 @group(0) @binding(3)
@@ -103,8 +107,18 @@ fn sample_auto_exposure() -> f32 {
 fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(input.position.xy);
     let ao = textureLoad(ao_tex, pixel, 0).r;
-    let auto_exposure = sample_auto_exposure();
-    let hdr = textureLoad(hdr_tex, pixel, 0).rgb * ao * auto_exposure;
+
+    // Unified exposure: manual * temporally-smoothed auto-exposure
+    let manual_exposure = tu.time_params.y;
+    let prev_auto = tu.time_params.z;
+    let dt = tu.time_params.w;
+    let raw_auto = sample_auto_exposure();
+    // Temporal EMA: adapt over ~0.5s (speed = 2.0)
+    let adapt_speed = clamp(dt * 2.0, 0.0, 1.0);
+    let auto_exposure = mix(prev_auto, raw_auto, adapt_speed);
+    let total_exposure = manual_exposure * auto_exposure;
+
+    let hdr = textureLoad(hdr_tex, pixel, 0).rgb * ao * total_exposure;
     var ldr = filmic_tonemap(hdr);
     let ldr_luma = luminance(ldr);
     let highlight_desat = smoothstep(0.55, 0.98, ldr_luma);

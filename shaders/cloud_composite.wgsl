@@ -5,13 +5,13 @@
 
 @group(0) @binding(0) var cloud_tex: texture_2d<f32>;
 @group(0) @binding(1) var cloud_sampler: sampler;
-@group(0) @binding(2) var depth_tex: texture_2d<f32>;
+@group(0) @binding(2) var depth_tex: texture_depth_2d;
 
 // Cloud depth texture for bilateral weighting (R32Float)
 @group(0) @binding(4) var cloud_depth_tex: texture_2d<f32>;
 
-// Must match cloud_march.wgsl and sun_shafts_occlusion.wgsl.
-const SKY_DEPTH_THRESHOLD: f32 = 0.9995;
+// Reversed-Z: near=1.0, far=0.0. Sky pixels have depth near 0.
+const SKY_DEPTH_THRESHOLD: f32 = 0.0005;
 
 // Must match full CloudUniforms layout so screen_params reads at the correct offset
 struct CompositeUniforms {
@@ -25,6 +25,7 @@ struct CompositeUniforms {
     screen_params: vec4<f32>,
     cloud_profile: vec4<f32>,
     cloud_profile2: vec4<f32>,
+    prev_time: vec4<f32>,
 };
 @group(0) @binding(3) var<uniform> cu: CompositeUniforms;
 
@@ -80,8 +81,9 @@ fn vs_composite(@builtin(vertex_index) vid: u32) -> FullscreenOutput {
 
 fn ray_dir_from_uv(uv: vec2<f32>) -> vec3<f32> {
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
-    let near_pt = cu.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far_pt = cu.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    // Reversed-Z: z=1 near, z=0 far. Use z=0.01 to avoid w=0 at infinity.
+    let near_pt = cu.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far_pt = cu.inv_view_proj * vec4<f32>(ndc, 0.01, 1.0);
     return normalize(far_pt.xyz / far_pt.w - near_pt.xyz / near_pt.w);
 }
 
@@ -91,7 +93,7 @@ fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let texel_size = vec2<f32>(cu.screen_params.z, cu.screen_params.w);
 
     // Full-res scene depth at this pixel
-    let full_depth = textureLoad(depth_tex, vec2<i32>(input.position.xy), 0).r;
+    let full_depth = textureLoad(depth_tex, vec2<i32>(input.position.xy), 0);
 
     // Quarter-res texel coordinate (continuous)
     let qcoord = input.uv * quarter_size - 0.5;
@@ -116,7 +118,7 @@ fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
 
     // Sky pixels: tent filter for smooth interpolation
     // Geometry-adjacent pixels: bilateral upsampling to prevent cloud bleeding onto surfaces
-    let is_sky = full_depth > SKY_DEPTH_THRESHOLD;
+    let is_sky = full_depth < SKY_DEPTH_THRESHOLD;
 
     var cloud: vec4<f32>;
     if is_sky {
@@ -138,7 +140,7 @@ fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
                 vec2<i32>(0),
                 vec2<i32>(textureDimensions(depth_tex)) - vec2<i32>(1)
             );
-            let sample_depth = textureLoad(depth_tex, full_pixel, 0).r;
+            let sample_depth = textureLoad(depth_tex, full_pixel, 0);
             let sample_cloud_d = textureLoad(cloud_depth_tex, clamped, 0).r;
             var depth_weight = 1.0;
             if sample_cloud_d > 0.1 {
@@ -159,7 +161,7 @@ fn fs_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
     }
 
     let ray_dir = ray_dir_from_uv(input.uv);
-    let horizon_fade = smoothstep(0.01, 0.085, ray_dir.y);
+    let horizon_fade = smoothstep(-0.02, 0.05, ray_dir.y);
     cloud = vec4<f32>(
         cloud.rgb * horizon_fade,
         mix(1.0, cloud.a, horizon_fade),

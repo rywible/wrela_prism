@@ -359,6 +359,7 @@ impl LightingUniforms {
         elapsed_secs: f32,
         screen_width: u32,
         screen_height: u32,
+        sky_probe_cache: &mut sky_probe::SkyProbeCache,
     ) -> Self {
         let vp = camera.view_projection_matrix();
         let inv_vp = vp.inverse();
@@ -375,20 +376,16 @@ impl LightingUniforms {
         .into_iter()
         .any(|ambient| ambient.length_squared() > 1e-4);
 
-        let auto_probe = sky_probe::compute_sky_probe(settings, settings.ambient_intensity);
-        let probe = if has_manual_ambient {
-            let manual_mix = 0.22;
-            sky_probe::SkyProbe {
-                up: auto_probe.up.lerp(settings.ambient_up, manual_mix),
-                down: auto_probe.down.lerp(settings.ambient_down, manual_mix),
-                right: auto_probe.right.lerp(settings.ambient_right, manual_mix),
-                left: auto_probe.left.lerp(settings.ambient_left, manual_mix),
-                front: auto_probe.front.lerp(settings.ambient_front, manual_mix),
-                back: auto_probe.back.lerp(settings.ambient_back, manual_mix),
-            }
-        } else {
-            auto_probe
-        };
+        let mut probe = *sky_probe_cache.get_or_compute(settings);
+        if has_manual_ambient {
+            let m = 0.22;
+            probe.up = probe.up.lerp(settings.ambient_up, m);
+            probe.down = probe.down.lerp(settings.ambient_down, m);
+            probe.right = probe.right.lerp(settings.ambient_right, m);
+            probe.left = probe.left.lerp(settings.ambient_left, m);
+            probe.front = probe.front.lerp(settings.ambient_front, m);
+            probe.back = probe.back.lerp(settings.ambient_back, m);
+        }
 
         Self {
             view_proj: vp.to_cols_array_2d(),
@@ -632,45 +629,41 @@ pub mod shadow {
             Vec3::Y
         };
 
-        // Frustum center
+        // Use bounding sphere of frustum corners — rotation-invariant, prevents shimmer.
         let center = frustum_corners.iter().copied().sum::<Vec3>() / 8.0;
+        let radius = frustum_corners
+            .iter()
+            .map(|c| (*c - center).length())
+            .fold(0.0_f32, f32::max);
+
         let light_view = Mat4::look_at_rh(center + light_dir * shadow_depth * 0.5, center, up);
 
-        // Project frustum corners into light view space to find extents
-        let mut min_x = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut min_y = f32::MAX;
-        let mut max_y = f32::MIN;
+        // Use sphere radius for XY extents — doesn't change on rotation
+        let half = radius;
+
+        // Find Z range in light space for proper near/far
         let mut min_z = f32::MAX;
         let mut max_z = f32::MIN;
-
         for &corner in frustum_corners {
             let lv = light_view * Vec4::from((corner, 1.0));
-            min_x = min_x.min(lv.x);
-            max_x = max_x.max(lv.x);
-            min_y = min_y.min(lv.y);
-            max_y = max_y.max(lv.y);
             min_z = min_z.min(lv.z);
             max_z = max_z.max(lv.z);
         }
-
-        // Pad Z range for objects behind the frustum that should still cast shadows
         min_z -= shadow_depth * 0.5;
 
-        // Texel snapping: round min/max to texel boundaries to prevent shimmer
-        let texels_per_unit =
-            SHADOW_MAP_SIZE as f32 / (max_x - min_x).max(max_y - min_y).max(0.001);
-        let snap = |val: f32| -> f32 { (val * texels_per_unit).floor() / texels_per_unit };
-        let snapped_min_x = snap(min_x);
-        let snapped_max_x = snap(max_x);
-        let snapped_min_y = snap(min_y);
-        let snapped_max_y = snap(max_y);
+        // Snap center to texel grid in light space to prevent sub-texel drift
+        let texel_size = (2.0 * half) / SHADOW_MAP_SIZE as f32;
+        let lv_center = light_view * Vec4::from((center, 1.0));
+        let snapped_x = (lv_center.x / texel_size).floor() * texel_size;
+        let snapped_y = (lv_center.y / texel_size).floor() * texel_size;
+        let offset_x = snapped_x - lv_center.x;
+        let offset_y = snapped_y - lv_center.y;
 
         let proj = Mat4::orthographic_rh(
-            snapped_min_x,
-            snapped_max_x,
-            snapped_min_y,
-            snapped_max_y,
+            -half + offset_x,
+            half + offset_x,
+            -half + offset_y,
+            half + offset_y,
             -max_z,
             -min_z,
         );
@@ -679,47 +672,39 @@ pub mod shadow {
 
     /// Extract the 8 corners of a view sub-frustum between near_split and far_split.
     ///
-    /// Works by unprojecting the full NDC frustum corners to world space,
-    /// then linearly interpolating along the camera rays to the split distances.
+    /// Computes corners directly from camera geometry to avoid issues with
+    /// infinite far plane in the reversed-Z projection matrix.
     pub fn frustum_corners(
-        inv_view_proj: Mat4,
+        camera: &crate::camera::CameraState,
         near_split: f32,
         far_split: f32,
-        near: f32,
-        far: f32,
     ) -> [Vec3; 8] {
-        // Unproject the 8 NDC cube corners to world space
-        // glam perspective_rh: z=0 → near, z=1 → far
-        let ndc_corners = [
-            // Near plane (z=0)
-            Vec4::new(-1.0, -1.0, 0.0, 1.0),
-            Vec4::new(1.0, -1.0, 0.0, 1.0),
-            Vec4::new(-1.0, 1.0, 0.0, 1.0),
-            Vec4::new(1.0, 1.0, 0.0, 1.0),
-            // Far plane (z=1)
-            Vec4::new(-1.0, -1.0, 1.0, 1.0),
-            Vec4::new(1.0, -1.0, 1.0, 1.0),
-            Vec4::new(-1.0, 1.0, 1.0, 1.0),
-            Vec4::new(1.0, 1.0, 1.0, 1.0),
-        ];
+        let forward = camera.forward();
+        let right = camera.right();
+        let up = camera.up();
+        let pos = camera.position();
+        let half_fov_tan = (camera.fov_y_radians * 0.5).tan();
 
-        let mut world = [Vec3::ZERO; 8];
-        for (i, &ndc) in ndc_corners.iter().enumerate() {
-            let w = inv_view_proj * ndc;
-            world[i] = Vec3::new(w.x / w.w, w.y / w.w, w.z / w.w);
-        }
+        let near_h = near_split * half_fov_tan;
+        let near_w = near_h * camera.aspect;
+        let far_h = far_split * half_fov_tan;
+        let far_w = far_h * camera.aspect;
 
-        // Interpolate along rays from near corners to far corners
-        let t_near = (near_split - near) / (far - near);
-        let t_far = (far_split - near) / (far - near);
+        let near_center = pos + forward * near_split;
+        let far_center = pos + forward * far_split;
 
-        std::array::from_fn(|i| {
-            if i < 4 {
-                world[i].lerp(world[i + 4], t_near)
-            } else {
-                world[i - 4].lerp(world[i], t_far)
-            }
-        })
+        [
+            // Near plane corners
+            near_center - right * near_w - up * near_h,
+            near_center + right * near_w - up * near_h,
+            near_center - right * near_w + up * near_h,
+            near_center + right * near_w + up * near_h,
+            // Far plane corners
+            far_center - right * far_w - up * far_h,
+            far_center + right * far_w - up * far_h,
+            far_center - right * far_w + up * far_h,
+            far_center + right * far_w + up * far_h,
+        ]
     }
 
     /// Compute all cascade light VP matrices for the current frame.
@@ -730,50 +715,23 @@ pub mod shadow {
     ) -> ([Mat4; NUM_CASCADES], [f32; NUM_CASCADES]) {
         let near = camera.near_plane;
         let far = camera.far_plane;
-        let splits = compute_cascade_splits(near, far, 0.7);
-        let inv_vp = camera.view_projection_matrix().inverse();
+        let splits = compute_cascade_splits(near, far, 0.75);
 
         let cascade_vps = std::array::from_fn(|i| {
             let split_near = if i == 0 { near } else { splits[i - 1] };
             let split_far = splits[i];
-            let corners = frustum_corners(inv_vp, split_near, split_far, near, far);
+            let corners = frustum_corners(camera, split_near, split_far);
             compute_cascade_light_vp(sun_dir, &corners, shadow_depth)
         });
 
-        // View-space split distances (for fragment shader cascade selection)
-        let view = camera.view_matrix();
-        let view_splits = std::array::from_fn(|i| {
-            // Convert the split far distance to view-space Z
-            // In a RH view matrix, view-space Z is negative for objects in front
-            // The shader will compare abs(view_z) against these
-            let world_point = camera.position() + camera.forward() * splits[i];
-            let view_point = view * Vec4::from((world_point, 1.0));
-            -view_point.z
-        });
+        // View-space split distances for fragment shader cascade selection.
+        // In RH view space, Z is negative for objects in front of camera.
+        // A point at distance d along forward has view_z = -d, so |view_z| = d.
+        let view_splits = splits;
 
         (cascade_vps, view_splits)
     }
 
-    // Legacy helper kept for backward compatibility
-    pub fn compute_light_vp(
-        sun_dir: Vec3,
-        shadow_center: Vec3,
-        focus_radius: f32,
-        shadow_depth: f32,
-    ) -> Mat4 {
-        let light_dir = sun_dir.normalize();
-        let light_distance = focus_radius + shadow_depth * 0.35;
-        let light_pos = shadow_center + light_dir * light_distance;
-        let up = if light_dir.y.abs() > 0.95 {
-            Vec3::Z
-        } else {
-            Vec3::Y
-        };
-        let view = Mat4::look_at_rh(light_pos, shadow_center, up);
-        let half = focus_radius * 1.05;
-        let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, shadow_depth);
-        proj * view
-    }
 }
 
 // ──────────────────────── Tests ────────────────────────

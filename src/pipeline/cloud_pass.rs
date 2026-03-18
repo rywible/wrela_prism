@@ -31,6 +31,7 @@ struct CloudUniforms {
     screen_params: [f32; 4],  // quarter_w, quarter_h, 1/qw, 1/qh
     cloud_profile: [f32; 4],  // density_scale, cloud_base, cloud_top, detail_erosion
     cloud_profile2: [f32; 4], // wind_speed, march_steps, light_steps, temporal_blend
+    prev_time: [f32; 4],      // prev_elapsed, 0, 0, 0
 }
 
 pub struct CloudPass {
@@ -59,6 +60,7 @@ pub struct CloudPass {
     frame_index: u32,
     frame_count: u32,
     prev_view_proj: Mat4,
+    prev_elapsed: f32,
 }
 
 impl CloudPass {
@@ -181,7 +183,7 @@ impl CloudPass {
                     binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -355,7 +357,7 @@ impl CloudPass {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -459,6 +461,7 @@ impl CloudPass {
             frame_index: 0,
             frame_count: 0,
             prev_view_proj: Mat4::IDENTITY,
+            prev_elapsed: 0.0,
         }
     }
 
@@ -542,8 +545,10 @@ impl CloudPass {
                 profile.light_steps as f32,
                 profile.temporal_blend,
             ],
+            prev_time: [self.prev_elapsed, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.prev_elapsed = elapsed_secs;
     }
 
     /// Encode the cloud march compute + temporal + composite render passes.

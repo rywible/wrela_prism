@@ -53,12 +53,6 @@ pub fn screen_diameter(
     pixel_diameter.max(0.0)
 }
 
-/// Estimate pixel count covered by a bounding sphere (circle approximation).
-pub fn estimated_pixel_count(screen_diam: f32) -> f32 {
-    let r = screen_diam * 0.5;
-    std::f32::consts::PI * r * r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

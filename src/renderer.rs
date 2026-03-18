@@ -33,14 +33,7 @@ impl Renderer {
             .sync_scene_resources(&gpu.device, &gpu.queue, scene);
     }
 
-    pub fn configure_shadow(
-        &mut self,
-        shadow_center: glam::Vec3,
-        shadow_base_radius: f32,
-        shadow_depth: f32,
-    ) {
-        self.pipeline.shadow_center = shadow_center;
-        self.pipeline.shadow_base_radius = shadow_base_radius;
+    pub fn configure_shadow(&mut self, shadow_depth: f32) {
         self.pipeline.shadow_depth = shadow_depth;
     }
 

@@ -69,7 +69,7 @@ struct RuntimeState {
     warmup_remaining: u32,
     debug_overlay: crate::pipeline::DebugOverlay,
     art_direction: ArtDirection,
-    humanoid_animator: Option<crate::humanoid_animator::HumanoidAnimator>,
+    animators: Vec<crate::humanoid_animator::HumanoidAnimator>,
     camera_mode: CameraMode,
     character_pos: glam::Vec3,
     third_person: ThirdPersonState,
@@ -96,11 +96,7 @@ impl RuntimeState {
 
         let gpu = pollster::block_on(GpuContext::new(window.clone()))?;
         let mut renderer = Renderer::new(&gpu);
-        renderer.configure_shadow(
-            stage_config.layout.shadow_center,
-            stage_config.layout.shadow_focus_radius,
-            stage_config.layout.shadow_depth,
-        );
+        renderer.configure_shadow(stage_config.layout.shadow_depth);
 
         // Build scene based on mode.
         let (bark_params, source_scene) = if options.growth_sim {
@@ -179,29 +175,29 @@ impl RuntimeState {
                 label, region.vertex_byte_offset, region.vertex_count
             );
         }
-        let humanoid_animator =
-            if let Some((_, region)) = runtime_scene_gpu.animated_regions.first() {
-                let shadow_idx = runtime_scene_gpu
-                    .animated_shadow_indices
-                    .first()
-                    .map(|(_, idx)| *idx);
-                let params = crate::subjects::humanoid::HumanoidParams::default();
-                info!(
-                    "humanoid animator: region byte_offset={}, vertex_count={}, shadow_idx={:?}",
-                    region.vertex_byte_offset, region.vertex_count, shadow_idx
-                );
-                Some(crate::humanoid_animator::HumanoidAnimator::new(
-                    &params,
-                    crate::runtime_scene::AnimatedRegion {
-                        vertex_byte_offset: region.vertex_byte_offset,
-                        vertex_count: region.vertex_count,
-                    },
-                    shadow_idx,
-                ))
-            } else {
-                info!("no animated regions found — humanoid animator disabled");
-                None
-            };
+        let mut animators = Vec::new();
+        for (i, (label, region)) in runtime_scene_gpu.animated_regions.iter().enumerate() {
+            let shadow_idx = runtime_scene_gpu
+                .animated_shadow_indices
+                .get(i)
+                .map(|(_, idx)| *idx);
+            let params = crate::subjects::humanoid::HumanoidParams::default();
+            info!(
+                "humanoid animator[{i}] '{label}': byte_offset={}, vertex_count={}, shadow_idx={:?}",
+                region.vertex_byte_offset, region.vertex_count, shadow_idx
+            );
+            animators.push(crate::humanoid_animator::HumanoidAnimator::new(
+                &params,
+                crate::runtime_scene::AnimatedRegion {
+                    vertex_byte_offset: region.vertex_byte_offset,
+                    vertex_count: region.vertex_count,
+                },
+                shadow_idx,
+            ));
+        }
+        if animators.is_empty() {
+            info!("no animated regions found — humanoid animator disabled");
+        }
 
         let now = Instant::now();
         info!("wrela_prism initialized — {}x{}", size.width, size.height);
@@ -236,7 +232,7 @@ impl RuntimeState {
             warmup_remaining,
             debug_overlay: crate::pipeline::DebugOverlay::default(),
             art_direction,
-            humanoid_animator,
+            animators,
             camera_mode: if options.third_person {
                 CameraMode::ThirdPerson
             } else {
@@ -368,8 +364,8 @@ impl RuntimeState {
             self.renderer.set_character_model(model);
         }
 
-        // Tick humanoid animation before render
-        if let Some(ref mut animator) = self.humanoid_animator {
+        // Tick all humanoid animators before render
+        for animator in &mut self.animators {
             animator.tick(dt, &self.gpu.queue, &self.runtime_scene_gpu);
         }
 

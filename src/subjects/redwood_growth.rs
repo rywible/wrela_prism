@@ -2,35 +2,7 @@ use glam::{Vec2, Vec3};
 
 use crate::scene::{SdfPrimitive, SdfTree};
 use crate::util::smoothstep;
-
-// ──────────────────────── Inline PRNG ────────────────────────
-
-/// Splitmix64 PRNG — deterministic, no external dependency.
-pub(crate) struct TreeRng {
-    state: u64,
-}
-
-impl TreeRng {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    }
-
-    pub(crate) fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    pub(crate) fn next_f32_range(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + self.next_f32() * (hi - lo)
-    }
-}
+pub(crate) use crate::util::Rng as TreeRng;
 
 // ──────────────────────── Parameters ────────────────────────
 
@@ -63,7 +35,7 @@ impl Default for RedwoodParams {
             tip_radius: 0.20,
             trunk_segments: 120,
             trunk_wobble: 0.07,
-            crown_start_frac: 0.20,
+            crown_start_frac: 0.45,
             branch_count: 120,
             max_branch_depth: 5,
             smooth_k_trunk: 0.30,

@@ -2,7 +2,7 @@ use glam::Affine3A;
 
 use crate::growth::GrowthParams;
 use crate::material::MaterialId;
-use crate::scene::{bounds::Aabb, ParametricDef, SdfTree, Vertex};
+use crate::scene::{ParametricDef, SdfTree, Vertex};
 use crate::soundstage::SoundstageLayout;
 use crate::subjects::humanoid::HumanoidParams;
 use crate::subjects::redwood_growth::RedwoodParams;
@@ -33,16 +33,10 @@ impl Default for SourceTransform {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum SourceBounds {
+    #[default]
     Auto,
-    Explicit(Aabb),
-}
-
-impl Default for SourceBounds {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -54,7 +48,6 @@ pub struct SourceMaterialRef {
 pub enum SourceLodPolicy {
     #[default]
     Auto,
-    ForceMeshlets,
 }
 
 #[derive(Clone, Copy, Debug)]

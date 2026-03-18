@@ -63,17 +63,39 @@ impl Pose {
     }
 
     /// Compute skinning matrices: `world_mat[i] * inverse_bind_mat[i]` for each bone.
-    pub fn evaluate_skinning_matrices(&self, skeleton: &HumanoidSkeleton) -> Vec<Mat4> {
+    ///
+    /// If `inverse_bind_matrices` is provided, uses the cached values.
+    /// Otherwise computes them from scratch (allocates).
+    pub fn evaluate_skinning_matrices(
+        &self,
+        skeleton: &HumanoidSkeleton,
+        inverse_bind_matrices: Option<&[Mat4]>,
+    ) -> Vec<Mat4> {
         let world_matrices = self.evaluate(skeleton);
 
+        if let Some(inv_bind) = inverse_bind_matrices {
+            world_matrices
+                .iter()
+                .zip(inv_bind.iter())
+                .map(|(world, inv)| *world * *inv)
+                .collect()
+        } else {
+            let rest_pose = Pose::identity(skeleton.bones.len());
+            let bind_matrices = rest_pose.evaluate(skeleton);
+
+            world_matrices
+                .iter()
+                .zip(bind_matrices.iter())
+                .map(|(world, bind)| *world * bind.inverse())
+                .collect()
+        }
+    }
+
+    /// Compute the inverse bind matrices for a skeleton (constant, can be cached).
+    pub fn compute_inverse_bind_matrices(skeleton: &HumanoidSkeleton) -> Vec<Mat4> {
         let rest_pose = Pose::identity(skeleton.bones.len());
         let bind_matrices = rest_pose.evaluate(skeleton);
-
-        world_matrices
-            .iter()
-            .zip(bind_matrices.iter())
-            .map(|(world, bind)| *world * bind.inverse())
-            .collect()
+        bind_matrices.iter().map(|m| m.inverse()).collect()
     }
 }
 
@@ -110,7 +132,7 @@ mod tests {
     fn identity_skinning_matrices_are_identity() {
         let skeleton = build_skeleton(&HumanoidParams::default());
         let pose = Pose::identity(BONE_COUNT);
-        let skinning = pose.evaluate_skinning_matrices(&skeleton);
+        let skinning = pose.evaluate_skinning_matrices(&skeleton, None);
         for (i, mat) in skinning.iter().enumerate() {
             let diff = (*mat - Mat4::IDENTITY).col(3).truncate().length();
             assert!(

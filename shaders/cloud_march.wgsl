@@ -4,7 +4,8 @@ const PI: f32 = 3.14159265359;
 const PLANET_RADIUS: f32 = 6360.0;
 const MAX_MARCH: i32 = 96;
 const MAX_LIGHT: i32 = 12;
-const SKY_DEPTH_THRESHOLD: f32 = 0.9995;
+// Reversed-Z: near=1.0, far=0.0. Sky pixels have depth near 0.
+const SKY_DEPTH_THRESHOLD: f32 = 0.0005;
 
 struct CloudUniforms {
     inv_view_proj: mat4x4<f32>,
@@ -17,6 +18,7 @@ struct CloudUniforms {
     screen_params: vec4<f32>,   // (quarter_w, quarter_h, 1/quarter_w, 1/quarter_h)
     cloud_profile: vec4<f32>,   // (density_scale, cloud_base, cloud_top, detail_erosion)
     cloud_profile2: vec4<f32>,  // (wind_speed, march_steps_f32, light_steps_f32, temporal_blend)
+    prev_time: vec4<f32>,       // (prev_elapsed, 0, 0, 0)
 };
 
 @group(0) @binding(0) var<uniform> u: CloudUniforms;
@@ -26,7 +28,7 @@ struct CloudUniforms {
 @group(0) @binding(4) var noise_sampler: sampler;
 @group(0) @binding(5) var history_tex: texture_2d<f32>;
 @group(0) @binding(6) var output_tex: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(7) var depth_tex: texture_2d<f32>;
+@group(0) @binding(7) var depth_tex: texture_depth_2d;
 @group(0) @binding(8) var cloud_depth_tex: texture_storage_2d<r32float, write>;
 @group(0) @binding(9) var sky_view_lut: texture_2d<f32>;
 @group(0) @binding(10) var lut_sampler: sampler;
@@ -179,8 +181,8 @@ fn cloud_march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cloud_top = u.cloud_profile.z;
 
     let res_div = u32(u.sky_ambient.w);
-    let depth_raw = textureLoad(depth_tex, vec2<i32>(gid.xy * res_div), 0).r;
-    if depth_raw < SKY_DEPTH_THRESHOLD {
+    let depth_raw = textureLoad(depth_tex, vec2<i32>(gid.xy * res_div), 0);
+    if depth_raw > SKY_DEPTH_THRESHOLD {
         textureStore(output_tex, gid.xy, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(cloud_depth_tex, gid.xy, vec4<f32>(0.0));
         return;
@@ -188,8 +190,9 @@ fn cloud_march(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(qs);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
-    let near_pt = u.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far_pt  = u.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    // Reversed-Z: z=1 near, z=0 far. Use z=0.01 to avoid w=0 at infinity.
+    let near_pt = u.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far_pt  = u.inv_view_proj * vec4<f32>(ndc, 0.01, 1.0);
     let ray_dir = normalize(far_pt.xyz / far_pt.w - near_pt.xyz / near_pt.w);
 
     let sun_dir = normalize(u.sun_direction.xyz);
@@ -244,7 +247,7 @@ fn cloud_march(@builtin(global_invocation_id) gid: vec3<u32>) {
                         // ── Multi-scatter approximation (Wrenninge 2013) ──
                         // As light penetrates deeper, scattering becomes more isotropic
                         // and the medium glows from within. Three octaves of scatter.
-                        let ms_amount = 0.16;
+                        let ms_amount = 0.28;
                         let ms_atten = 0.30;  // each octave attenuated
                         let ms_phase_atten = 0.50;
                         var ms_contrib = vec3<f32>(0.0);

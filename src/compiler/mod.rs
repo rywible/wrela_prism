@@ -22,9 +22,9 @@ pub struct CompiledChunk {
     pub instance_ids: Vec<RuntimeInstanceId>,
     pub prototype_ids: Vec<RuntimePrototypeId>,
     pub meshlet_set: MeshletSet,
-    /// Vertex range within the chunk's DAG for animated surfaces.
-    /// `(start_vertex_index, vertex_count)` — `None` if no animated surfaces.
-    pub animated_vertex_range: Option<(u32, u32)>,
+    /// Vertex ranges within the chunk's DAG for animated surfaces.
+    /// Each entry: `(label, start_vertex_index, vertex_count)`.
+    pub animated_vertex_ranges: Vec<(String, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,8 +265,8 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
     use crate::runtime_scene::merge_meshlet_dags;
 
     let mut dags = Vec::new();
-    // Track which DAG index corresponds to an animated surface and its vertex count.
-    let mut animated_dag_info: Vec<(usize, u32)> = Vec::new();
+    // Track which DAG index corresponds to an animated surface: (dag_index, vertex_count, label).
+    let mut animated_dag_info: Vec<(usize, u32, String)> = Vec::new();
 
     for instance_id in &chunk.instance_ids {
         let instance = &runtime_scene.instances[instance_id.0 as usize];
@@ -275,7 +275,7 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
             let vertices = surface
                 .vertices
                 .iter()
-                .map(|vertex| transform_vertex(vertex, instance.transform.affine))
+                .map(|vertex| crate::scene::transform_vertex(vertex, instance.transform.affine))
                 .collect::<Vec<_>>();
             let vert_count = vertices.len() as u32;
             let mut dag = build_meshlet_dag(vertices, &surface.indices);
@@ -284,7 +284,7 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
                 for meshlet in &mut dag.meshlets {
                     meshlet.bounds.radius += 0.54;
                 }
-                animated_dag_info.push((dags.len(), vert_count));
+                animated_dag_info.push((dags.len(), vert_count, surface.label.clone()));
             }
             dags.push(dag);
         }
@@ -292,10 +292,11 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
 
     let (merged_dag, vertex_bases) = merge_meshlet_dags(&dags);
 
-    // Compute animated vertex range from the first animated surface's DAG position
-    let animated_vertex_range = animated_dag_info
-        .first()
-        .map(|&(dag_idx, count)| (vertex_bases[dag_idx], count));
+    // Compute animated vertex ranges for ALL animated surfaces
+    let animated_vertex_ranges: Vec<(String, u32, u32)> = animated_dag_info
+        .iter()
+        .map(|(dag_idx, count, label)| (label.clone(), vertex_bases[*dag_idx], *count))
+        .collect();
 
     let meshlet_set = MeshletSet { dag: merged_dag };
 
@@ -305,7 +306,7 @@ fn compile_chunk(chunk: &RuntimeChunk, runtime_scene: &RuntimeScene) -> Compiled
         instance_ids: chunk.instance_ids.clone(),
         prototype_ids: chunk.prototype_ids.clone(),
         meshlet_set,
-        animated_vertex_range,
+        animated_vertex_ranges,
     }
 }
 
@@ -563,23 +564,6 @@ fn assign_chunk(
         chunk_key_to_id.insert(key, chunk_id);
         chunk_id
     }
-}
-
-fn transform_vertex(vertex: &Vertex, transform: glam::Affine3A) -> Vertex {
-    let normal_transform = glam::Mat3::from_cols(
-        transform.matrix3.x_axis.into(),
-        transform.matrix3.y_axis.into(),
-        transform.matrix3.z_axis.into(),
-    );
-    let mut transformed = *vertex;
-    transformed.position = transform
-        .transform_point3(glam::Vec3::from_array(vertex.position))
-        .to_array();
-    transformed.normal = normal_transform
-        .mul_vec3(glam::Vec3::from_array(vertex.normal))
-        .normalize_or_zero()
-        .to_array();
-    transformed
 }
 
 #[cfg(test)]

@@ -122,9 +122,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = height_fog(in.world_position, cam_dist);
     color = mix(color, uniforms.fog_color.rgb * uniforms.sun_color.rgb, fog_factor);
 
-    // Apply scene exposure so the capsule lives in the same brightness range as the
-    // rest of the scene (tonemapping + gamma happen in a later fullscreen pass).
-    color *= uniforms.lighting_params.x;
+    // Exposure is applied once in the tonemap pass — output raw HDR here.
 
     return vec4<f32>(color, 1.0);
 }

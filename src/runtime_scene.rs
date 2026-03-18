@@ -261,14 +261,14 @@ impl RuntimeSceneGpu {
             .filter(|chunk| resident_chunks.contains(&chunk.id))
             .collect();
         for (dag_idx, chunk) in resident_compiled.iter().enumerate() {
-            if let Some((start_in_chunk, count)) = chunk.animated_vertex_range {
+            for (label, start_in_chunk, count) in &chunk.animated_vertex_ranges {
                 let global_start = vertex_bases[dag_idx] + start_in_chunk;
                 let byte_offset = global_start as u64 * std::mem::size_of::<Vertex>() as u64;
                 animated_regions.push((
-                    "humanoid".to_string(),
+                    label.clone(),
                     AnimatedRegion {
                         vertex_byte_offset: byte_offset,
-                        vertex_count: count,
+                        vertex_count: *count,
                     },
                 ));
             }

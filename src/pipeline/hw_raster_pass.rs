@@ -12,6 +12,8 @@ pub struct VisbufFrameUniforms {
     pub screen_size: [f32; 4],
     pub error_threshold: [f32; 4],
     pub frustum_planes: [[f32; 4]; 6],
+    /// HZB occlusion culling params: [enable, mip_count, hzb_width, hzb_height]
+    pub hzb_params: [f32; 4],
 }
 
 /// Max vertices per draw call = MAX_MESHLET_TRIANGLES * 3
@@ -104,9 +106,6 @@ pub struct VisibilityBuffer {
     pub view: wgpu::TextureView,
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
-    /// R32Float copy of depth for SSAO and sun shaft sampling.
-    pub depth_float_texture: wgpu::Texture,
-    pub depth_float_view: wgpu::TextureView,
     /// Storage buffer for SW rasterizer atomic writes.
     pub storage_buffer: wgpu::Buffer,
     pub width: u32,
@@ -152,24 +151,6 @@ impl VisibilityBuffer {
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // R32Float copy for post-processing that needs float-sampled depth
-        let depth_float_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("visibility-depth-float"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        });
-        let depth_float_view =
-            depth_float_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("visibility-storage"),
             size: (width as u64) * (height as u64) * 4,
@@ -182,8 +163,6 @@ impl VisibilityBuffer {
             view,
             depth_texture,
             depth_view,
-            depth_float_texture,
-            depth_float_view,
             storage_buffer,
             width,
             height,
@@ -308,7 +287,7 @@ impl HwRasterPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -422,7 +401,7 @@ impl HwRasterPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &vis_buffer.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,

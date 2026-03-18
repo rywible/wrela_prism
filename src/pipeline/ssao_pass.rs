@@ -81,7 +81,7 @@ impl SsaoPass {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            sample_type: wgpu::TextureSampleType::Depth,
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -138,7 +138,7 @@ impl SsaoPass {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            sample_type: wgpu::TextureSampleType::Depth,
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -219,6 +219,7 @@ impl SsaoPass {
         view: Mat4,
         width: u32,
         height: u32,
+        frame_index: u32,
     ) {
         let inv_proj = projection.inverse();
         let uniforms = SsaoUniforms {
@@ -231,7 +232,7 @@ impl SsaoPass {
                 1.0 / width as f32,
                 1.0 / height as f32,
             ],
-            params: [0.5, 0.025, 1.5, 0.0], // radius, bias, intensity
+            params: [0.5, 0.025, 1.5, frame_index as f32], // radius, bias, intensity, frame_index
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

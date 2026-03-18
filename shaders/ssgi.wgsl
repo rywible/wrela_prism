@@ -10,12 +10,12 @@ struct SsgiUniforms {
     projection: mat4x4<f32>,
     inv_projection: mat4x4<f32>,
     screen_size: vec4<f32>,   // (width, height, 1/width, 1/height)
-    params: vec4<f32>,        // (gi_intensity, radius, 0, 0)
+    params: vec4<f32>,        // (gi_intensity, radius, frame_index, 0)
 };
 
 @group(0) @binding(0) var<uniform> uniforms: SsgiUniforms;
 @group(0) @binding(1) var normal_tex: texture_2d<f32>;
-@group(0) @binding(2) var depth_tex: texture_2d<f32>;
+@group(0) @binding(2) var depth_tex: texture_depth_2d;
 @group(0) @binding(3) var color_tex: texture_2d<f32>;
 @group(0) @binding(4) var output_tex: texture_storage_2d<rgba16float, write>;
 
@@ -59,8 +59,8 @@ fn ssgi_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(pixel) + 0.5) * uniforms.screen_size.zw;
 
     // Read depth and normal
-    let depth = textureLoad(depth_tex, pixel, 0).r;
-    if depth >= 1.0 {
+    let depth = textureLoad(depth_tex, pixel, 0);
+    if depth <= 0.0001 {
         textureStore(output_tex, pixel, vec4<f32>(0.0));
         return;
     }
@@ -74,8 +74,9 @@ fn ssgi_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let gi_radius = uniforms.params.y;
 
-    // Per-pixel rotation angle
-    let rotation = hash_pixel(pixel) * PI * 2.0;
+    // Per-pixel rotation angle + per-frame golden angle offset for TAA accumulation
+    let golden_angle = 2.3999632; // π(3−√5) radians — maximally irrational rotation
+    let rotation = hash_pixel(pixel) * PI * 2.0 + uniforms.params.z * golden_angle;
     let cos_r = cos(rotation);
     let sin_r = sin(rotation);
 
@@ -110,7 +111,7 @@ fn ssgi_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         // Read scene depth at sample position
-        let sample_depth = textureLoad(depth_tex, sample_pixel, 0).r;
+        let sample_depth = textureLoad(depth_tex, sample_pixel, 0);
         let sample_view_pos = view_pos_from_depth(sample_uv, sample_depth);
 
         // Check if sample is close enough (screen-space hit)
@@ -146,7 +147,7 @@ fn ssgi_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @group(0) @binding(0) var<uniform> blur_uniforms: SsgiUniforms;
 @group(0) @binding(1) var blur_normal_tex: texture_2d<f32>;
-@group(0) @binding(2) var blur_depth_tex: texture_2d<f32>;
+@group(0) @binding(2) var blur_depth_tex: texture_depth_2d;
 @group(0) @binding(3) var blur_input_tex: texture_2d<f32>;
 @group(0) @binding(4) var blur_output_tex: texture_storage_2d<rgba16float, write>;
 
@@ -158,11 +159,11 @@ fn ssgi_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let center_depth = textureLoad(blur_depth_tex, pixel, 0).r;
+    let center_depth = textureLoad(blur_depth_tex, pixel, 0);
     let center_normal = textureLoad(blur_normal_tex, pixel, 0).rgb * 2.0 - 1.0;
     let center_color = textureLoad(blur_input_tex, pixel, 0).rgb;
 
-    if center_depth >= 1.0 {
+    if center_depth <= 0.0001 {
         textureStore(blur_output_tex, pixel, vec4<f32>(0.0));
         return;
     }
@@ -182,7 +183,7 @@ fn ssgi_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let np = vec2<u32>(neighbor);
 
-            let n_depth = textureLoad(blur_depth_tex, np, 0).r;
+            let n_depth = textureLoad(blur_depth_tex, np, 0);
             let n_normal = textureLoad(blur_normal_tex, np, 0).rgb * 2.0 - 1.0;
             let n_color = textureLoad(blur_input_tex, np, 0).rgb;
 

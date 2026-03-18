@@ -44,7 +44,7 @@ struct ArtDirectionUniforms {
 
 @group(0) @binding(0) var<uniform> art: ArtDirectionUniforms;
 
-@group(1) @binding(0) var depth_tex: texture_2d<f32>;
+@group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
 @group(1) @binding(2) var outline_sampler: sampler;
 
@@ -82,11 +82,11 @@ fn fs_outline(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(input.position.xy);
 
     // Sample depth in a 3x3 cross pattern
-    let d_c  = textureLoad(depth_tex, pixel, 0).r;
-    let d_l  = textureLoad(depth_tex, pixel + vec2<i32>(-1, 0) * i32(thickness), 0).r;
-    let d_r  = textureLoad(depth_tex, pixel + vec2<i32>( 1, 0) * i32(thickness), 0).r;
-    let d_u  = textureLoad(depth_tex, pixel + vec2<i32>( 0,-1) * i32(thickness), 0).r;
-    let d_d  = textureLoad(depth_tex, pixel + vec2<i32>( 0, 1) * i32(thickness), 0).r;
+    let d_c  = textureLoad(depth_tex, pixel, 0);
+    let d_l  = textureLoad(depth_tex, pixel + vec2<i32>(-1, 0) * i32(thickness), 0);
+    let d_r  = textureLoad(depth_tex, pixel + vec2<i32>( 1, 0) * i32(thickness), 0);
+    let d_u  = textureLoad(depth_tex, pixel + vec2<i32>( 0,-1) * i32(thickness), 0);
+    let d_d  = textureLoad(depth_tex, pixel + vec2<i32>( 0, 1) * i32(thickness), 0);
 
     // Sobel-like depth discontinuity
     let depth_edge = abs(d_l - d_r) + abs(d_u - d_d);
@@ -114,6 +114,12 @@ fn fs_outline(input: FullscreenOutput) -> @location(0) vec4<f32> {
     // Soften outer edge for ink-like falloff
     let ink_edge = smoothstep(0.1, 0.6, edge);
 
+    // Material mask: suppress outlines on foliage (dense geometry creates noise)
+    // normal_tex.a = 0.0 for foliage, 1.0 for other materials
+    let material_mask = textureLoad(normal_tex, pixel, 0).a;
+    // Allow strong outlines on trunk/ground (mask=1), very subtle on foliage (mask=0)
+    let masked_strength = mix(art.outline_strength * 0.15, art.outline_strength, material_mask);
+
     // Output with alpha for blending
-    return vec4<f32>(art.outline_color.rgb, ink_edge * art.outline_strength);
+    return vec4<f32>(art.outline_color.rgb, ink_edge * masked_strength);
 }

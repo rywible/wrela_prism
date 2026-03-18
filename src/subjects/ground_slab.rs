@@ -23,7 +23,7 @@ fn ground_height_sample(x: f32, z: f32, radius: f32) -> f32 {
     let broad = (broad_roll + broad_cross + shallow_swale) * (1.0 - outer_plain * 0.45);
     let micro = mid_ripple * (1.0 - outer_plain * 0.82) + detail * inner_relief;
 
-    broad + micro + radial_relief + buttress_echo - edge_sink * 1.4
+    broad + micro + radial_relief + buttress_echo - edge_sink * 0.8
 }
 
 fn ground_normal_sample(x: f32, z: f32, radius: f32) -> [f32; 3] {

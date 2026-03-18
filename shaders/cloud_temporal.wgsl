@@ -17,6 +17,7 @@ struct CloudUniforms {
     screen_params: vec4<f32>,   // (quarter_w, quarter_h, 1/quarter_w, 1/quarter_h)
     cloud_profile: vec4<f32>,   // (density_scale, cloud_base, cloud_top, detail_erosion)
     cloud_profile2: vec4<f32>,  // (wind_speed, march_steps, light_steps, temporal_blend)
+    prev_time: vec4<f32>,       // (prev_elapsed, 0, 0, 0)
 };
 
 @group(0) @binding(0) var<uniform> u: CloudUniforms;
@@ -64,14 +65,23 @@ fn cloud_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Reproject from cloud hit point — always use cloud distance, not far plane
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(quarter_size);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
-    let near_pt = u.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far_pt = u.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    // Reversed-Z: z=1 near, z=0 far. Use z=0.01 to avoid w=0 at infinity.
+    let near_pt = u.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far_pt = u.inv_view_proj * vec4<f32>(ndc, 0.01, 1.0);
     let ray_origin = near_pt.xyz / near_pt.w;
     let ray_dir = normalize(far_pt.xyz / far_pt.w - ray_origin);
 
     let cloud_dist = textureLoad(cloud_depth_tex, vec2<i32>(gid.xy), 0).r;
     // Cloud march stores distance in atmosphere-space kilometers; convert to scene meters
-    let cloud_point = ray_origin + ray_dir * max(cloud_dist * 1000.0, 1.0);
+    var cloud_point = ray_origin + ray_dir * max(cloud_dist * 1000.0, 1.0);
+
+    // Compensate for wind movement between frames: subtract the wind displacement
+    // so the reprojected point maps to where this cloud parcel was last frame.
+    // Wind direction must match cloud_march.wgsl: vec3(0.0024, 0.0, 0.0010) * speed.
+    let wind_dt = u.cloud_params.z - u.prev_time.x;
+    let wind_speed = u.cloud_profile2.x;
+    let wind_dir = vec3<f32>(0.0024, 0.0, 0.0010);
+    cloud_point -= wind_dir * wind_speed * wind_dt;
 
     let prev_clip = u.prev_view_proj * vec4<f32>(cloud_point, 1.0);
     let prev_ndc = prev_clip.xy / prev_clip.w;

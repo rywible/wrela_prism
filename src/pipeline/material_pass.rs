@@ -128,12 +128,12 @@ impl MaterialPass {
                         },
                         count: None,
                     },
-                    // Depth buffer (R32Float, for contact shadows)
+                    // Depth buffer (Depth32Float, for contact shadows)
                     wgpu::BindGroupLayoutEntry {
                         binding: 7,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            sample_type: wgpu::TextureSampleType::Depth,
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -287,7 +287,7 @@ impl MaterialPass {
         bark_albedo_rough_view: &wgpu::TextureView,
         bark_normal_ao_view: &wgpu::TextureView,
         bark_height_view: &wgpu::TextureView,
-        depth_float_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
         sky_lut: &SkyLutPass,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -324,7 +324,7 @@ impl MaterialPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(depth_float_view),
+                    resource: wgpu::BindingResource::TextureView(depth_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,

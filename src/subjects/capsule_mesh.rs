@@ -202,13 +202,13 @@ pub fn build_capsule_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-/// Normalize a 3-component vector and return as `[f32; 3]`.
 fn norm3(x: f32, y: f32, z: f32) -> [f32; 3] {
-    let len = (x * x + y * y + z * z).sqrt();
+    let v = glam::Vec3::new(x, y, z);
+    let len = v.length();
     if len < 1e-8 {
         [0.0, 1.0, 0.0]
     } else {
-        [x / len, y / len, z / len]
+        (v / len).to_array()
     }
 }
 

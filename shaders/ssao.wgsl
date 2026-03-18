@@ -5,7 +5,7 @@ struct SsaoUniforms {
     view: mat4x4<f32>,
     inv_projection: mat4x4<f32>,
     screen_size: vec4<f32>,     // width, height, 1/width, 1/height
-    params: vec4<f32>,          // radius, bias, intensity, 0
+    params: vec4<f32>,          // radius, bias, intensity, frame_index
 };
 
 @group(0) @binding(0)
@@ -15,15 +15,34 @@ var<uniform> u: SsaoUniforms;
 var gbuffer1_tex: texture_2d<f32>;
 
 @group(0) @binding(2)
-var depth_tex: texture_2d<f32>;
+var depth_tex: texture_depth_2d;
 
 @group(0) @binding(3)
 var ao_out: texture_storage_2d<r32float, write>;
 
-// Precomputed hemisphere kernel (16 samples: 8 tight + 8 wide)
-const KERNEL_SIZE: u32 = 16u;
-const KERNEL: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
-    // 8 tight-radius samples
+// Precomputed hemisphere kernel (32 samples: 8 fine + 8 medium + 8 tight + 8 wide)
+// Hammersley distribution with cosine weighting for even hemisphere coverage.
+const KERNEL_SIZE: u32 = 32u;
+const KERNEL: array<vec3<f32>, 32> = array<vec3<f32>, 32>(
+    // 8 fine-radius samples (0.01-0.04) — captures micro-occlusion
+    vec3(0.012, 0.028, 0.010),
+    vec3(-0.018, 0.032, 0.014),
+    vec3(0.025, 0.020, -0.015),
+    vec3(-0.010, 0.035, -0.012),
+    vec3(0.022, 0.018, 0.020),
+    vec3(-0.015, 0.030, -0.018),
+    vec3(0.008, 0.038, 0.012),
+    vec3(-0.020, 0.025, 0.016),
+    // 8 medium-radius samples (0.10-0.20) — mid-range occlusion
+    vec3(0.10, 0.14, 0.08),
+    vec3(-0.12, 0.16, 0.10),
+    vec3(0.15, 0.10, -0.12),
+    vec3(-0.08, 0.18, -0.10),
+    vec3(0.11, 0.13, 0.14),
+    vec3(-0.14, 0.12, -0.11),
+    vec3(0.06, 0.19, 0.08),
+    vec3(-0.10, 0.15, 0.12),
+    // 8 tight-radius samples (original)
     vec3(0.04, 0.08, 0.04),
     vec3(-0.06, 0.05, 0.08),
     vec3(0.08, 0.03, -0.06),
@@ -32,7 +51,7 @@ const KERNEL: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
     vec3(-0.07, 0.06, -0.05),
     vec3(0.02, 0.12, 0.03),
     vec3(-0.04, 0.09, 0.06),
-    // 8 wide-radius samples
+    // 8 wide-radius samples (original)
     vec3(0.20, 0.35, 0.15),
     vec3(-0.25, 0.30, 0.22),
     vec3(0.30, 0.20, -0.18),
@@ -69,10 +88,10 @@ fn ssao_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let coord = vec2<i32>(gid.xy);
-    let depth = textureLoad(depth_tex, coord, 0).r;
+    let depth = textureLoad(depth_tex, coord, 0);
 
-    // Skip sky pixels
-    if depth >= 0.9999 {
+    // Skip sky pixels (reversed-Z: sky is near 0)
+    if depth <= 0.0001 {
         textureStore(ao_out, coord, vec4(1.0));
         return;
     }
@@ -86,8 +105,9 @@ fn ssao_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bias = u.params.y;
     let intensity = u.params.z;
 
-    // Per-pixel random rotation angle
-    let angle = hash_pixel(gid.xy) * 6.2831853;
+    // Per-pixel random rotation angle + per-frame golden angle offset for TAA accumulation
+    let golden_angle = 2.3999632; // π(3−√5) radians — maximally irrational rotation
+    let angle = hash_pixel(gid.xy) * 6.2831853 + u.params.w * golden_angle;
     let cos_a = cos(angle);
     let sin_a = sin(angle);
 
@@ -116,7 +136,7 @@ fn ssao_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
 
-        let sample_depth = textureLoad(depth_tex, sample_pixel, 0).r;
+        let sample_depth = textureLoad(depth_tex, sample_pixel, 0);
         let sample_view = reconstruct_view_pos(sample_pixel, sample_depth);
 
         // Range check and occlusion
@@ -138,7 +158,7 @@ var<uniform> blur_u: SsaoUniforms;
 var gbuffer1_blur: texture_2d<f32>;
 
 @group(0) @binding(2)
-var depth_blur: texture_2d<f32>;
+var depth_blur: texture_depth_2d;
 
 @group(0) @binding(3)
 var raw_ao_tex: texture_2d<f32>;
@@ -155,7 +175,7 @@ fn ssao_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let coord = vec2<i32>(gid.xy);
-    let center_depth = textureLoad(depth_blur, coord, 0).r;
+    let center_depth = textureLoad(depth_blur, coord, 0);
     let center_g1 = textureLoad(gbuffer1_blur, coord, 0);
     let center_normal = decode_world_normal(center_g1.xyz);
 
@@ -171,7 +191,7 @@ fn ssao_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             let sample_ao = textureLoad(raw_ao_tex, sample_coord, 0).r;
-            let sample_depth = textureLoad(depth_blur, sample_coord, 0).r;
+            let sample_depth = textureLoad(depth_blur, sample_coord, 0);
             let sample_g1 = textureLoad(gbuffer1_blur, sample_coord, 0);
             let sample_normal = decode_world_normal(sample_g1.xyz);
 

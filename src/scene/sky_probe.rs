@@ -22,6 +22,7 @@ const NUM_SAMPLES: usize = 12;
 const NUM_LIGHT_SAMPLES: usize = 6;
 
 /// 6-face ambient probe computed from atmospheric scattering.
+#[derive(Clone, Copy)]
 pub struct SkyProbe {
     pub up: Vec3,
     pub down: Vec3,
@@ -255,6 +256,80 @@ pub fn compute_sky_probe(settings: &SceneSettings, ambient_intensity: f32) -> Sk
         left: radiances[3],
         front: radiances[4],
         back: radiances[5],
+    }
+}
+
+/// Cache key for sky probe dirty-tracking. All fields that affect the probe result.
+#[derive(Clone, Copy)]
+struct CacheKey {
+    sun_dir: [f32; 3],
+    rayleigh: f32,
+    mie: f32,
+    mie_aniso: f32,
+    cloud_coverage: f32,
+    ambient_intensity: f32,
+}
+
+impl CacheKey {
+    fn from_settings(settings: &SceneSettings) -> Self {
+        let sd = settings.sun_direction.normalize();
+        Self {
+            sun_dir: [sd.x, sd.y, sd.z],
+            rayleigh: settings.rayleigh_strength,
+            mie: settings.mie_strength,
+            mie_aniso: settings.mie_anisotropy,
+            cloud_coverage: settings.cloud_coverage,
+            ambient_intensity: settings.ambient_intensity,
+        }
+    }
+
+    fn matches(&self, other: &CacheKey) -> bool {
+        const EPS: f32 = 1e-5;
+        (self.sun_dir[0] - other.sun_dir[0]).abs() < EPS
+            && (self.sun_dir[1] - other.sun_dir[1]).abs() < EPS
+            && (self.sun_dir[2] - other.sun_dir[2]).abs() < EPS
+            && (self.rayleigh - other.rayleigh).abs() < EPS
+            && (self.mie - other.mie).abs() < EPS
+            && (self.mie_aniso - other.mie_aniso).abs() < EPS
+            // Wider epsilon: small coverage changes produce negligible probe shifts
+            && (self.cloud_coverage - other.cloud_coverage).abs() < 0.001
+            && (self.ambient_intensity - other.ambient_intensity).abs() < EPS
+    }
+}
+
+/// Caches `SkyProbe` and only recomputes when atmosphere parameters change.
+pub struct SkyProbeCache {
+    last_key: Option<CacheKey>,
+    cached: SkyProbe,
+}
+
+impl SkyProbeCache {
+    pub fn new() -> Self {
+        Self {
+            last_key: None,
+            cached: SkyProbe {
+                up: Vec3::splat(0.1),
+                down: Vec3::splat(0.08),
+                right: Vec3::splat(0.09),
+                left: Vec3::splat(0.09),
+                front: Vec3::splat(0.09),
+                back: Vec3::splat(0.09),
+            },
+        }
+    }
+
+    /// Returns the cached probe if parameters haven't changed, otherwise recomputes.
+    pub fn get_or_compute(&mut self, settings: &SceneSettings) -> &SkyProbe {
+        let key = CacheKey::from_settings(settings);
+        let needs_recompute = match &self.last_key {
+            Some(last) => !last.matches(&key),
+            None => true,
+        };
+        if needs_recompute {
+            self.cached = compute_sky_probe(settings, settings.ambient_intensity);
+            self.last_key = Some(key);
+        }
+        &self.cached
     }
 }
 

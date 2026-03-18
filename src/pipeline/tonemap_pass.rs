@@ -1,9 +1,11 @@
 use crate::gpu::GpuContext;
 
+// Mirrors TonemapUniforms in shaders/tonemap.wgsl
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TonemapUniforms {
     screen_size: [f32; 4],
+    // x = elapsed_secs, y = manual_exposure, z = prev_auto_exposure, w = dt
     time_params: [f32; 4],
     color_grade: [f32; 4], // xyz = tint, w = strength (0 = no grading)
 }
@@ -177,11 +179,17 @@ impl TonemapPass {
         width: u32,
         height: u32,
         elapsed_secs: f32,
+        manual_exposure: f32,
+        dt: f32,
         color_grade: [f32; 4],
     ) {
+        // prev_auto_exposure is anchored at 1.0 — the shader applies a gentle per-frame
+        // adaptation via EMA. Without GPU readback, we can't feed the result back, so
+        // the auto-exposure adapts within each frame relative to neutral (1.0).
+        let prev_auto_exposure = 1.0_f32;
         let uniforms = TonemapUniforms {
             screen_size: [width as f32, height as f32, 0.0, 0.0],
-            time_params: [elapsed_secs, 0.0, 0.0, 0.0],
+            time_params: [elapsed_secs, manual_exposure, prev_auto_exposure, dt],
             color_grade,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

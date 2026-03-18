@@ -173,7 +173,7 @@ impl CameraState {
             aspect: aspect.max(0.001),
             fov_y_radians: bookmark.fov_y_degrees.to_radians(),
             near_plane: 0.1,
-            far_plane: 3000.0,
+            far_plane: 500.0,
             navigation: CameraNavigationConfig::default(),
         };
         camera.enforce_constraints();
@@ -266,11 +266,15 @@ impl CameraState {
     }
 
     pub fn projection_matrix(&self) -> Mat4 {
-        Mat4::perspective_rh(
-            self.fov_y_radians,
-            self.aspect.max(0.001),
-            self.near_plane,
-            self.far_plane,
+        // Reversed-Z infinite perspective: near maps to z=1, far maps to z=0.
+        // Dramatically better depth precision at distance compared to standard [0,1].
+        let f = 1.0 / (self.fov_y_radians * 0.5).tan();
+        let aspect = self.aspect.max(0.001);
+        Mat4::from_cols(
+            glam::Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+            glam::Vec4::new(0.0, f, 0.0, 0.0),
+            glam::Vec4::new(0.0, 0.0, 0.0, -1.0),
+            glam::Vec4::new(0.0, 0.0, self.near_plane, 0.0),
         )
     }
 
