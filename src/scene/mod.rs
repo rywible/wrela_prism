@@ -253,6 +253,26 @@ impl Default for CloudProfile {
     }
 }
 
+/// Area light types for LTC-based evaluation.
+#[derive(Clone, Debug)]
+pub enum AreaLight {
+    /// Spherical area light.
+    Sphere {
+        position: Vec3,
+        radius: f32,
+        color: Vec3,
+        intensity: f32,
+    },
+    /// Tube (capsule) area light.
+    Tube {
+        start: Vec3,
+        end: Vec3,
+        radius: f32,
+        color: Vec3,
+        intensity: f32,
+    },
+}
+
 /// Scene-wide lighting and environment settings.
 pub struct SceneSettings {
     pub sun_direction: Vec3,
@@ -296,6 +316,9 @@ pub struct SceneSettings {
     pub dof_enabled: bool,
     pub motion_blur_enabled: bool,
     pub fxaa_enabled: bool,
+    pub area_lights: Vec<AreaLight>,
+    pub ca_strength: f32,
+    pub film_grain_strength: f32,
 }
 
 /// Wind settings for foliage animation.

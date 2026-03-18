@@ -82,6 +82,9 @@ pub fn hero() -> SoundstageConfig {
             dof_enabled: false,
             motion_blur_enabled: false,
             fxaa_enabled: false,
+            area_lights: Vec::new(),
+            ca_strength: 0.0,
+            film_grain_strength: 0.0,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -151,6 +154,9 @@ pub fn low_angle() -> SoundstageConfig {
             dof_enabled: false,
             motion_blur_enabled: false,
             fxaa_enabled: false,
+            area_lights: Vec::new(),
+            ca_strength: 0.0,
+            film_grain_strength: 0.0,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -220,6 +226,9 @@ pub fn silhouette() -> SoundstageConfig {
             dof_enabled: false,
             motion_blur_enabled: false,
             fxaa_enabled: false,
+            area_lights: Vec::new(),
+            ca_strength: 0.0,
+            film_grain_strength: 0.0,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {
@@ -289,6 +298,9 @@ pub fn neutral_debug() -> SoundstageConfig {
             dof_enabled: false,
             motion_blur_enabled: false,
             fxaa_enabled: false,
+            area_lights: Vec::new(),
+            ca_strength: 0.0,
+            film_grain_strength: 0.0,
         },
         layout: stage_layout(),
         camera_bookmark: CameraBookmark {

@@ -1,3 +1,4 @@
+use super::area_light_pass::AreaLightPass;
 use super::hw_raster_pass::VisibilityBuffer;
 use super::ibl_pass::IblPass;
 use super::sky_lut_pass::SkyLutPass;
@@ -45,6 +46,17 @@ impl MaterialPass {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Area lights uniform buffer
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -286,6 +298,7 @@ impl MaterialPass {
         device: &wgpu::Device,
         lighting_uniform_buffer: &wgpu::Buffer,
         bark_uniform_buffer: &wgpu::Buffer,
+        area_light_pass: &AreaLightPass,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material-frame-bg"),
@@ -298,6 +311,10 @@ impl MaterialPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: bark_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: area_light_pass.light_buffer.as_entire_binding(),
                 },
             ],
         })

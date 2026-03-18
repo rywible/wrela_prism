@@ -5,6 +5,7 @@ use crate::runtime_scene::RuntimeSceneGpu;
 use crate::scene::shadow::{compute_all_cascade_vps, ShadowMap};
 use crate::scene::{LightingUniforms, SceneSettings};
 
+use super::area_light_pass::AreaLightPass;
 use super::bloom_pass::BloomPass;
 use super::cloud_pass::CloudPass;
 use super::cull_pass::CullPass;
@@ -26,6 +27,7 @@ use super::shadow_pass::ShadowPass;
 use super::sky_lut_pass::SkyLutPass;
 use super::sky_pass::SkyPass;
 use super::ssgi_pass::SsgiPass;
+use super::ssr_pass::SsrPass;
 use super::sun_shaft_pass::SunShaftPass;
 use super::sw_raster_pass::SwRasterPass;
 use super::taa_pass::TaaPass;
@@ -54,6 +56,8 @@ pub struct VisbufPipeline {
     pub sky_pass: SkyPass,
     pub cloud_pass: CloudPass,
     pub ssgi_pass: Option<SsgiPass>,
+    pub ssr_pass: Option<SsrPass>,
+    pub area_light_pass: AreaLightPass,
     pub gtao_pass: Option<GtaoPass>,
     pub sun_shaft_pass: SunShaftPass,
     pub outline_pass: OutlinePass,
@@ -169,6 +173,8 @@ impl VisbufPipeline {
         let volumetric_fog_pass = VolumetricFogPass::new(&gpu.device);
         let cloud_pass = CloudPass::new(&gpu.device, gpu.width(), gpu.height());
         let ssgi_pass = Some(SsgiPass::new(&gpu.device, gpu.width(), gpu.height()));
+        let ssr_pass = Some(SsrPass::new(&gpu.device, gpu.width(), gpu.height()));
+        let area_light_pass = AreaLightPass::new(&gpu.device, &gpu.queue);
         let gtao_pass = Some(GtaoPass::new(&gpu.device, gpu.width(), gpu.height()));
         let sun_shaft_pass = SunShaftPass::new(gpu);
         let bloom_pass = Some(BloomPass::new(&gpu.device, gpu.width(), gpu.height()));
@@ -264,6 +270,7 @@ impl VisbufPipeline {
             &gpu.device,
             &lighting_uniform_buffer,
             &bark_uniform_buffer,
+            &area_light_pass,
         ));
 
         let sky_bg = Some(sky_pass.create_bind_group(
@@ -296,6 +303,8 @@ impl VisbufPipeline {
             sky_pass,
             cloud_pass,
             ssgi_pass,
+            ssr_pass,
+            area_light_pass,
             gtao_pass,
             sun_shaft_pass,
             outline_pass,
@@ -460,6 +469,9 @@ impl VisbufPipeline {
         if let Some(ssgi) = &mut self.ssgi_pass {
             ssgi.resize(&gpu.device, gpu.width(), gpu.height());
         }
+        if let Some(ssr) = &mut self.ssr_pass {
+            ssr.resize(&gpu.device, gpu.width(), gpu.height());
+        }
         if let Some(gtao) = &mut self.gtao_pass {
             gtao.resize(&gpu.device, gpu.width(), gpu.height());
         }
@@ -619,6 +631,10 @@ impl VisbufPipeline {
             0,
             bytemuck::bytes_of(&lighting),
         );
+
+        // Update area lights
+        self.area_light_pass
+            .update_lights(&gpu.queue, &settings.area_lights);
 
         // Shadow uniforms
         self.shadow_pass.write_uniforms(&gpu.queue, &cascade_vps);
@@ -913,6 +929,30 @@ impl VisbufPipeline {
             }
         }
 
+        // -- Pass 5.65: SSR (screen-space reflections) --
+        if let Some(ssr) = &self.ssr_pass {
+            let view = camera.view_matrix();
+            let projection = camera.projection_matrix();
+            ssr.write_uniforms(
+                &gpu.queue,
+                view,
+                projection,
+                gpu.width(),
+                gpu.height(),
+                self.frame_index,
+            );
+            if let Some(hzb_view) = &self.hzb_pass.hzb_views.first() {
+                ssr.execute(
+                    &gpu.device,
+                    &mut encoder,
+                    &self.material_pass.normal_view,
+                    &self.vis_buffer.depth_view,
+                    &self.scene_color.view,
+                    hzb_view,
+                );
+            }
+        }
+
         // -- Pass 6: GTAO (horizon-based AO with bent normals) --
         if let Some(gtao) = &self.gtao_pass {
             let projection = camera.projection_matrix();
@@ -1070,6 +1110,8 @@ impl VisbufPipeline {
                 settings.exposure,
                 dt,
                 self.art_direction_color_grade,
+                settings.ca_strength,
+                settings.film_grain_strength,
             );
         }
 
@@ -1156,6 +1198,8 @@ impl VisbufPipeline {
             self.last_manual_exposure,
             self.last_dt,
             self.art_direction_color_grade,
+            0.0, // no CA for captures
+            0.0, // no film grain for captures
         );
         gpu.queue.submit([encoder.finish()]);
 

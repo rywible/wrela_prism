@@ -46,6 +46,20 @@ struct BarkParams {
 };
 @group(0) @binding(1) var<uniform> bark: BarkParams;
 
+// Area light data
+struct GpuAreaLight {
+    pos_radius: vec4<f32>,   // xyz = position/start, w = radius
+    color_type: vec4<f32>,   // xyz = color*intensity, w = type (0=sphere, 1=tube)
+    end_unused: vec4<f32>,   // xyz = end pos (tube), w = unused
+    _pad: vec4<f32>,
+};
+
+struct AreaLightUniforms {
+    params: vec4<f32>,       // x = light_count, yzw = reserved
+    lights: array<GpuAreaLight, 16>,
+};
+@group(0) @binding(2) var<uniform> area_lights: AreaLightUniforms;
+
 struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
     nor_x: f32, nor_y: f32, nor_z: f32,
@@ -636,6 +650,100 @@ fn ibl_specular(N: vec3<f32>, V: vec3<f32>, roughness: f32, F0: vec3<f32>) -> ve
     return prefiltered * (F0 * env_brdf.x + env_brdf.y);
 }
 
+// -- Area Light Evaluation (LTC-approximated) --
+
+/// Evaluate contribution from all area lights at a shading point.
+/// Uses a simplified representative-point technique for sphere and tube lights.
+fn evaluate_area_lights(
+    world_pos: vec3<f32>,
+    N: vec3<f32>,
+    V: vec3<f32>,
+    roughness: f32,
+    F0: vec3<f32>,
+    albedo: vec3<f32>,
+) -> vec3<f32> {
+    let light_count = u32(area_lights.params.x);
+    if light_count == 0u {
+        return vec3<f32>(0.0);
+    }
+
+    var total = vec3<f32>(0.0);
+
+    for (var i = 0u; i < light_count; i++) {
+        let light = area_lights.lights[i];
+        let light_color = light.color_type.xyz;
+        let light_type = light.color_type.w;
+        let light_radius = light.pos_radius.w;
+
+        var L: vec3<f32>;
+        var dist: f32;
+
+        if light_type < 0.5 {
+            // Sphere light — representative point: closest point on sphere surface
+            let light_pos = light.pos_radius.xyz;
+            let to_light = light_pos - world_pos;
+            let center_dist = length(to_light);
+            let L_center = to_light / max(center_dist, 0.001);
+
+            // Representative point technique (Karis 2013):
+            // Shift L toward the reflection direction for specular
+            let R = reflect(-V, N);
+            let closest_on_ray = dot(to_light, R) * R;
+            let center_to_ray = closest_on_ray - to_light;
+            let closest_pt = to_light + center_to_ray * clamp(light_radius / max(length(center_to_ray), 0.001), 0.0, 1.0);
+            L = normalize(closest_pt);
+            dist = max(length(closest_pt), 0.001);
+        } else {
+            // Tube light — closest point on line segment
+            let seg_start = light.pos_radius.xyz;
+            let seg_end = light.end_unused.xyz;
+            let seg = seg_end - seg_start;
+            let seg_len = max(length(seg), 0.001);
+            let seg_dir = seg / seg_len;
+
+            let to_start = world_pos - seg_start;
+            let t = clamp(dot(to_start, seg_dir) / seg_len, 0.0, 1.0);
+            let closest_on_seg = seg_start + seg * t;
+            let to_light = closest_on_seg - world_pos;
+            dist = max(length(to_light), 0.001);
+            L = to_light / dist;
+
+            // Representative point shift for tube specular
+            let R = reflect(-V, N);
+            let r_proj = dot(to_light, R);
+            if r_proj > 0.0 {
+                let shift = normalize(R * r_proj - to_light);
+                let rep_pt = to_light + shift * min(light_radius, dist);
+                let rep_dist = max(length(rep_pt), 0.001);
+                L = rep_pt / rep_dist;
+                dist = rep_dist;
+            }
+        }
+
+        let NdotL = max(dot(N, L), 0.0);
+        if NdotL <= 0.0 { continue; }
+
+        // Attenuation: inverse square with radius-based normalization
+        let normalization = 1.0 / max(dist * dist, light_radius * light_radius);
+        let attenuation = normalization;
+
+        // Diffuse contribution
+        let kD = (1.0 - 0.0) * albedo / PI; // metallic = 0 for most surfaces
+        let diffuse = kD * NdotL * light_color * attenuation;
+
+        // Specular contribution (GGX with modified roughness for area lights)
+        // Widen the lobe based on light solid angle
+        let solid_angle = (light_radius / max(dist, 0.01));
+        let mod_roughness = clamp(roughness + solid_angle * 0.5, 0.0, 1.0);
+        let spec = specular_brdf(N, V, L, mod_roughness, F0);
+        let specular = spec * NdotL * light_color * attenuation;
+
+        total += diffuse + specular;
+    }
+
+    return total;
+}
+
 // -- Parallax Occlusion Mapping --
 
 fn parallax_occlusion_map(
@@ -1085,8 +1193,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         // IBL specular: image-based environment reflections (subtle on bark)
         let bark_ibl = ibl_specular(lighting_normal, view_dir, bark_roughness, bark_f0) * bark_ao;
 
+        // Area lights (LTC-approximated)
+        let bark_area = evaluate_area_lights(world_pos, lighting_normal, view_dir, bark_roughness, bark_f0, bark_color);
+
         color = bark_color * (bark_ambient + (diffuse_term + wrap_fill) * cavity_shadow)
-            + apply_specular_flatten(specular_term + sheen_term + bark_ibl, art.specular_flattening) + edge_sss;
+            + apply_specular_flatten(specular_term + sheen_term + bark_ibl, art.specular_flattening) + edge_sss + bark_area;
         final_normal = perturbed_normal;
     } else {
         // === Standard PBR pipeline (foliage + ground) ===
@@ -1197,8 +1308,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         let under_canopy = smoothstep(canopy_top, canopy_top - 12.0, world_pos.y);
         let canopy_scatter = vec3<f32>(0.012, 0.020, 0.008) * under_canopy * sun_energy;
 
+        // Area lights (LTC-approximated)
+        let pbr_area = evaluate_area_lights(world_pos, normal, view_dir, roughness, f0, base_color);
+
         // Compose lighting
-        color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra) * ground_darken
+        color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra + pbr_area) * ground_darken
               + (ground_bounce + canopy_scatter) * ao;
 
         // Foliage minimum floor: prevent complete shadow crush in dense canopy.

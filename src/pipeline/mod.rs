@@ -1,3 +1,4 @@
+pub mod area_light_pass;
 pub mod bloom_pass;
 pub mod cloud_pass;
 pub mod cull_pass;
@@ -18,6 +19,7 @@ pub mod sky_lut_pass;
 pub mod sky_pass;
 pub mod ssao_pass;
 pub mod ssgi_pass;
+pub mod ssr_pass;
 pub mod sun_shaft_pass;
 pub mod sw_raster_pass;
 pub mod taa_pass;
