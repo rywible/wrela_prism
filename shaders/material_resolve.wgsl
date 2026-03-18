@@ -88,6 +88,13 @@ struct MeshletDescriptor {
 @group(2) @binding(8) var sky_view_lut: texture_2d<f32>;
 @group(2) @binding(9) var sky_lut_sampler: sampler;
 
+// IBL: Prefiltered environment cubemap (specular reflections)
+@group(2) @binding(10) var env_cubemap: texture_cube<f32>;
+// IBL: Split-sum BRDF LUT (Rg16Float, parameterized by NdotV x roughness)
+@group(2) @binding(11) var brdf_lut: texture_2d<f32>;
+// IBL: Cubemap sampler (trilinear, ClampToEdge)
+@group(2) @binding(12) var cubemap_sampler: sampler;
+
 // -- Art Direction Uniforms (bind group 3) --
 
 struct ArtDirectionUniforms {
@@ -619,6 +626,16 @@ fn specular_brdf(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32, F0: v
     return D * G * F;
 }
 
+// IBL specular from prefiltered environment map + BRDF LUT (split-sum approximation).
+fn ibl_specular(N: vec3<f32>, V: vec3<f32>, roughness: f32, F0: vec3<f32>) -> vec3<f32> {
+    let NdotV = max(dot(N, V), 0.0);
+    let R = reflect(-V, N);
+    let max_mip = f32(textureNumLevels(env_cubemap) - 1u);
+    let prefiltered = textureSampleLevel(env_cubemap, cubemap_sampler, R, roughness * max_mip).rgb;
+    let env_brdf = textureSampleLevel(brdf_lut, cubemap_sampler, vec2<f32>(NdotV, roughness), 0.0).rg;
+    return prefiltered * (F0 * env_brdf.x + env_brdf.y);
+}
+
 // -- Parallax Occlusion Mapping --
 
 fn parallax_occlusion_map(
@@ -1061,8 +1078,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         // Ambient with strong AO — deep darks in crevices
         let bark_ambient = six_face_ambient(perturbed_normal) * bark_ao * bark_ao * 1.18;
 
+        // IBL specular: image-based environment reflections (subtle on bark)
+        let bark_ibl = ibl_specular(lighting_normal, view_dir, bark_roughness, bark_f0) * bark_ao;
+
         color = bark_color * (bark_ambient + (diffuse_term + wrap_fill) * cavity_shadow)
-            + apply_specular_flatten(specular_term + sheen_term, art.specular_flattening) + edge_sss;
+            + apply_specular_flatten(specular_term + sheen_term + bark_ibl, art.specular_flattening) + edge_sss;
         final_normal = perturbed_normal;
     } else {
         // === Standard PBR pipeline (foliage + ground) ===
@@ -1097,8 +1117,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
 
         // Specular: Cook-Torrance GGX (art direction can flatten)
         let spec = specular_brdf(normal, view_dir, sun_dir, roughness, f0);
+        let ibl_spec = ibl_specular(normal, view_dir, roughness, f0) * ao;
         let specular = apply_specular_flatten(
-            spec * NdotL * sun_color * sun_energy * shadow,
+            spec * NdotL * sun_color * sun_energy * shadow + ibl_spec,
             art.specular_flattening
         );
 

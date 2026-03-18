@@ -14,6 +14,7 @@ use super::hw_raster_pass::{
     extract_frustum_planes, DispatchLists, HwRasterPass, VisbufFrameUniforms, VisibilityBuffer,
 };
 use super::hzb_pass::HzbPass;
+use super::ibl_pass::IblPass;
 use super::material_pass::MaterialPass;
 use super::noise_textures::NoiseTextures;
 use super::outline_pass::OutlinePass;
@@ -42,6 +43,7 @@ pub struct VisbufPipeline {
 
     // Existing passes (kept)
     pub shadow_pass: ShadowPass,
+    pub ibl_pass: IblPass,
     pub sky_lut_pass: SkyLutPass,
     pub sky_pass: SkyPass,
     pub cloud_pass: CloudPass,
@@ -143,6 +145,7 @@ impl VisbufPipeline {
 
         let sky_pass = SkyPass::new(&gpu.device);
         let sky_lut_pass = SkyLutPass::new(&gpu.device);
+        let ibl_pass = IblPass::new(&gpu.device);
         let noise_textures = NoiseTextures::new(&gpu.device);
         let cloud_pass = CloudPass::new(&gpu.device, gpu.width(), gpu.height());
         let ssgi_pass = Some(SsgiPass::new(&gpu.device, gpu.width(), gpu.height()));
@@ -263,6 +266,7 @@ impl VisbufPipeline {
             material_pass,
             hzb_pass,
             shadow_pass,
+            ibl_pass,
             sky_lut_pass,
             sky_pass,
             cloud_pass,
@@ -383,6 +387,7 @@ impl VisbufPipeline {
             bark_height_view,
             &self.vis_buffer.depth_view,
             &self.sky_lut_pass,
+            &self.ibl_pass,
         ));
         // Sky bind group depends on vis_buffer + LUTs
         self.sky_bg = Some(self.sky_pass.create_bind_group(
@@ -488,6 +493,16 @@ impl VisbufPipeline {
             settings.mie_anisotropy,
         );
         self.sky_lut_pass.generate_if_dirty(&gpu.device, &gpu.queue);
+
+        // Generate BRDF LUT (one-time) and update IBL cubemap (dirty-tracked)
+        self.ibl_pass.ensure_brdf_lut(&gpu.device, &gpu.queue);
+        self.ibl_pass.update_cubemap(
+            &gpu.device,
+            &gpu.queue,
+            &self.sky_lut_pass.sky_view_view,
+            &self.sky_lut_pass.lut_sampler,
+            settings,
+        );
 
         let frame = gpu.surface.get_current_texture()?;
 

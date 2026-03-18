@@ -1,4 +1,5 @@
 use super::hw_raster_pass::VisibilityBuffer;
+use super::ibl_pass::IblPass;
 use super::sky_lut_pass::SkyLutPass;
 use super::HDR_FORMAT;
 use crate::scene::shadow::ShadowMap;
@@ -157,6 +158,35 @@ impl MaterialPass {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // Prefiltered environment cubemap (IBL specular)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::Cube,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // BRDF LUT (IBL split-sum)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // IBL cubemap sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 12,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -289,6 +319,7 @@ impl MaterialPass {
         bark_height_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         sky_lut: &SkyLutPass,
+        ibl: &IblPass,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material-vis-bg"),
@@ -333,6 +364,18 @@ impl MaterialPass {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::Sampler(&self.sky_lut_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(ibl.env_cubemap_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(ibl.brdf_lut_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Sampler(ibl.cubemap_sampler()),
                 },
             ],
         })

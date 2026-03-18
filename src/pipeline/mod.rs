@@ -5,6 +5,7 @@ pub mod forward_character;
 pub mod gtao_pass;
 pub mod hw_raster_pass;
 pub mod hzb_pass;
+pub mod ibl_pass;
 pub mod material_pass;
 pub mod noise_textures;
 pub mod outline_pass;
