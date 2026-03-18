@@ -34,6 +34,15 @@ use super::taa_pass::TaaPass;
 use super::tonemap_pass::TonemapPass;
 use super::volumetric_fog_pass::VolumetricFogPass;
 use super::HDR_FORMAT;
+
+#[derive(Clone, Copy, Default)]
+enum HdrStage {
+    #[default]
+    Raw,
+    AfterDof,
+    AfterMotionBlur,
+}
+
 struct SceneColorTarget {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -123,9 +132,8 @@ pub struct VisbufPipeline {
     last_manual_exposure: f32,
     last_dt: f32,
     last_elapsed: f32,
-    /// Which HDR source was actually fed to tonemap last frame:
-    /// 0 = tonemap_source() (TAA/raw), 1 = DoF output, 2 = motion blur output
-    last_hdr_source_stage: u8,
+    /// Which HDR source was actually fed to tonemap last frame.
+    last_hdr_source_stage: HdrStage,
 
     // Sky probe cache — avoids recomputing 1,872 optical depth evaluations when params unchanged
     sky_probe_cache: crate::scene::sky_probe::SkyProbeCache,
@@ -348,7 +356,7 @@ impl VisbufPipeline {
             last_manual_exposure: 1.0,
             last_dt: 0.0,
             last_elapsed: 0.0,
-            last_hdr_source_stage: 0,
+            last_hdr_source_stage: HdrStage::Raw,
             sky_probe_cache: crate::scene::sky_probe::SkyProbeCache::new(),
             hzb_ready: false,
             frame_index: 0,
@@ -1064,12 +1072,12 @@ impl VisbufPipeline {
         }
 
         // Resolve final HDR source for tonemap
-        let hdr_stage: u8 = if mb_active {
-            2
+        let hdr_stage = if mb_active {
+            HdrStage::AfterMotionBlur
         } else if dof_active {
-            1
+            HdrStage::AfterDof
         } else {
-            0
+            HdrStage::Raw
         };
 
         let frame_view = frame
@@ -1092,9 +1100,9 @@ impl VisbufPipeline {
         // Scope to consume `final_hdr_source` borrow before mutating self fields
         {
             let final_hdr_source = match hdr_stage {
-                2 => self.motion_blur_pass.as_ref().unwrap().output_view(),
-                1 => self.dof_pass.as_ref().unwrap().output_view(),
-                _ => self.tonemap_source(),
+                HdrStage::AfterMotionBlur => self.motion_blur_pass.as_ref().unwrap().output_view(),
+                HdrStage::AfterDof => self.dof_pass.as_ref().unwrap().output_view(),
+                HdrStage::Raw => self.tonemap_source(),
             };
 
             self.tonemap_pass.encode(
@@ -1218,17 +1226,17 @@ impl VisbufPipeline {
     /// DoF and motion blur being active).
     fn last_tonemap_hdr_source(&self) -> &wgpu::TextureView {
         match self.last_hdr_source_stage {
-            2 => self
+            HdrStage::AfterMotionBlur => self
                 .motion_blur_pass
                 .as_ref()
                 .map(|mb| mb.output_view())
                 .unwrap_or_else(|| self.tonemap_source()),
-            1 => self
+            HdrStage::AfterDof => self
                 .dof_pass
                 .as_ref()
                 .map(|dof| dof.output_view())
                 .unwrap_or_else(|| self.tonemap_source()),
-            _ => self.tonemap_source(),
+            HdrStage::Raw => self.tonemap_source(),
         }
     }
 }

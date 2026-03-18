@@ -32,7 +32,7 @@ pub struct AreaLightPass {
     pub ltc_lut_view: wgpu::TextureView,
     pub ltc_amp_texture: wgpu::Texture,
     pub ltc_amp_view: wgpu::TextureView,
-    pub light_buffer: wgpu::Buffer,
+    light_buffer: wgpu::Buffer,
     pub light_count: u32,
 }
 
@@ -194,6 +194,11 @@ impl AreaLightPass {
         };
 
         queue.write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Returns the GPU uniform buffer containing packed area light data.
+    pub fn uniform_buffer(&self) -> &wgpu::Buffer {
+        &self.light_buffer
     }
 }
 

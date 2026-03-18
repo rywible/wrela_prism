@@ -13,7 +13,7 @@ use super::HDR_FORMAT;
 
 /// Froxel grid dimensions.
 const FROXEL_W: u32 = 160;
-const FROXEL_H: u32 = 90;
+const FROXEL_H: u32 = 88;
 const FROXEL_D: u32 = 128;
 
 // ─── Uniform layouts ───

@@ -1,6 +1,6 @@
 // Froxel volumetric fog — injection pass (compute).
 //
-// For each froxel voxel in a 160x90x128 3D grid:
+// For each froxel voxel in a 160x88x128 3D grid:
 // 1. Compute world position via inverse exponential depth
 // 2. Evaluate density with height falloff
 // 3. Sample shadow map for sun visibility

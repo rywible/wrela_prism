@@ -314,7 +314,7 @@ impl MaterialPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_light_pass.light_buffer.as_entire_binding(),
+                    resource: area_light_pass.uniform_buffer().as_entire_binding(),
                 },
             ],
         })
