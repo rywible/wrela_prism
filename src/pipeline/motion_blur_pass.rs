@@ -77,7 +77,7 @@ impl MotionBlurPass {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rg16Float,
+                        format: wgpu::TextureFormat::Rg32Float,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -307,7 +307,7 @@ fn create_tile_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rg16Float,
+        format: wgpu::TextureFormat::Rg32Float,
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });

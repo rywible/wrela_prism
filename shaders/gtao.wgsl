@@ -28,7 +28,7 @@ var gbuffer1_tex: texture_2d<f32>;
 var depth_tex: texture_depth_2d;
 
 @group(0) @binding(3)
-var ao_out: texture_storage_2d<r16float, write>;
+var ao_out: texture_storage_2d<r32float, write>;
 
 @group(0) @binding(4)
 var bent_normal_out: texture_storage_2d<rgba16float, write>;
@@ -234,7 +234,7 @@ var raw_ao_tex: texture_2d<f32>;
 var raw_bent_normal_tex: texture_2d<f32>;
 
 @group(0) @binding(5)
-var blurred_ao_out: texture_storage_2d<r16float, write>;
+var blurred_ao_out: texture_storage_2d<r32float, write>;
 
 @group(0) @binding(6)
 var blurred_bent_normal_out: texture_storage_2d<rgba16float, write>;

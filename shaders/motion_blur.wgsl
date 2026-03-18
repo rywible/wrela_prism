@@ -13,7 +13,7 @@ struct MotionBlurUniforms {
 
 @group(0) @binding(0) var<uniform> tile_uniforms: MotionBlurUniforms;
 @group(0) @binding(1) var motion_tex: texture_2d<f32>;
-@group(0) @binding(2) var tile_max_out: texture_storage_2d<rg16float, write>;
+@group(0) @binding(2) var tile_max_out: texture_storage_2d<rg32float, write>;
 
 @compute @workgroup_size(8, 8)
 fn tile_max(@builtin(global_invocation_id) gid: vec3<u32>) {

@@ -1,6 +1,6 @@
 use super::hw_raster_pass::DispatchLists;
 use crate::meshlet::GpuMeshletBuffers;
-#[cfg(feature = "cpu_dag_cut")]
+
 use crate::meshlet::MeshletDag;
 
 /// CPU-side adaptive DAG traversal + GPU per-meshlet culling.
@@ -186,7 +186,7 @@ impl CullPass {
     ///
     /// Retained for debugging/validation. The default code path now uses
     /// `DagTraversePass` for GPU-driven DAG traversal.
-    #[cfg(feature = "cpu_dag_cut")]
+    
     pub fn cpu_dag_cut_adaptive(
         &self,
         queue: &wgpu::Queue,
@@ -275,7 +275,7 @@ impl CullPass {
 
     /// Create the dispatch bind group for phase 1 culling.
     /// Binds hw/sw dispatch lists, group queue, HZB, and phase2 reject buffers.
-    #[cfg(feature = "cpu_dag_cut")]
+    
     pub fn create_dispatch_bind_group(
         &self,
         device: &wgpu::Device,
@@ -478,7 +478,7 @@ impl CullPass {
     }
 
     /// Encode phase 1 cull pass (uses prev-frame HZB).
-    #[cfg(feature = "cpu_dag_cut")]
+    
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,

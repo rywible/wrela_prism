@@ -1,6 +1,6 @@
 // Split-sum BRDF integration LUT (compute shader).
 //
-// Generates a 256x256 Rg16Float texture parameterized by (NdotV, roughness).
+// Generates a 256x256 Rgba16Float texture parameterized by (NdotV, roughness).
 // Each texel integrates the GGX BRDF over the hemisphere using importance sampling,
 // outputting scale (r) and bias (g) for the Fresnel-weighted specular term:
 //   specular = prefiltered * (F0 * scale + bias)
@@ -8,7 +8,7 @@
 const PI: f32 = 3.14159265359;
 const SAMPLE_COUNT: u32 = 1024u;
 
-@group(0) @binding(0) var output_lut: texture_storage_2d<rg16float, write>;
+@group(0) @binding(0) var output_lut: texture_storage_2d<rgba16float, write>;
 
 // Radical inverse (Van der Corput sequence) for Hammersley sampling.
 fn radical_inverse_vdc(bits_in: u32) -> f32 {

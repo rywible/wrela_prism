@@ -397,13 +397,11 @@ impl VisbufPipeline {
             .hzb_full_view
             .as_ref()
             .expect("HZB not initialized");
-        // GPU-driven mode: cull pass reads from DAG traverse output buffers
-        self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group_gpu_driven(
+        // CPU DAG cut mode: cull pass reads from its own group_queue_buffer
+        self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
             device,
             &self.dispatch_lists,
             hzb_view,
-            self.dag_traverse.output_queue_buffer(),
-            self.dag_traverse.output_count_buffer(),
         ));
         self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
             device,
@@ -522,12 +520,10 @@ impl VisbufPipeline {
                     .hzb_full_view
                     .as_ref()
                     .expect("HZB not initialized");
-                self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group_gpu_driven(
+                self.dispatch_bg = Some(self.cull_pass.create_dispatch_bind_group(
                     &gpu.device,
                     &self.dispatch_lists,
                     hzb_view,
-                    self.dag_traverse.output_queue_buffer(),
-                    self.dag_traverse.output_count_buffer(),
                 ));
                 self.phase2_dispatch_bg = Some(self.cull_pass.create_phase2_dispatch_bind_group(
                     &gpu.device,
@@ -695,26 +691,33 @@ impl VisbufPipeline {
         // Phase 2: Re-test HZB-rejected meshlets against fresh HZB → raster
         // Final HZB build (for next frame's phase 1)
 
-        // -- Phase 1: GPU DAG traversal + GPU per-meshlet cull --
+        // -- Phase 1: CPU DAG cut + GPU per-meshlet cull --
         self.vis_buffer.clear(&mut encoder);
         self.dispatch_lists.clear(&mut encoder);
         self.cull_pass.clear_phase2(&mut encoder);
 
-        // GPU DAG traversal: seed work queue with roots, then dispatch
-        self.dag_traverse.seed_work_queue(&gpu.queue);
-        if let Some(dag_bg) = &self.dag_bg {
-            self.dag_traverse
-                .encode(&mut encoder, &self.frame_bg, dag_bg);
-        }
+        // CPU DAG cut: traverse DAG on CPU, upload selected groups to GPU.
+        // TODO: GPU DAG traversal (dag_traverse_pass) produces correct sky/ground
+        // but misses tree geometry — needs debugging of error projection in
+        // dag_traverse.wgsl before it can replace the CPU path.
+        let fov_factor = visbuf_uniforms.error_threshold[1];
+        let error_threshold_px = visbuf_uniforms.error_threshold[0];
+        let group_count = self.cull_pass.cpu_dag_cut_adaptive(
+            &gpu.queue,
+            &scene.dag,
+            cam_pos,
+            gpu.height() as f32,
+            fov_factor,
+            error_threshold_px,
+        );
 
-        // Cull pass now reads GPU-produced group queue via indirect dispatch
         if let (Some(cull_bg), Some(dispatch_bg)) = (&self.cull_bg, &self.dispatch_bg) {
-            self.cull_pass.encode_indirect(
+            self.cull_pass.encode(
                 &mut encoder,
                 &self.frame_bg,
                 cull_bg,
                 dispatch_bg,
-                self.dag_traverse.indirect_args_buffer(),
+                group_count,
             );
         }
 

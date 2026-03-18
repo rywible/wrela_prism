@@ -75,7 +75,12 @@ fn fs_fog_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
     let inscatter = fog.rgb;
     let transmittance = fog.a;
 
+    // Sanitize: clamp to valid range and handle NaN by coercing to safe defaults.
+    // On some GPUs, uninitialized storage textures can produce NaN/denorms.
+    let s = clamp(inscatter, vec3<f32>(0.0), vec3<f32>(100.0));
+    let t = clamp(transmittance, 0.0, 1.0);
+
     // output.rgb = inscatter (pre-multiplied), output.a = transmittance
     // The blend state will compute: scene_color * transmittance + inscatter
-    return vec4<f32>(inscatter, transmittance);
+    return vec4<f32>(s, t);
 }

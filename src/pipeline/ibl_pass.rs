@@ -1,7 +1,7 @@
 //! Image-Based Lighting (IBL) pass — specular environment map pipeline.
 //!
 //! Three stages:
-//! 1. **BRDF LUT** (one-time): 256x256 Rg16Float split-sum integration table.
+//! 1. **BRDF LUT** (one-time): 256x256 Rgba16Float split-sum integration table.
 //! 2. **Sky cubemap** (per-dirty): Render atmospheric sky into 6-face cubemap from sky-view LUT.
 //! 3. **Prefiltered environment map**: GGX importance-sample blur per mip level.
 //!
@@ -38,8 +38,19 @@ pub struct IblPass {
     // Textures
     _brdf_lut_texture: wgpu::Texture,
     brdf_lut_view: wgpu::TextureView,
+    /// Prefiltered environment cubemap (all MIP_LEVELS), written by prefilter passes,
+    /// read by the material shader. STORAGE_BINDING | TEXTURE_BINDING.
     env_cubemap: wgpu::Texture,
     env_cubemap_view: wgpu::TextureView,
+    /// Sky-rendered mip-0 source cubemap (TEXTURE_BINDING only). Prefilter passes
+    /// read from this to avoid a read-write conflict with env_cubemap.
+    env_cubemap_src_tex: wgpu::Texture,
+    env_cubemap_src_view: wgpu::TextureView,
+    /// Tiny 1x1 cubemap used as a dummy binding-3 source during sky_to_cubemap
+    /// to avoid a read-write conflict on env_cubemap (the shader doesn't read
+    /// it during that entry point, but the bind group still declares it).
+    _dummy_cubemap: wgpu::Texture,
+    dummy_cubemap_view: wgpu::TextureView,
     cubemap_sampler: wgpu::Sampler,
     brdf_lut_sampler: wgpu::Sampler,
 
@@ -66,7 +77,8 @@ pub struct IblPass {
 
 impl IblPass {
     pub fn new(device: &wgpu::Device) -> Self {
-        // -- BRDF LUT texture (Rg16Float, 256x256) --
+        // -- BRDF LUT texture (Rgba16Float, 256x256 — only .rg used, but Rg16Float
+        //    lacks STORAGE_BINDING support on many GPUs) --
         let brdf_lut_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ibl-brdf-lut"),
             size: wgpu::Extent3d {
@@ -77,7 +89,7 @@ impl IblPass {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg16Float,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -100,6 +112,51 @@ impl IblPass {
         });
         let env_cubemap_view = env_cubemap.create_view(&wgpu::TextureViewDescriptor {
             label: Some("ibl-env-cubemap-view"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+
+        // -- Sky-rendered mip-0 source cubemap (TEXTURE_BINDING only).
+        //    sky_to_cubemap writes into this; prefilter_mip reads from this to
+        //    avoid a read-write conflict with env_cubemap. --
+        let env_cubemap_src = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ibl-env-cubemap-src"),
+            size: wgpu::Extent3d {
+                width: CUBEMAP_SIZE,
+                height: CUBEMAP_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let env_cubemap_src_view = env_cubemap_src.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("ibl-env-cubemap-src-view"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+
+        // -- Dummy 1×1 cubemap (used at binding 3 during sky_to_cubemap to avoid
+        //    read-write conflict with env_cubemap_src; the shader never reads it there) --
+        let dummy_cubemap = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ibl-dummy-cubemap"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_cubemap_view = dummy_cubemap.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("ibl-dummy-cubemap-view"),
             dimension: Some(wgpu::TextureViewDimension::Cube),
             ..Default::default()
         });
@@ -133,7 +190,7 @@ impl IblPass {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rg16Float,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -270,6 +327,10 @@ impl IblPass {
             brdf_lut_view,
             env_cubemap,
             env_cubemap_view,
+            env_cubemap_src_tex: env_cubemap_src,
+            env_cubemap_src_view,
+            _dummy_cubemap: dummy_cubemap,
+            dummy_cubemap_view,
             cubemap_sampler,
             brdf_lut_sampler,
             brdf_lut_pipeline,
@@ -349,114 +410,123 @@ impl IblPass {
         self.last_mie = settings.mie_strength;
         self.last_mie_anisotropy = settings.mie_anisotropy;
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ibl-cubemap-encoder"),
-        });
+        // Helper: build the PrefilterParams for a given face/mip.
+        let make_params = |face: u32, mip_level: u32, face_size: u32| PrefilterParams {
+            face,
+            mip_level,
+            face_size,
+            max_mip: MIP_LEVELS - 1,
+            sun_direction: [sun.x, sun.y, sun.z, 0.0],
+            sun_color: [
+                settings.sun_color.x,
+                settings.sun_color.y,
+                settings.sun_color.z,
+                settings.sun_strength,
+            ],
+            fog_color: [
+                settings.fog_color.x,
+                settings.fog_color.y,
+                settings.fog_color.z,
+                1.0,
+            ],
+            sky_zenith: [
+                settings.sky_zenith.x,
+                settings.sky_zenith.y,
+                settings.sky_zenith.z,
+                1.0,
+            ],
+            sky_horizon: [
+                settings.sky_horizon.x,
+                settings.sky_horizon.y,
+                settings.sky_horizon.z,
+                1.0,
+            ],
+            atmosphere_params: [
+                settings.rayleigh_strength,
+                settings.mie_strength,
+                settings.mie_anisotropy,
+                settings.cloud_coverage,
+            ],
+        };
 
-        // Stage 1: Render sky into cubemap mip 0 (6 faces)
-        for face in 0..6u32 {
-            let face_view = self.env_cubemap.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("ibl-cubemap-face-mip0"),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: face,
-                array_layer_count: Some(1),
-                base_mip_level: 0,
-                mip_level_count: Some(1),
-                ..Default::default()
+        // Stage 1: Render sky into env_cubemap_src (mip 0, 6 faces).
+        // We write to env_cubemap_src (a separate texture from env_cubemap) so that
+        // Stage 2 can read from env_cubemap_src without any read-write conflicts.
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ibl-sky-to-src-encoder"),
             });
 
-            let params = PrefilterParams {
-                face,
-                mip_level: 0,
-                face_size: CUBEMAP_SIZE,
-                max_mip: MIP_LEVELS - 1,
-                sun_direction: [sun.x, sun.y, sun.z, 0.0],
-                sun_color: [
-                    settings.sun_color.x,
-                    settings.sun_color.y,
-                    settings.sun_color.z,
-                    settings.sun_strength,
-                ],
-                fog_color: [
-                    settings.fog_color.x,
-                    settings.fog_color.y,
-                    settings.fog_color.z,
-                    1.0,
-                ],
-                sky_zenith: [
-                    settings.sky_zenith.x,
-                    settings.sky_zenith.y,
-                    settings.sky_zenith.z,
-                    1.0,
-                ],
-                sky_horizon: [
-                    settings.sky_horizon.x,
-                    settings.sky_horizon.y,
-                    settings.sky_horizon.z,
-                    1.0,
-                ],
-                atmosphere_params: [
-                    settings.rayleigh_strength,
-                    settings.mie_strength,
-                    settings.mie_anisotropy,
-                    settings.cloud_coverage,
-                ],
-            };
-            queue.write_buffer(
-                &self.prefilter_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&params),
-            );
-
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ibl-sky-to-cubemap-bg"),
-                layout: &self.prefilter_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.prefilter_uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(sky_view_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(sky_lut_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.env_cubemap_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::Sampler(&self.cubemap_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&face_view),
-                    },
-                ],
-            });
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("ibl-sky-to-cubemap-pass"),
-                    timestamp_writes: None,
+            for face in 0..6u32 {
+                let face_view = self.env_cubemap_src_tex.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("ibl-cubemap-src-face-mip0"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: face,
+                    array_layer_count: Some(1),
+                    base_mip_level: 0,
+                    mip_level_count: Some(1),
+                    ..Default::default()
                 });
-                pass.set_pipeline(&self.sky_to_cubemap_pipeline);
-                pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(CUBEMAP_SIZE.div_ceil(8), CUBEMAP_SIZE.div_ceil(8), 1);
+
+                let params = make_params(face, 0, CUBEMAP_SIZE);
+                queue.write_buffer(
+                    &self.prefilter_uniform_buffer,
+                    0,
+                    bytemuck::bytes_of(&params),
+                );
+
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ibl-sky-to-src-bg"),
+                    layout: &self.prefilter_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.prefilter_uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(sky_view_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sky_lut_sampler),
+                        },
+                        // Binding 3: dummy — sky_to_cubemap doesn't sample env_cubemap_src.
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.dummy_cubemap_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.cubemap_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&face_view),
+                        },
+                    ],
+                });
+
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ibl-sky-to-src-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.sky_to_cubemap_pipeline);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(CUBEMAP_SIZE.div_ceil(8), CUBEMAP_SIZE.div_ceil(8), 1);
+                }
             }
+
+            // Submit so env_cubemap_src mip 0 is ready for the prefilter passes.
+            queue.submit([encoder.finish()]);
         }
 
-        // Submit the sky-to-cubemap pass so mip 0 is available for reading
-        queue.submit([encoder.finish()]);
-
-        // Stage 2: Prefilter mips 1..MIP_LEVELS
-        // Each mip reads from the full cubemap (all mips available via trilinear)
-        // and writes to a single face of the target mip.
-        for mip in 1..MIP_LEVELS {
+        // Stage 2: Prefilter all mips (0..MIP_LEVELS) of env_cubemap.
+        // Reads from env_cubemap_src (separate texture — no conflict).
+        // Mip 0: roughness = 0 → essentially a pass-through of the sky data.
+        // Mips 1+: progressively rougher GGX convolution.
+        for mip in 0..MIP_LEVELS {
             let mip_size = (CUBEMAP_SIZE >> mip).max(1);
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -474,43 +544,7 @@ impl IblPass {
                     ..Default::default()
                 });
 
-                let params = PrefilterParams {
-                    face,
-                    mip_level: mip,
-                    face_size: mip_size,
-                    max_mip: MIP_LEVELS - 1,
-                    sun_direction: [sun.x, sun.y, sun.z, 0.0],
-                    sun_color: [
-                        settings.sun_color.x,
-                        settings.sun_color.y,
-                        settings.sun_color.z,
-                        settings.sun_strength,
-                    ],
-                    fog_color: [
-                        settings.fog_color.x,
-                        settings.fog_color.y,
-                        settings.fog_color.z,
-                        1.0,
-                    ],
-                    sky_zenith: [
-                        settings.sky_zenith.x,
-                        settings.sky_zenith.y,
-                        settings.sky_zenith.z,
-                        1.0,
-                    ],
-                    sky_horizon: [
-                        settings.sky_horizon.x,
-                        settings.sky_horizon.y,
-                        settings.sky_horizon.z,
-                        1.0,
-                    ],
-                    atmosphere_params: [
-                        settings.rayleigh_strength,
-                        settings.mie_strength,
-                        settings.mie_anisotropy,
-                        settings.cloud_coverage,
-                    ],
-                };
+                let params = make_params(face, mip, mip_size);
                 queue.write_buffer(
                     &self.prefilter_uniform_buffer,
                     0,
@@ -533,9 +567,13 @@ impl IblPass {
                             binding: 2,
                             resource: wgpu::BindingResource::Sampler(sky_lut_sampler),
                         },
+                        // Binding 3: env_cubemap_src — separate from the write target
+                        // env_cubemap, so no read-write conflict in the same dispatch.
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&self.env_cubemap_view),
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.env_cubemap_src_view,
+                            ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
@@ -568,7 +606,7 @@ impl IblPass {
         &self.env_cubemap_view
     }
 
-    /// BRDF LUT view (2D, Rg16Float).
+    /// BRDF LUT view (2D, Rgba16Float — only .rg channels used).
     pub fn brdf_lut_view(&self) -> &wgpu::TextureView {
         &self.brdf_lut_view
     }

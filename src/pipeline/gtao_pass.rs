@@ -106,7 +106,7 @@ impl GtaoPass {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::R16Float,
+                            format: wgpu::TextureFormat::R32Float,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
@@ -196,7 +196,7 @@ impl GtaoPass {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::R16Float,
+                            format: wgpu::TextureFormat::R32Float,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
@@ -423,7 +423,7 @@ fn create_ao_texture(device: &wgpu::Device, width: u32, height: u32, label: &str
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R16Float,
+        format: wgpu::TextureFormat::R32Float,
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     })

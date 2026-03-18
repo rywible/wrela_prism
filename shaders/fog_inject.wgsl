@@ -59,12 +59,14 @@ fn froxel_to_world(coord: vec3<f32>) -> vec3<f32> {
     // Exponential depth from slice
     let depth = slice_to_depth(coord.z + 0.5);
 
-    // Reconstruct view ray via inverse VP
+    // Reconstruct view ray via inverse VP.
+    // Use two points with non-degenerate w (z=1 near, z=0.5 mid) to avoid
+    // division by zero at z=0 (infinity in reversed-Z).
     let near_clip = u.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let far_clip = u.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let mid_clip = u.inv_view_proj * vec4<f32>(ndc, 0.5, 1.0);
     let near_world = near_clip.xyz / near_clip.w;
-    let far_world = far_clip.xyz / far_clip.w;
-    let ray_dir = normalize(far_world - near_world);
+    let mid_world = mid_clip.xyz / mid_clip.w;
+    let ray_dir = normalize(mid_world - near_world);
     let cam_pos = u.camera_position.xyz;
 
     // Place at the given depth along the ray
@@ -141,7 +143,9 @@ fn fog_inject(@builtin(global_invocation_id) gid: vec3<u32>) {
     let albedo = u.fog_albedo.rgb;
     let anisotropy = u.fog_params.z;
     let sun_dir = normalize(u.sun_direction.xyz);
-    let view_dir = normalize(world_pos - u.camera_position.xyz);
+    let to_frag = world_pos - u.camera_position.xyz;
+    let frag_dist = length(to_frag);
+    let view_dir = select(vec3<f32>(0.0, 0.0, 1.0), to_frag / frag_dist, frag_dist > 0.001);
     let cos_theta = dot(view_dir, sun_dir);
 
     // Phase function

@@ -12,7 +12,7 @@ struct DofUniforms {
 @group(0) @binding(0) var<uniform> uniforms: DofUniforms;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var hdr_tex: texture_2d<f32>;
-@group(0) @binding(3) var coc_tex: texture_storage_2d<r16float, write>;
+@group(0) @binding(3) var coc_tex: texture_storage_2d<r32float, write>;
 
 // Linearize reversed-Z depth (near=1, far~=0) to view-space distance.
 fn linearize_depth(d: f32) -> f32 {

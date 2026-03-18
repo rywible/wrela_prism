@@ -216,17 +216,5 @@ fn ssr_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(output_tex, pixel, vec4<f32>(reflection_color * weight, weight));
 }
 
-// Composite pass: additively blend SSR reflections onto scene color
-@compute @workgroup_size(8, 8)
-fn ssr_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pixel = gid.xy;
-    let screen = vec2<u32>(u32(uniforms.screen_size.x), u32(uniforms.screen_size.y));
-    if pixel.x >= screen.x || pixel.y >= screen.y {
-        return;
-    }
-
-    let reflection = textureLoad(output_tex, pixel);
-    // Reflection is pre-multiplied by weight in alpha
-    // We just add it to scene_color (done externally via additive blend render pass)
-    // This shader is the trace-only path; composite is done via render pass.
-}
+// Composite is handled by a separate fullscreen render pass (shaders/ssr_composite.wgsl)
+// using additive blending onto scene_color.

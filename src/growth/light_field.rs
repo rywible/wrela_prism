@@ -68,7 +68,7 @@ impl LightFieldGpu {
         let max_capsules = 16384u32;
         let max_queries = 8192u32;
 
-        // 3D textures: density and light (R16Float, 128³).
+        // 3D textures: density and light (R32Float, 128³).
         let tex_desc = |label| wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -79,7 +79,7 @@ impl LightFieldGpu {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R16Float,
+            format: wgpu::TextureFormat::R32Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         };
@@ -163,7 +163,7 @@ impl LightFieldGpu {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R16Float,
+                        format: wgpu::TextureFormat::R32Float,
                         view_dimension: wgpu::TextureViewDimension::D3,
                     },
                     count: None,
@@ -202,7 +202,7 @@ impl LightFieldGpu {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R16Float,
+                        format: wgpu::TextureFormat::R32Float,
                         view_dimension: wgpu::TextureViewDimension::D3,
                     },
                     count: None,
