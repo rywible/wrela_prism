@@ -1237,22 +1237,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         color += base_emissive * emissive_intensity;
     }
 
-    // -- Aerial perspective from shared atmosphere model --
-    // Height fog provides the distance-based opacity curve.
-    // The inscatter color comes from the same sky LUT as the sky pass.
-    // Lift sub-horizon directions gradually so distant ground converges toward
-    // lower-sky haze instead of a hard horizon-color band.
-    let fog_factor = height_fog(world_pos, cam_dist, material);
-    let fog_dir = normalize(world_pos - camera_pos);
-    var aerial = sample_aerial_sky(fog_dir);
-    if material == MATERIAL_GROUND {
-        // Distant ground converges toward horizon sky color for smooth transition.
-        // Lift the fog direction upward with distance so ground blends to horizon.
-        let dist_t = smoothstep(100.0, 600.0, cam_dist);
-        let lifted_dir = normalize(fog_dir + vec3<f32>(0.0, dist_t * 0.12, 0.0));
-        aerial = sample_aerial_sky(lifted_dir) + vec3<f32>(0.10, 0.08, 0.05);
-    }
-    color = mix(color, aerial, fog_factor);
+    // -- Aerial perspective (disabled: froxel volumetric fog handles this now) --
+    // Legacy height_fog() is preserved but gated off. Froxel composite pass
+    // applies per-pixel inscatter + transmittance after the material resolve.
 
     // Exposure is applied once in the tonemap pass — output raw HDR here.
 
