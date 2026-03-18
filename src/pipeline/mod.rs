@@ -66,6 +66,10 @@ pub(crate) fn storage_entry(
     }
 }
 
+pub(crate) fn pack_screen_size(width: u32, height: u32) -> [f32; 4] {
+    [width as f32, height as f32, 1.0 / width as f32, 1.0 / height as f32]
+}
+
 pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,

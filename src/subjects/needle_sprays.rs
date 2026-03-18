@@ -5,7 +5,7 @@
 /// into the meshlet DAG builder.
 use glam::Vec3;
 
-use crate::scene::{pack_semantic_channels, Vertex, MATERIAL_FOLIAGE};
+use crate::scene::{pack_foliage_channels, Vertex, MATERIAL_FOLIAGE};
 use crate::subjects::redwood_growth::{RedwoodParams, TreeRng};
 
 /// Build needle spray geometry from anchor points.
@@ -89,7 +89,7 @@ pub fn build_needle_sprays(
 
                 // Fully opaque (alpha=1.0, emissive=0.0) — alpha-test
                 // infrastructure is ready for future shaped foliage cards
-                let channels = pack_semantic_channels(1.0, 0.0);
+                let channels = pack_foliage_channels(1.0, 0.0);
 
                 for (corner, uv) in corners.iter().zip(uvs.iter()) {
                     verts.push(Vertex {

@@ -581,23 +581,6 @@ fn sky_fill_visibility() -> f32 {
     return mix(1.0, 1.22, cloud_cover);
 }
 
-fn sample_aerial_sky(dir: vec3<f32>) -> vec3<f32> {
-    let sun_dir = normalize(uniforms.sun_direction.xyz);
-    let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
-    let zenith_t = pow(smoothstep(-0.08, 0.58, dir.y), 0.55);
-    let horizon_t = smoothstep(-0.10, 0.18, dir.y);
-    let scattering = sample_sky_lut(dir) * mix(1.10, 0.98, cloud_cover);
-    let lower_haze = lower_atmosphere_haze(dir, sun_dir);
-    let lower_grade = mix(
-        uniforms.fog_color.rgb * vec3<f32>(0.28, 0.28, 0.22) + uniforms.sun_color.rgb * vec3<f32>(0.08, 0.06, 0.03),
-        uniforms.sky_horizon.rgb * 0.14 + uniforms.sun_color.rgb * vec3<f32>(0.05, 0.04, 0.03),
-        horizon_t
-    );
-    let upper_grade = mix(uniforms.sky_horizon.rgb * 0.06, uniforms.sky_zenith.rgb * 0.14, zenith_t);
-    let grade = mix(lower_grade, upper_grade, smoothstep(-0.02, 0.60, dir.y));
-    return scattering + grade + lower_haze;
-}
-
 // -- PBR Functions --
 
 // GGX Normal Distribution Function
@@ -896,38 +879,6 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
     ground = mix(ground, vec3<f32>(0.36, 0.28, 0.18), far_plain * 0.24);
 
     return ground;
-}
-
-// -- Height fog with per-material attenuation --
-// DISABLED: Froxel volumetric fog (fog_composite pass) now handles atmospheric scattering.
-// The function is kept for reference but returns 0.0 to disable analytical fog.
-
-fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
-    // Volumetric fog composite replaces analytical height fog.
-    return 0.0;
-
-    // Original analytical fog (kept for reference):
-    // let density = uniforms.fog_params.x;
-    // let falloff = uniforms.fog_params.y;
-    // let fog_start = uniforms.fog_params.z;
-    // let fog_end = uniforms.fog_params.w;
-    //
-    // let distance_factor = clamp((dist - fog_start) / max(fog_end - fog_start, 0.001), 0.0, 1.0);
-    // let distance_fog = 1.0 - exp(-pow(distance_factor, 2.2) * density * 1500.0);
-    // let ground_mist = exp(-max(world_pos.y, 0.0) * falloff);
-    // var fog = clamp(distance_fog * (0.24 + ground_mist * 0.76), 0.0, 1.0);
-    //
-    // if material == MATERIAL_FOLIAGE {
-    //     fog *= 0.84;
-    // } else if material == MATERIAL_TRUNK {
-    //     fog *= 0.90;
-    // }
-    // if material == MATERIAL_GROUND {
-    //     let edge_fade = smoothstep(fog_start * 0.70, fog_end * 1.05, dist);
-    //     fog = max(fog, edge_fade * 0.88);
-    // }
-    //
-    // return fog;
 }
 
 // -- Fragment shader --
@@ -1350,10 +1301,6 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         let base_emissive = material_color(material, world_pos, normal);
         color += base_emissive * emissive_intensity;
     }
-
-    // -- Aerial perspective (disabled: froxel volumetric fog handles this now) --
-    // Legacy height_fog() is preserved but gated off. Froxel composite pass
-    // applies per-pixel inscatter + transmittance after the material resolve.
 
     // Exposure is applied once in the tonemap pass — output raw HDR here.
 

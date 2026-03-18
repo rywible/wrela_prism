@@ -149,7 +149,7 @@ impl DagTraversePass {
 
     /// Compute and cache root group indices from the DAG. Call once per scene load.
     pub fn sync_roots(&mut self, dag: &MeshletDag) {
-        self.root_buffer_staging = root_group_indices(dag);
+        self.root_buffer_staging = dag.root_group_indices();
         self.root_count = self.root_buffer_staging.len() as u32;
         // Dispatch enough workgroups to have at least as many threads as there
         // could be work items. The DAG has at most `dag.groups.len()` nodes, but
@@ -286,36 +286,3 @@ impl DagTraversePass {
     }
 }
 
-/// Compute root group indices (groups with no parent in the DAG).
-fn root_group_indices(dag: &MeshletDag) -> Vec<u32> {
-    if dag.groups.is_empty() {
-        return Vec::new();
-    }
-
-    let mut has_parent = vec![false; dag.groups.len()];
-    for group in &dag.groups {
-        for child_idx in group.child_start..group.child_start + group.child_count {
-            if let Some(slot) = has_parent.get_mut(child_idx as usize) {
-                *slot = true;
-            }
-        }
-    }
-
-    let mut roots: Vec<u32> = has_parent
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, has_parent)| (!*has_parent).then_some(idx as u32))
-        .collect();
-
-    if roots.is_empty() {
-        let max_level = dag.groups.iter().map(|g| g.level).max().unwrap_or(0);
-        roots = dag
-            .groups
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, group)| (group.level == max_level).then_some(idx as u32))
-            .collect();
-    }
-
-    roots
-}

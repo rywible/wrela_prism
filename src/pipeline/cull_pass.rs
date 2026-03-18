@@ -1,6 +1,6 @@
 use super::hw_raster_pass::DispatchLists;
 use crate::meshlet::GpuMeshletBuffers;
-#[cfg(any(feature = "cpu_dag_cut", test))]
+#[cfg(feature = "cpu_dag_cut")]
 use crate::meshlet::MeshletDag;
 
 /// CPU-side adaptive DAG traversal + GPU per-meshlet culling.
@@ -202,7 +202,7 @@ impl CullPass {
         }
 
         let mut selected_groups: Vec<u32> = Vec::new();
-        let mut stack = root_group_indices(dag);
+        let mut stack = dag.root_group_indices();
 
         while let Some(group_idx) = stack.pop() {
             let group = &dag.groups[group_idx as usize];
@@ -275,6 +275,7 @@ impl CullPass {
 
     /// Create the dispatch bind group for phase 1 culling.
     /// Binds hw/sw dispatch lists, group queue, HZB, and phase2 reject buffers.
+    #[cfg(feature = "cpu_dag_cut")]
     pub fn create_dispatch_bind_group(
         &self,
         device: &wgpu::Device,
@@ -477,6 +478,7 @@ impl CullPass {
     }
 
     /// Encode phase 1 cull pass (uses prev-frame HZB).
+    #[cfg(feature = "cpu_dag_cut")]
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -531,43 +533,8 @@ impl CullPass {
     }
 }
 
-#[cfg(any(feature = "cpu_dag_cut", test))]
-fn root_group_indices(dag: &MeshletDag) -> Vec<u32> {
-    if dag.groups.is_empty() {
-        return Vec::new();
-    }
-
-    let mut has_parent = vec![false; dag.groups.len()];
-    for group in &dag.groups {
-        for child_idx in group.child_start..group.child_start + group.child_count {
-            if let Some(slot) = has_parent.get_mut(child_idx as usize) {
-                *slot = true;
-            }
-        }
-    }
-
-    let mut roots: Vec<u32> = has_parent
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, has_parent)| (!*has_parent).then_some(idx as u32))
-        .collect();
-
-    if roots.is_empty() {
-        let max_level = dag.groups.iter().map(|g| g.level).max().unwrap_or(0);
-        roots = dag
-            .groups
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, group)| (group.level == max_level).then_some(idx as u32))
-            .collect();
-    }
-
-    roots
-}
-
 #[cfg(test)]
 mod tests {
-    use super::root_group_indices;
     use crate::meshlet::bounds::MeshletBounds;
     use crate::meshlet::{MeshletDag, MeshletGroup};
 
@@ -628,6 +595,6 @@ mod tests {
             level_offsets: vec![0],
         };
 
-        assert_eq!(root_group_indices(&dag), vec![2, 3]);
+        assert_eq!(dag.root_group_indices(), vec![2, 3]);
     }
 }

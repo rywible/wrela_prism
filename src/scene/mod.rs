@@ -576,7 +576,7 @@ pub const MATERIAL_EMISSIVE: u32 = 4;
 /// NOTE: Trunk geometry uses a *different* packing scheme via
 /// `art_direction::pack_semantic_channels` (curvature, edge_sharpness, etc.).
 /// The shader dispatches on `material` to decide which interpretation to use.
-pub fn pack_semantic_channels(alpha: f32, emissive: f32) -> u32 {
+pub fn pack_foliage_channels(alpha: f32, emissive: f32) -> u32 {
     let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
     let e = (emissive.clamp(0.0, 1.0) * 255.0).round() as u32;
     a | (e << 8)
@@ -843,8 +843,8 @@ mod tests {
     }
 
     #[test]
-    fn pack_unpack_semantic_channels_roundtrip() {
-        let packed = super::pack_semantic_channels(0.75, 0.5);
+    fn pack_unpack_foliage_channels_roundtrip() {
+        let packed = super::pack_foliage_channels(0.75, 0.5);
         let alpha = super::unpack_alpha(packed);
         let emissive = super::unpack_emissive(packed);
         assert!((alpha - 0.75).abs() < 0.005);
@@ -852,12 +852,12 @@ mod tests {
     }
 
     #[test]
-    fn pack_semantic_channels_extremes() {
-        let zero = super::pack_semantic_channels(0.0, 0.0);
+    fn pack_foliage_channels_extremes() {
+        let zero = super::pack_foliage_channels(0.0, 0.0);
         assert_eq!(super::unpack_alpha(zero), 0.0);
         assert_eq!(super::unpack_emissive(zero), 0.0);
 
-        let full = super::pack_semantic_channels(1.0, 1.0);
+        let full = super::pack_foliage_channels(1.0, 1.0);
         assert!((super::unpack_alpha(full) - 1.0).abs() < 0.005);
         assert!((super::unpack_emissive(full) - 1.0).abs() < 0.005);
     }

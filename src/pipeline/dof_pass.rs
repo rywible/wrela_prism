@@ -219,12 +219,7 @@ impl DofPass {
     ) {
         let max_coc_px = 16.0_f32;
         let uniforms = DofUniforms {
-            screen_size: [
-                self.width as f32,
-                self.height as f32,
-                1.0 / self.width as f32,
-                1.0 / self.height as f32,
-            ],
+            screen_size: super::pack_screen_size(self.width, self.height),
             focus_params: [focus_distance, aperture, max_coc_px, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

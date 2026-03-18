@@ -212,12 +212,7 @@ impl MotionBlurPass {
     ) {
         let max_blur_px = 20.0_f32;
         let uniforms = MotionBlurUniforms {
-            screen_size: [
-                self.width as f32,
-                self.height as f32,
-                1.0 / self.width as f32,
-                1.0 / self.height as f32,
-            ],
+            screen_size: super::pack_screen_size(self.width, self.height),
             params: [max_blur_px, TILE_SIZE as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
