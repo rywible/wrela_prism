@@ -253,6 +253,26 @@ impl Default for CloudProfile {
     }
 }
 
+/// Area light types for LTC-based evaluation.
+#[derive(Clone, Debug)]
+pub enum AreaLight {
+    /// Spherical area light.
+    Sphere {
+        position: Vec3,
+        radius: f32,
+        color: Vec3,
+        intensity: f32,
+    },
+    /// Tube (capsule) area light.
+    Tube {
+        start: Vec3,
+        end: Vec3,
+        radius: f32,
+        color: Vec3,
+        intensity: f32,
+    },
+}
+
 /// Scene-wide lighting and environment settings.
 pub struct SceneSettings {
     pub sun_direction: Vec3,
@@ -288,6 +308,17 @@ pub struct SceneSettings {
     pub cloud_coverage: f32,
     pub cloud_profile: CloudProfile,
     pub wind: WindSettings,
+    pub fog_volume_density: f32,
+    pub fog_volume_albedo: Vec3,
+    pub fog_volume_anisotropy: f32,
+    pub focus_distance: f32,
+    pub aperture: f32,
+    pub dof_enabled: bool,
+    pub motion_blur_enabled: bool,
+    pub fxaa_enabled: bool,
+    pub area_lights: Vec<AreaLight>,
+    pub ca_strength: f32,
+    pub film_grain_strength: f32,
 }
 
 /// Wind settings for foliage animation.
@@ -533,6 +564,33 @@ pub const MATERIAL_TRUNK: u32 = 0;
 pub const MATERIAL_FOLIAGE: u32 = 1;
 pub const MATERIAL_GROUND: u32 = 2;
 pub const MATERIAL_SKIN: u32 = 3;
+pub const MATERIAL_EMISSIVE: u32 = 4;
+
+/// Pack alpha and emissive into `semantic_channels` for foliage/emissive materials.
+///
+/// Bit layout (foliage + emissive materials):
+/// - Bits 0–7: alpha (0–255 maps to 0.0–1.0)
+/// - Bits 8–15: emissive intensity (0–255 maps to 0.0–1.0)
+/// - Bits 16–31: reserved
+///
+/// NOTE: Trunk geometry uses a *different* packing scheme via
+/// `art_direction::pack_semantic_channels` (curvature, edge_sharpness, etc.).
+/// The shader dispatches on `material` to decide which interpretation to use.
+pub fn pack_foliage_channels(alpha: f32, emissive: f32) -> u32 {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let e = (emissive.clamp(0.0, 1.0) * 255.0).round() as u32;
+    a | (e << 8)
+}
+
+/// Unpack alpha from a `semantic_channels` u32 (foliage packing). Returns 0.0–1.0.
+pub fn unpack_alpha(semantic_channels: u32) -> f32 {
+    (semantic_channels & 0xFF) as f32 / 255.0
+}
+
+/// Unpack emissive intensity from a `semantic_channels` u32 (foliage packing). Returns 0.0–1.0.
+pub fn unpack_emissive(semantic_channels: u32) -> f32 {
+    ((semantic_channels >> 8) & 0xFF) as f32 / 255.0
+}
 
 /// Shadow map helpers.
 pub mod shadow {
@@ -731,7 +789,6 @@ pub mod shadow {
 
         (cascade_vps, view_splits)
     }
-
 }
 
 // ──────────────────────── Tests ────────────────────────
@@ -783,6 +840,26 @@ mod tests {
         let bounds = compute_geometry_bounds(&GeometryDef::Sdf(tree));
         assert!(bounds.min.x <= -1.0);
         assert!(bounds.max.x >= 7.0);
+    }
+
+    #[test]
+    fn pack_unpack_foliage_channels_roundtrip() {
+        let packed = super::pack_foliage_channels(0.75, 0.5);
+        let alpha = super::unpack_alpha(packed);
+        let emissive = super::unpack_emissive(packed);
+        assert!((alpha - 0.75).abs() < 0.005);
+        assert!((emissive - 0.5).abs() < 0.005);
+    }
+
+    #[test]
+    fn pack_foliage_channels_extremes() {
+        let zero = super::pack_foliage_channels(0.0, 0.0);
+        assert_eq!(super::unpack_alpha(zero), 0.0);
+        assert_eq!(super::unpack_emissive(zero), 0.0);
+
+        let full = super::pack_foliage_channels(1.0, 1.0);
+        assert!((super::unpack_alpha(full) - 1.0).abs() < 0.005);
+        assert!((super::unpack_emissive(full) - 1.0).abs() < 0.005);
     }
 
     #[test]

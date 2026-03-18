@@ -46,6 +46,20 @@ struct BarkParams {
 };
 @group(0) @binding(1) var<uniform> bark: BarkParams;
 
+// Area light data
+struct GpuAreaLight {
+    pos_radius: vec4<f32>,   // xyz = position/start, w = radius
+    color_type: vec4<f32>,   // xyz = color*intensity, w = type (0=sphere, 1=tube)
+    end_unused: vec4<f32>,   // xyz = end pos (tube), w = unused
+    _pad: vec4<f32>,
+};
+
+struct AreaLightUniforms {
+    params: vec4<f32>,       // x = light_count, yzw = reserved
+    lights: array<GpuAreaLight, 16>,
+};
+@group(0) @binding(2) var<uniform> area_lights: AreaLightUniforms;
+
 struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
     nor_x: f32, nor_y: f32, nor_z: f32,
@@ -87,6 +101,13 @@ struct MeshletDescriptor {
 // Sky-view LUT for aerial perspective (must match sky_pass.wgsl parameterization)
 @group(2) @binding(8) var sky_view_lut: texture_2d<f32>;
 @group(2) @binding(9) var sky_lut_sampler: sampler;
+
+// IBL: Prefiltered environment cubemap (specular reflections)
+@group(2) @binding(10) var env_cubemap: texture_cube<f32>;
+// IBL: Split-sum BRDF LUT (Rg16Float, parameterized by NdotV x roughness)
+@group(2) @binding(11) var brdf_lut: texture_2d<f32>;
+// IBL: Cubemap sampler (trilinear, ClampToEdge)
+@group(2) @binding(12) var cubemap_sampler: sampler;
 
 // -- Art Direction Uniforms (bind group 3) --
 
@@ -285,6 +306,7 @@ const MATERIAL_TRUNK: u32 = 0u;
 const MATERIAL_FOLIAGE: u32 = 1u;
 const MATERIAL_GROUND: u32 = 2u;
 const MATERIAL_SKIN: u32 = 3u;
+const MATERIAL_EMISSIVE: u32 = 4u;
 
 // -- Helpers --
 
@@ -559,23 +581,6 @@ fn sky_fill_visibility() -> f32 {
     return mix(1.0, 1.22, cloud_cover);
 }
 
-fn sample_aerial_sky(dir: vec3<f32>) -> vec3<f32> {
-    let sun_dir = normalize(uniforms.sun_direction.xyz);
-    let cloud_cover = clamp(uniforms.shaft_params.w, 0.0, 1.0);
-    let zenith_t = pow(smoothstep(-0.08, 0.58, dir.y), 0.55);
-    let horizon_t = smoothstep(-0.10, 0.18, dir.y);
-    let scattering = sample_sky_lut(dir) * mix(1.10, 0.98, cloud_cover);
-    let lower_haze = lower_atmosphere_haze(dir, sun_dir);
-    let lower_grade = mix(
-        uniforms.fog_color.rgb * vec3<f32>(0.28, 0.28, 0.22) + uniforms.sun_color.rgb * vec3<f32>(0.08, 0.06, 0.03),
-        uniforms.sky_horizon.rgb * 0.14 + uniforms.sun_color.rgb * vec3<f32>(0.05, 0.04, 0.03),
-        horizon_t
-    );
-    let upper_grade = mix(uniforms.sky_horizon.rgb * 0.06, uniforms.sky_zenith.rgb * 0.14, zenith_t);
-    let grade = mix(lower_grade, upper_grade, smoothstep(-0.02, 0.60, dir.y));
-    return scattering + grade + lower_haze;
-}
-
 // -- PBR Functions --
 
 // GGX Normal Distribution Function
@@ -616,6 +621,110 @@ fn specular_brdf(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32, F0: v
     let F = F_Schlick(VdotH, F0);
 
     return D * G * F;
+}
+
+// IBL specular from prefiltered environment map + BRDF LUT (split-sum approximation).
+fn ibl_specular(N: vec3<f32>, V: vec3<f32>, roughness: f32, F0: vec3<f32>) -> vec3<f32> {
+    let NdotV = max(dot(N, V), 0.0);
+    let R = reflect(-V, N);
+    let max_mip = f32(textureNumLevels(env_cubemap) - 1u);
+    let prefiltered = textureSampleLevel(env_cubemap, cubemap_sampler, R, roughness * max_mip).rgb;
+    let env_brdf = textureSampleLevel(brdf_lut, cubemap_sampler, vec2<f32>(NdotV, roughness), 0.0).rg;
+    return prefiltered * (F0 * env_brdf.x + env_brdf.y);
+}
+
+// -- Area Light Evaluation (LTC-approximated) --
+
+/// Evaluate contribution from all area lights at a shading point.
+/// Uses a simplified representative-point technique for sphere and tube lights.
+fn evaluate_area_lights(
+    world_pos: vec3<f32>,
+    N: vec3<f32>,
+    V: vec3<f32>,
+    roughness: f32,
+    F0: vec3<f32>,
+    albedo: vec3<f32>,
+) -> vec3<f32> {
+    let light_count = u32(area_lights.params.x);
+    if light_count == 0u {
+        return vec3<f32>(0.0);
+    }
+
+    var total = vec3<f32>(0.0);
+
+    for (var i = 0u; i < light_count; i++) {
+        let light = area_lights.lights[i];
+        let light_color = light.color_type.xyz;
+        let light_type = light.color_type.w;
+        let light_radius = light.pos_radius.w;
+
+        var L: vec3<f32>;
+        var dist: f32;
+
+        if light_type < 0.5 {
+            // Sphere light — representative point: closest point on sphere surface
+            let light_pos = light.pos_radius.xyz;
+            let to_light = light_pos - world_pos;
+            let center_dist = length(to_light);
+            let L_center = to_light / max(center_dist, 0.001);
+
+            // Representative point technique (Karis 2013):
+            // Shift L toward the reflection direction for specular
+            let R = reflect(-V, N);
+            let closest_on_ray = dot(to_light, R) * R;
+            let center_to_ray = closest_on_ray - to_light;
+            let closest_pt = to_light + center_to_ray * clamp(light_radius / max(length(center_to_ray), 0.001), 0.0, 1.0);
+            L = normalize(closest_pt);
+            dist = max(length(closest_pt), 0.001);
+        } else {
+            // Tube light — closest point on line segment
+            let seg_start = light.pos_radius.xyz;
+            let seg_end = light.end_unused.xyz;
+            let seg = seg_end - seg_start;
+            let seg_len = max(length(seg), 0.001);
+            let seg_dir = seg / seg_len;
+
+            let to_start = world_pos - seg_start;
+            let t = clamp(dot(to_start, seg_dir) / seg_len, 0.0, 1.0);
+            let closest_on_seg = seg_start + seg * t;
+            let to_light = closest_on_seg - world_pos;
+            dist = max(length(to_light), 0.001);
+            L = to_light / dist;
+
+            // Representative point shift for tube specular
+            let R = reflect(-V, N);
+            let r_proj = dot(to_light, R);
+            if r_proj > 0.0 {
+                let shift = normalize(R * r_proj - to_light);
+                let rep_pt = to_light + shift * min(light_radius, dist);
+                let rep_dist = max(length(rep_pt), 0.001);
+                L = rep_pt / rep_dist;
+                dist = rep_dist;
+            }
+        }
+
+        let NdotL = max(dot(N, L), 0.0);
+        if NdotL <= 0.0 { continue; }
+
+        // Attenuation: inverse square with radius-based normalization
+        let normalization = 1.0 / max(dist * dist, light_radius * light_radius);
+        let attenuation = normalization;
+
+        // Diffuse contribution
+        let kD = (1.0 - 0.0) * albedo / PI; // metallic = 0 for most surfaces
+        let diffuse = kD * NdotL * light_color * attenuation;
+
+        // Specular contribution (GGX with modified roughness for area lights)
+        // Widen the lobe based on light solid angle
+        let solid_angle = (light_radius / max(dist, 0.01));
+        let mod_roughness = clamp(roughness + solid_angle * 0.5, 0.0, 1.0);
+        let spec = specular_brdf(N, V, L, mod_roughness, F0);
+        let specular = spec * NdotL * light_color * attenuation;
+
+        total += diffuse + specular;
+    }
+
+    return total;
 }
 
 // -- Parallax Occlusion Mapping --
@@ -772,34 +881,6 @@ fn material_color(material: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3
     return ground;
 }
 
-// -- Height fog with per-material attenuation --
-
-fn height_fog(world_pos: vec3<f32>, dist: f32, material: u32) -> f32 {
-    let density = uniforms.fog_params.x;
-    let falloff = uniforms.fog_params.y;
-    let fog_start = uniforms.fog_params.z;
-    let fog_end = uniforms.fog_params.w;
-
-    let distance_factor = clamp((dist - fog_start) / max(fog_end - fog_start, 0.001), 0.0, 1.0);
-    let distance_fog = 1.0 - exp(-pow(distance_factor, 2.2) * density * 1500.0);
-    let ground_mist = exp(-max(world_pos.y, 0.0) * falloff);
-    var fog = clamp(distance_fog * (0.24 + ground_mist * 0.76), 0.0, 1.0);
-
-    // Per-material fog attenuation
-    if material == MATERIAL_FOLIAGE {
-        fog *= 0.84;
-    } else if material == MATERIAL_TRUNK {
-        fog *= 0.90;
-    }
-    // Ground: fade into atmospheric haze earlier so the slab edge doesn't read as a horizon stripe.
-    if material == MATERIAL_GROUND {
-        let edge_fade = smoothstep(fog_start * 0.70, fog_end * 1.05, dist);
-        fog = max(fog, edge_fade * 0.88);
-    }
-
-    return fog;
-}
-
 // -- Fragment shader --
 
 struct MaterialOutput {
@@ -858,6 +939,34 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
            + vec2<f32>(v2.uv_x, v2.uv_y) * bary.z;
     let ao = v0.ao * bary.x + v1.ao * bary.y + v2.ao * bary.z;
     let material = v0.material;
+
+    // Unpack alpha from semantic_channels for foliage (bits 0-7: 0-255 → 0.0-1.0).
+    // Only foliage uses byte 0 as alpha; trunk uses it for art-direction curvature.
+    if material == MATERIAL_FOLIAGE {
+        let alpha0 = f32(v0.semantic_channels & 0xFFu) / 255.0;
+        let alpha1 = f32(v1.semantic_channels & 0xFFu) / 255.0;
+        let alpha2 = f32(v2.semantic_channels & 0xFFu) / 255.0;
+        var alpha = alpha0 * bary.x + alpha1 * bary.y + alpha2 * bary.z;
+        // semantic_channels == 0 means legacy fully-opaque foliage
+        if v0.semantic_channels == 0u && v1.semantic_channels == 0u && v2.semantic_channels == 0u {
+            alpha = 1.0;
+        }
+        if alpha < 0.5 {
+            discard;
+        }
+    }
+
+    // Unpack emissive intensity from semantic_channels (bits 8-15).
+    // For emissive materials, byte 1 stores emissive intensity.
+    // Safe for all materials: trunk byte 1 = edge_sharpness (won't cause emission
+    // unless material == MATERIAL_EMISSIVE).
+    var emissive_intensity = 0.0;
+    if material == MATERIAL_EMISSIVE {
+        let e0 = f32((v0.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        let e1 = f32((v1.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        let e2 = f32((v2.semantic_channels >> 8u) & 0xFFu) / 255.0;
+        emissive_intensity = e0 * bary.x + e1 * bary.y + e2 * bary.z;
+    }
 
     // -- Lighting Setup --
 
@@ -1032,8 +1141,14 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         // Ambient with strong AO — deep darks in crevices
         let bark_ambient = six_face_ambient(perturbed_normal) * bark_ao * bark_ao * 1.18;
 
+        // IBL specular: image-based environment reflections (subtle on bark)
+        let bark_ibl = ibl_specular(lighting_normal, view_dir, bark_roughness, bark_f0) * bark_ao;
+
+        // Area lights (LTC-approximated)
+        let bark_area = evaluate_area_lights(world_pos, lighting_normal, view_dir, bark_roughness, bark_f0, bark_color);
+
         color = bark_color * (bark_ambient + (diffuse_term + wrap_fill) * cavity_shadow)
-            + apply_specular_flatten(specular_term + sheen_term, art.specular_flattening) + edge_sss;
+            + apply_specular_flatten(specular_term + sheen_term + bark_ibl, art.specular_flattening) + edge_sss + bark_area;
         final_normal = perturbed_normal;
     } else {
         // === Standard PBR pipeline (foliage + ground) ===
@@ -1068,8 +1183,9 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
 
         // Specular: Cook-Torrance GGX (art direction can flatten)
         let spec = specular_brdf(normal, view_dir, sun_dir, roughness, f0);
+        let ibl_spec = ibl_specular(normal, view_dir, roughness, f0) * ao;
         let specular = apply_specular_flatten(
-            spec * NdotL * sun_color * sun_energy * shadow,
+            spec * NdotL * sun_color * sun_energy * shadow + ibl_spec,
             art.specular_flattening
         );
 
@@ -1143,8 +1259,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         let under_canopy = smoothstep(canopy_top, canopy_top - 12.0, world_pos.y);
         let canopy_scatter = vec3<f32>(0.012, 0.020, 0.008) * under_canopy * sun_energy;
 
+        // Area lights (LTC-approximated)
+        let pbr_area = evaluate_area_lights(world_pos, normal, view_dir, roughness, f0, base_color);
+
         // Compose lighting
-        color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra) * ground_darken
+        color = (ambient_term + diffuse_term + specular + sky_fill_term + sss + extra + pbr_area) * ground_darken
               + (ground_bounce + canopy_scatter) * ao;
 
         // Foliage minimum floor: prevent complete shadow crush in dense canopy.
@@ -1177,22 +1296,11 @@ fn fs_resolve(input: FullscreenOutput) -> MaterialOutput {
         color = mix(color, color + vec3<f32>(0.12, 0.09, 0.05), distance_lift * 0.22);
     }
 
-    // -- Aerial perspective from shared atmosphere model --
-    // Height fog provides the distance-based opacity curve.
-    // The inscatter color comes from the same sky LUT as the sky pass.
-    // Lift sub-horizon directions gradually so distant ground converges toward
-    // lower-sky haze instead of a hard horizon-color band.
-    let fog_factor = height_fog(world_pos, cam_dist, material);
-    let fog_dir = normalize(world_pos - camera_pos);
-    var aerial = sample_aerial_sky(fog_dir);
-    if material == MATERIAL_GROUND {
-        // Distant ground converges toward horizon sky color for smooth transition.
-        // Lift the fog direction upward with distance so ground blends to horizon.
-        let dist_t = smoothstep(100.0, 600.0, cam_dist);
-        let lifted_dir = normalize(fog_dir + vec3<f32>(0.0, dist_t * 0.12, 0.0));
-        aerial = sample_aerial_sky(lifted_dir) + vec3<f32>(0.10, 0.08, 0.05);
+    // Emissive contribution: bypasses shadow and AO, added as unlit self-illumination
+    if emissive_intensity > 0.001 {
+        let base_emissive = material_color(material, world_pos, normal);
+        color += base_emissive * emissive_intensity;
     }
-    color = mix(color, aerial, fog_factor);
 
     // Exposure is applied once in the tonemap pass — output raw HDR here.
 

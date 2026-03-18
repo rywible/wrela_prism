@@ -1,10 +1,17 @@
+pub mod area_light_pass;
 pub mod bloom_pass;
 pub mod cloud_pass;
 pub mod cull_pass;
+pub mod dag_traverse_pass;
+pub mod dof_pass;
 pub mod forward_character;
+pub mod fxaa_pass;
+pub mod gtao_pass;
 pub mod hw_raster_pass;
 pub mod hzb_pass;
+pub mod ibl_pass;
 pub mod material_pass;
+pub mod motion_blur_pass;
 pub mod noise_textures;
 pub mod outline_pass;
 pub mod shadow_pass;
@@ -12,11 +19,13 @@ pub mod sky_lut_pass;
 pub mod sky_pass;
 pub mod ssao_pass;
 pub mod ssgi_pass;
+pub mod ssr_pass;
 pub mod sun_shaft_pass;
 pub mod sw_raster_pass;
 pub mod taa_pass;
 pub mod tonemap_pass;
 pub mod visbuf_pipeline;
+pub mod volumetric_fog_pass;
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -55,6 +64,10 @@ pub(crate) fn storage_entry(
         },
         count: None,
     }
+}
+
+pub(crate) fn pack_screen_size(width: u32, height: u32) -> [f32; 4] {
+    [width as f32, height as f32, 1.0 / width as f32, 1.0 / height as f32]
 }
 
 pub struct CapturedFrame {

@@ -1,122 +1,81 @@
+//! FXAA 3.11 pass — fast approximate anti-aliasing as a fullscreen fragment shader.
+//!
+//! Operates on LDR data (after tonemap). Only active when TAA is off.
+//! Pattern follows `tonemap_pass.rs`.
+//!
+//! Requires an intermediate LDR texture between tonemap and the swapchain so FXAA
+//! can read the tonemapped result as a texture.
+
 use crate::gpu::GpuContext;
 
-// Mirrors TonemapUniforms in shaders/tonemap.wgsl
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TonemapUniforms {
+struct FxaaUniforms {
     screen_size: [f32; 4],
-    // x = elapsed_secs, y = manual_exposure, z = prev_auto_exposure, w = dt
-    time_params: [f32; 4],
-    color_grade: [f32; 4], // xyz = tint, w = strength (0 = no grading)
-    post_fx_params: [f32; 4], // x = ca_strength, y = film_grain_strength, z/w = reserved
 }
 
-pub struct TonemapPass {
+pub struct FxaaPass {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
-    white_ao_view: wgpu::TextureView,
+    /// Intermediate LDR texture that tonemap writes to (instead of swapchain).
+    ldr_texture: wgpu::Texture,
+    ldr_view: wgpu::TextureView,
 }
 
-impl TonemapPass {
+impl FxaaPass {
     pub fn new(gpu: &GpuContext) -> Self {
         let device = &gpu.device;
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("prism-tonemap-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            label: Some("fxaa-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("prism-tonemap-uniforms"),
-            size: std::mem::size_of::<TonemapUniforms>() as u64,
+            label: Some("fxaa-uniforms"),
+            size: std::mem::size_of::<FxaaUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let white_ao = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("prism-tonemap-white-ao"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &white_ao,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::bytes_of(&1.0f32),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        let white_ao_view = white_ao.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("prism-tonemap-bind-group-layout"),
+            label: Some("fxaa-bgl"),
             entries: &[
-                // 0: HDR scene color
+                // 0: LDR input texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
                 },
-                // 1: SSAO texture
+                // 1: sampler (linear filtering)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // 2: sampler
+                // 2: uniforms
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                // 3: tonemap uniforms
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size:
-                            Some(
-                                std::num::NonZeroU64::new(
-                                    std::mem::size_of::<TonemapUniforms>() as u64
-                                )
+                        min_binding_size: Some(
+                            std::num::NonZeroU64::new(std::mem::size_of::<FxaaUniforms>() as u64)
                                 .unwrap(),
-                            ),
+                        ),
                     },
                     count: None,
                 },
@@ -124,18 +83,18 @@ impl TonemapPass {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("prism-tonemap-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/tonemap.wgsl").into()),
+            label: Some("fxaa-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/fxaa.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("prism-tonemap-pipeline-layout"),
+            label: Some("fxaa-pipeline-layout"),
             bind_group_layouts: &[&bind_group_layout],
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("prism-tonemap-pipeline"),
+            label: Some("fxaa-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -145,7 +104,7 @@ impl TonemapPass {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_tonemap"),
+                entry_point: Some("fs_fxaa"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: gpu.surface_format,
@@ -160,71 +119,74 @@ impl TonemapPass {
             cache: None,
         });
 
+        let (ldr_texture, ldr_view) =
+            create_ldr_texture(device, gpu.width(), gpu.height(), gpu.surface_format);
+
         Self {
             bind_group_layout,
             pipeline,
             sampler,
             uniform_buffer,
-            white_ao_view,
+            ldr_texture,
+            ldr_view,
         }
     }
 
+    pub fn resize(&mut self, gpu: &GpuContext) {
+        let (lt, lv) =
+            create_ldr_texture(&gpu.device, gpu.width(), gpu.height(), gpu.surface_format);
+        self.ldr_texture = lt;
+        self.ldr_view = lv;
+    }
+
+    /// Returns the intermediate LDR texture view that tonemap should write to
+    /// (instead of the swapchain) when FXAA is active.
+    pub fn ldr_input_view(&self) -> &wgpu::TextureView {
+        &self.ldr_view
+    }
+
+    /// Encode the FXAA pass, reading from the intermediate LDR texture
+    /// and writing to the final swapchain view.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
-        hdr_scene_color_view: &wgpu::TextureView,
-        ao_view: Option<&wgpu::TextureView>,
         output_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-        elapsed_secs: f32,
-        manual_exposure: f32,
-        dt: f32,
-        color_grade: [f32; 4],
-        ca_strength: f32,
-        film_grain_strength: f32,
     ) {
-        // prev_auto_exposure is anchored at 1.0 — the shader applies a gentle per-frame
-        // adaptation via EMA. Without GPU readback, we can't feed the result back, so
-        // the auto-exposure adapts within each frame relative to neutral (1.0).
-        let prev_auto_exposure = 1.0_f32;
-        let uniforms = TonemapUniforms {
-            screen_size: [width as f32, height as f32, 0.0, 0.0],
-            time_params: [elapsed_secs, manual_exposure, prev_auto_exposure, dt],
-            color_grade,
-            post_fx_params: [ca_strength, film_grain_strength, 0.0, 0.0],
+        let uniforms = FxaaUniforms {
+            screen_size: [
+                width as f32,
+                height as f32,
+                1.0 / width as f32,
+                1.0 / height as f32,
+            ],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("prism-tonemap-bind-group"),
+            label: Some("fxaa-bg"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(hdr_scene_color_view),
+                    resource: wgpu::BindingResource::TextureView(&self.ldr_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        ao_view.unwrap_or(&self.white_ao_view),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 2,
                     resource: self.uniform_buffer.as_entire_binding(),
                 },
             ],
         });
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("prism-tonemap-pass"),
+            label: Some("fxaa-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
                 resolve_target: None,
@@ -244,4 +206,28 @@ impl TonemapPass {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+fn create_ldr_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fxaa-ldr-intermediate"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }

@@ -5,7 +5,7 @@
 /// into the meshlet DAG builder.
 use glam::Vec3;
 
-use crate::scene::{Vertex, MATERIAL_FOLIAGE};
+use crate::scene::{pack_foliage_channels, Vertex, MATERIAL_FOLIAGE};
 use crate::subjects::redwood_growth::{RedwoodParams, TreeRng};
 
 /// Build needle spray geometry from anchor points.
@@ -78,23 +78,32 @@ pub fn build_needle_sprays(
                 let face_normal = needle_dir.cross(needle_right).normalize_or_zero();
                 let hemisphere_normal = (face_normal + Vec3::Y * 0.6).normalize_or_zero();
 
-                // 4 corners of the elongated quad
+                // 4 corners of the elongated quad with per-vertex UVs
                 let corners = [
                     pos - needle_dir * half_len - needle_right * half_width,
                     pos + needle_dir * half_len - needle_right * half_width,
                     pos + needle_dir * half_len + needle_right * half_width,
                     pos - needle_dir * half_len + needle_right * half_width,
                 ];
+                let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 
-                for corner in &corners {
+                // Fully opaque (alpha=1.0, emissive=0.0) — alpha-test
+                // infrastructure is ready for future shaped foliage cards
+                let channels = pack_foliage_channels(1.0, 0.0);
+
+                for (corner, uv) in corners.iter().zip(uvs.iter()) {
                     verts.push(Vertex {
                         position: (*corner).into(),
-                        normal: [hemisphere_normal.x, hemisphere_normal.y, hemisphere_normal.z],
+                        normal: [
+                            hemisphere_normal.x,
+                            hemisphere_normal.y,
+                            hemisphere_normal.z,
+                        ],
                         material: MATERIAL_FOLIAGE,
                         feature_id: 0,
-                        uv: [0.0, 0.0],
+                        uv: *uv,
                         ao,
-                        semantic_channels: 0,
+                        semantic_channels: channels,
                     });
                 }
 

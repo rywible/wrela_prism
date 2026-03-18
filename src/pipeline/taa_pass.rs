@@ -85,9 +85,7 @@ impl TaaPass {
 
         let motion_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("taa-motion-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/taa_motion.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/taa_motion.wgsl").into()),
         });
 
         let motion_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -170,9 +168,7 @@ impl TaaPass {
 
         let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("taa-resolve-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/taa_resolve.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/taa_resolve.wgsl").into()),
         });
 
         let resolve_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -281,7 +277,12 @@ impl TaaPass {
                 1.0 / self.width as f32,
                 1.0 / self.height as f32,
             ],
-            jitter: [jitter[0], jitter[1], self.prev_jitter[0], self.prev_jitter[1]],
+            jitter: [
+                jitter[0],
+                jitter[1],
+                self.prev_jitter[0],
+                self.prev_jitter[1],
+            ],
             params: [0.1, first_frame, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -370,6 +371,11 @@ impl TaaPass {
         self.prev_jitter = jitter;
         self.frame_count = self.frame_count.saturating_add(1);
         self.write_to_a = !self.write_to_a;
+    }
+
+    /// Returns the motion vector texture view for use by motion blur.
+    pub fn motion_view(&self) -> &wgpu::TextureView {
+        &self.motion_view
     }
 
     /// Returns the most recently written history texture (TAA output for tonemap).

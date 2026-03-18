@@ -74,9 +74,11 @@ fn ssgi_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let gi_radius = uniforms.params.y;
 
-    // Per-pixel rotation angle + per-frame golden angle offset for TAA accumulation
+    // Per-pixel rotation angle + per-frame golden angle offset for TAA accumulation.
+    // Wrap frame index to avoid f32 precision loss at high frame counts (>16M).
     let golden_angle = 2.3999632; // π(3−√5) radians — maximally irrational rotation
-    let rotation = hash_pixel(pixel) * PI * 2.0 + uniforms.params.z * golden_angle;
+    let wrapped_frame = uniforms.params.z % 512.0;
+    let rotation = hash_pixel(pixel) * PI * 2.0 + wrapped_frame * golden_angle;
     let cos_r = cos(rotation);
     let sin_r = sin(rotation);
 

@@ -41,6 +41,48 @@ pub struct MeshletDag {
     pub level_offsets: Vec<u32>,
 }
 
+impl MeshletDag {
+    /// Total number of meshlets across ALL LOD levels in the DAG, not just the
+    /// current frame's selected groups. Used as a conservative dispatch upper bound.
+    pub fn total_dag_meshlet_count(&self) -> usize {
+        self.meshlets.len()
+    }
+
+    /// Compute root group indices: groups with no parent in the DAG.
+    pub fn root_group_indices(&self) -> Vec<u32> {
+        if self.groups.is_empty() {
+            return Vec::new();
+        }
+
+        let mut has_parent = vec![false; self.groups.len()];
+        for group in &self.groups {
+            for child_idx in group.child_start..group.child_start + group.child_count {
+                if let Some(slot) = has_parent.get_mut(child_idx as usize) {
+                    *slot = true;
+                }
+            }
+        }
+
+        let mut roots: Vec<u32> = has_parent
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, has_parent)| (!*has_parent).then_some(idx as u32))
+            .collect();
+
+        if roots.is_empty() {
+            let max_level = self.groups.iter().map(|g| g.level).max().unwrap_or(0);
+            roots = self
+                .groups
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, group)| (group.level == max_level).then_some(idx as u32))
+                .collect();
+        }
+
+        roots
+    }
+}
+
 /// Target group size when partitioning meshlets for simplification.
 const GROUP_TARGET_SIZE: usize = 4;
 /// Target simplification ratio per level.

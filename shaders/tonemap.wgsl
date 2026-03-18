@@ -15,6 +15,7 @@ struct TonemapUniforms {
     // x = elapsed_secs, y = manual_exposure, z = prev_auto_exposure, w = dt
     time_params: vec4<f32>,
     color_grade: vec4<f32>,  // xyz = tint, w = strength (0 = no grading)
+    post_fx_params: vec4<f32>,  // x = ca_strength, y = film_grain_strength, z/w = reserved
 };
 @group(0) @binding(3)
 var<uniform> tu: TonemapUniforms;
@@ -106,7 +107,9 @@ fn sample_auto_exposure() -> f32 {
 @fragment
 fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(input.position.xy);
-    let ao = textureLoad(ao_tex, pixel, 0).r;
+    let ao_raw = textureLoad(ao_tex, pixel, 0).r;
+    // Multi-bounce AO correction — recovers energy lost to single-bounce approximation
+    let ao = ao_raw + 0.2 * ao_raw * (1.0 - ao_raw);
 
     // Unified exposure: manual * temporally-smoothed auto-exposure
     let manual_exposure = tu.time_params.y;
@@ -134,6 +137,38 @@ fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     let uv = input.position.xy / tu.screen_size.xy;
     let vignette = 1.0 - 0.3 * dot(uv - 0.5, uv - 0.5);
     ldr *= vignette;
+
+    // Chromatic aberration: radial R/B channel offset from center
+    let ca_strength = tu.post_fx_params.x;
+    if ca_strength > 0.0001 {
+        let ca_center = vec2<f32>(0.5, 0.5);
+        let ca_offset = (uv - ca_center) * ca_strength;
+        // Compute offset pixel coordinates for R and B channels
+        let r_px = vec2<i32>(clamp(
+            vec2<i32>(input.position.xy + ca_offset * tu.screen_size.xy),
+            vec2<i32>(0),
+            vec2<i32>(i32(tu.screen_size.x) - 1, i32(tu.screen_size.y) - 1),
+        ));
+        let b_px = vec2<i32>(clamp(
+            vec2<i32>(input.position.xy - ca_offset * tu.screen_size.xy),
+            vec2<i32>(0),
+            vec2<i32>(i32(tu.screen_size.x) - 1, i32(tu.screen_size.y) - 1),
+        ));
+        // Re-tonemap the offset samples (we're in LDR space, but need to sample HDR source)
+        let r_hdr = textureLoad(hdr_tex, r_px, 0).r * ao * total_exposure;
+        let b_hdr = textureLoad(hdr_tex, b_px, 0).b * ao * total_exposure;
+        let r_ldr = filmic_tonemap(vec3<f32>(r_hdr, 0.0, 0.0)).r;
+        let b_ldr = filmic_tonemap(vec3<f32>(0.0, 0.0, b_hdr)).b;
+        ldr = vec3<f32>(r_ldr, ldr.g, b_ldr);
+    }
+
+    // Film grain: temporal noise based on pixel hash + time
+    let grain_strength = tu.post_fx_params.y;
+    if grain_strength > 0.0001 {
+        let grain_seed = input.position.xy + fract(tu.time_params.x * 12.9898) * 100.0;
+        let grain_noise = fract(sin(dot(grain_seed, vec2<f32>(12.9898, 78.233))) * 43758.5453) * 2.0 - 1.0;
+        ldr += grain_noise * grain_strength;
+    }
 
     // Triangular-PDF dither via interleaved gradient noise — breaks 8-bit banding
     let dither_pos = input.position.xy;

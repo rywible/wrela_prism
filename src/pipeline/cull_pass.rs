@@ -1,5 +1,7 @@
 use super::hw_raster_pass::DispatchLists;
-use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
+use crate::meshlet::GpuMeshletBuffers;
+
+use crate::meshlet::MeshletDag;
 
 /// CPU-side adaptive DAG traversal + GPU per-meshlet culling.
 ///
@@ -8,13 +10,28 @@ use crate::meshlet::{GpuMeshletBuffers, MeshletDag};
 /// is below the threshold are selected; otherwise their children are visited.
 /// Selected group indices are uploaded to the GPU, where a compute shader does
 /// per-meshlet frustum culling, writing survivors to the HW dispatch list.
+///
+/// Two-phase occlusion culling eliminates 1-frame popping:
+///   Phase 1: Cull with prev-frame HZB → raster → rebuild HZB (mid-frame)
+///   Phase 2: Re-test HZB-rejected meshlets against fresh HZB → raster survivors
 pub struct CullPass {
     /// Group queue buffer (CPU → GPU).
     group_queue_buffer: wgpu::Buffer,
     group_queue_count_buffer: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
+    phase2_pipeline: wgpu::ComputePipeline,
     cull_bind_group_layout: wgpu::BindGroupLayout,
     dispatch_bind_group_layout: wgpu::BindGroupLayout,
+    /// Phase 2 reject list: meshlet indices that failed HZB in phase 1.
+    phase2_queue_buffer: wgpu::Buffer,
+    /// Atomic counter for the reject list.
+    phase2_count_buffer: wgpu::Buffer,
+    /// Scratch buffer for binding slot 7 in the phase2 dispatch bind group.
+    /// Prevents aliasing phase2_queue_buffer as both read-only (binding 4) and
+    /// read_write (binding 7) in the same bind group, which WebGPU forbids.
+    phase2_scratch_list_buffer: wgpu::Buffer,
+    /// Scratch buffer for binding slot 8 in the phase2 dispatch bind group.
+    phase2_scratch_count_buffer: wgpu::Buffer,
 }
 
 impl CullPass {
@@ -39,7 +56,7 @@ impl CullPass {
                     super::storage_entry(3, false, wgpu::ShaderStages::COMPUTE), // sw_dispatch_count
                     super::storage_entry(4, true, wgpu::ShaderStages::COMPUTE),  // group_queue
                     super::storage_entry(5, true, wgpu::ShaderStages::COMPUTE), // group_queue_count (uniform-like)
-                    // HZB texture (previous frame, all mip levels)
+                    // HZB texture (previous frame for P1, fresh mid-frame for P2)
                     wgpu::BindGroupLayoutEntry {
                         binding: 6,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -50,6 +67,9 @@ impl CullPass {
                         },
                         count: None,
                     },
+                    // Phase 2 reject list (written in P1, read in P2)
+                    super::storage_entry(7, false, wgpu::ShaderStages::COMPUTE), // phase2_reject_list
+                    super::storage_entry(8, false, wgpu::ShaderStages::COMPUTE), // phase2_reject_count
                 ],
             });
 
@@ -79,6 +99,15 @@ impl CullPass {
             cache: None,
         });
 
+        let phase2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("meshlet-cull-phase2-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("meshlet_cull_phase2"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
         let group_queue_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("group-queue"),
             size: 16384 * 4, // up to 16384 groups
@@ -93,12 +122,56 @@ impl CullPass {
             mapped_at_creation: false,
         });
 
+        // Phase 2 reject list: meshlets HZB-rejected in phase 1, up to 65536 entries
+        let phase2_queue_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-reject-list"),
+            size: 65536 * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let phase2_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-reject-count"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Small scratch buffers used only to satisfy the phase2 dispatch bind group
+        // layout at slots 7 and 8 (the phase2_reject_list / phase2_reject_count
+        // write targets). The phase2 shader never writes to these slots, so a
+        // single-element buffer is sufficient. This avoids the WebGPU validation
+        // hazard that would arise from binding phase2_queue_buffer as both
+        // read-only (binding 4) and read_write (binding 7) in the same bind group.
+        let phase2_scratch_list_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-scratch-list"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let phase2_scratch_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phase2-scratch-count"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         Self {
             group_queue_buffer,
             group_queue_count_buffer,
             pipeline,
+            phase2_pipeline,
             cull_bind_group_layout,
             dispatch_bind_group_layout,
+            phase2_queue_buffer,
+            phase2_count_buffer,
+            phase2_scratch_list_buffer,
+            phase2_scratch_count_buffer,
         }
     }
 
@@ -110,6 +183,10 @@ impl CullPass {
     /// Otherwise its children are visited recursively.
     ///
     /// Returns the number of selected groups (to dispatch the GPU cull shader).
+    ///
+    /// Retained for debugging/validation. The default code path now uses
+    /// `DagTraversePass` for GPU-driven DAG traversal.
+    
     pub fn cpu_dag_cut_adaptive(
         &self,
         queue: &wgpu::Queue,
@@ -125,7 +202,7 @@ impl CullPass {
         }
 
         let mut selected_groups: Vec<u32> = Vec::new();
-        let mut stack = root_group_indices(dag);
+        let mut stack = dag.root_group_indices();
 
         while let Some(group_idx) = stack.pop() {
             let group = &dag.groups[group_idx as usize];
@@ -196,6 +273,9 @@ impl CullPass {
         })
     }
 
+    /// Create the dispatch bind group for phase 1 culling.
+    /// Binds hw/sw dispatch lists, group queue, HZB, and phase2 reject buffers.
+    
     pub fn create_dispatch_bind_group(
         &self,
         device: &wgpu::Device,
@@ -234,10 +314,171 @@ impl CullPass {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(hzb_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.phase2_queue_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.phase2_count_buffer.as_entire_binding(),
+                },
             ],
         })
     }
 
+    /// Create the dispatch bind group for GPU-driven DAG traversal mode.
+    ///
+    /// Binds the DAG traverse pass's output buffers as the group queue input
+    /// instead of the CPU-uploaded buffers. All other bindings are the same.
+    pub fn create_dispatch_bind_group_gpu_driven(
+        &self,
+        device: &wgpu::Device,
+        dispatch: &DispatchLists,
+        hzb_view: &wgpu::TextureView,
+        gpu_group_queue: &wgpu::Buffer,
+        gpu_group_count: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cull-dispatch-bg-gpu-driven"),
+            layout: &self.dispatch_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dispatch.hw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dispatch.hw_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dispatch.sw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dispatch.sw_count_buffer.as_entire_binding(),
+                },
+                // GPU-produced group queue from DAG traverse pass
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_group_queue.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: gpu_group_count.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(hzb_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.phase2_queue_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.phase2_count_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Encode phase 1 cull pass using indirect dispatch (GPU-driven DAG traversal mode).
+    ///
+    /// Instead of a CPU-provided group count, reads the workgroup count from
+    /// the indirect args buffer produced by the DAG traverse pass.
+    pub fn encode_indirect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_bg: &wgpu::BindGroup,
+        cull_bg: &wgpu::BindGroup,
+        dispatch_bg: &wgpu::BindGroup,
+        indirect_buffer: &wgpu::Buffer,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("meshlet-cull-phase1-indirect"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, frame_bg, &[]);
+        pass.set_bind_group(1, cull_bg, &[]);
+        pass.set_bind_group(2, dispatch_bg, &[]);
+
+        pass.dispatch_workgroups_indirect(indirect_buffer, 0);
+    }
+
+    /// Create the dispatch bind group for phase 2 culling.
+    ///
+    /// Re-uses the same layout but swaps bindings so the phase2 reject list
+    /// is bound as the "group_queue" input (binding 4) and the phase2 reject
+    /// count as "group_queue_count" (binding 5). The HZB view points to the
+    /// fresh mid-frame HZB. hw_dispatch_list/count are the output targets.
+    pub fn create_phase2_dispatch_bind_group(
+        &self,
+        device: &wgpu::Device,
+        dispatch: &DispatchLists,
+        hzb_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cull-phase2-dispatch-bg"),
+            layout: &self.dispatch_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dispatch.hw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dispatch.hw_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dispatch.sw_dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dispatch.sw_count_buffer.as_entire_binding(),
+                },
+                // Phase 2 reject list as input (re-bound to group_queue slot)
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.phase2_queue_buffer.as_entire_binding(),
+                },
+                // Phase 2 reject count as input (re-bound to group_queue_count slot)
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.phase2_count_buffer.as_entire_binding(),
+                },
+                // Fresh mid-frame HZB
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(hzb_view),
+                },
+                // Scratch buffers for slots 7/8: the phase2 shader never writes to
+                // these, but they must be bound to satisfy the layout. Using dedicated
+                // scratch buffers avoids aliasing phase2_queue_buffer / phase2_count_buffer
+                // as both read-only (bindings 4/5) and read_write (bindings 7/8) within
+                // the same bind group, which WebGPU validation forbids.
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.phase2_scratch_list_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.phase2_scratch_count_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Clear the phase 2 reject count to zero.
+    pub fn clear_phase2(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.phase2_count_buffer, 0, None);
+    }
+
+    /// Encode phase 1 cull pass (uses prev-frame HZB).
+    
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -247,7 +488,7 @@ impl CullPass {
         group_count: u32,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("meshlet-cull-pass"),
+            label: Some("meshlet-cull-phase1"),
             timestamp_writes: None,
         });
 
@@ -256,47 +497,44 @@ impl CullPass {
         pass.set_bind_group(1, cull_bg, &[]);
         pass.set_bind_group(2, dispatch_bg, &[]);
 
-        let workgroups = (group_count + 63) / 64;
+        let workgroups = group_count.div_ceil(64);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+
+    /// Encode phase 2 cull pass (uses fresh mid-frame HZB).
+    ///
+    /// `reject_count` is the number of meshlets in the phase2 reject list.
+    /// The phase2 dispatch bind group must have been created with
+    /// `create_phase2_dispatch_bind_group()`.
+    pub fn encode_phase2(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_bg: &wgpu::BindGroup,
+        cull_bg: &wgpu::BindGroup,
+        phase2_dispatch_bg: &wgpu::BindGroup,
+        reject_count: u32,
+    ) {
+        if reject_count == 0 {
+            return;
+        }
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("meshlet-cull-phase2"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.phase2_pipeline);
+        pass.set_bind_group(0, frame_bg, &[]);
+        pass.set_bind_group(1, cull_bg, &[]);
+        pass.set_bind_group(2, phase2_dispatch_bg, &[]);
+
+        let workgroups = reject_count.div_ceil(64);
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
 
-fn root_group_indices(dag: &MeshletDag) -> Vec<u32> {
-    if dag.groups.is_empty() {
-        return Vec::new();
-    }
-
-    let mut has_parent = vec![false; dag.groups.len()];
-    for group in &dag.groups {
-        for child_idx in group.child_start..group.child_start + group.child_count {
-            if let Some(slot) = has_parent.get_mut(child_idx as usize) {
-                *slot = true;
-            }
-        }
-    }
-
-    let mut roots: Vec<u32> = has_parent
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, has_parent)| (!*has_parent).then_some(idx as u32))
-        .collect();
-
-    if roots.is_empty() {
-        let max_level = dag.groups.iter().map(|g| g.level).max().unwrap_or(0);
-        roots = dag
-            .groups
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, group)| (group.level == max_level).then_some(idx as u32))
-            .collect();
-    }
-
-    roots
-}
-
 #[cfg(test)]
 mod tests {
-    use super::root_group_indices;
     use crate::meshlet::bounds::MeshletBounds;
     use crate::meshlet::{MeshletDag, MeshletGroup};
 
@@ -357,6 +595,6 @@ mod tests {
             level_offsets: vec![0],
         };
 
-        assert_eq!(root_group_indices(&dag), vec![2, 3]);
+        assert_eq!(dag.root_group_indices(), vec![2, 3]);
     }
 }

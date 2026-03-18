@@ -15,18 +15,33 @@ struct ShadowVertexIn {
     @location(6) semantic_channels: u32,
 };
 
+const MATERIAL_FOLIAGE: u32 = 1u;
+
 struct ShadowVertexOut {
     @builtin(position) clip_position: vec4<f32>,
+    @location(0) alpha: f32,
 };
 
 @vertex
 fn vs_shadow(input: ShadowVertexIn) -> ShadowVertexOut {
+    // Unpack alpha from semantic_channels for foliage only (bits 0-7: 0-255 → 0.0-1.0).
+    // Other materials use byte 0 for art-direction data, so default to fully opaque.
+    var alpha = 1.0;
+    if input.material == MATERIAL_FOLIAGE {
+        let raw_alpha = input.semantic_channels & 0xFFu;
+        alpha = select(f32(raw_alpha) / 255.0, 1.0, input.semantic_channels == 0u);
+    }
+
     var output: ShadowVertexOut;
     output.clip_position = shadow_uniforms.light_vp * vec4<f32>(input.position, 1.0);
+    output.alpha = alpha;
     return output;
 }
 
 @fragment
-fn fs_shadow() {
-    // All fragments write depth — no alpha discard needed for opaque needle sprays.
+fn fs_shadow(input: ShadowVertexOut) {
+    // Alpha test: discard transparent fragments for correct foliage shadow casting
+    if input.alpha < 0.5 {
+        discard;
+    }
 }

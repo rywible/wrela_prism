@@ -33,7 +33,7 @@ struct Capsule {
 
 @group(0) @binding(0) var<uniform> density_config: LightFieldConfig;
 @group(0) @binding(1) var<storage, read> capsules: array<Capsule>;
-@group(0) @binding(2) var density_tex: texture_storage_3d<r16float, write>;
+@group(0) @binding(2) var density_tex: texture_storage_3d<r32float, write>;
 
 /// Distance from point p to the closest point on capsule segment ab.
 fn capsule_distance(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, ra: f32, rb: f32) -> f32 {
@@ -78,7 +78,7 @@ fn voxelize_density(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @group(0) @binding(0) var<uniform> prop_config: LightFieldConfig;
 @group(0) @binding(1) var density_read: texture_3d<f32>;
-@group(0) @binding(2) var light_tex: texture_storage_3d<r16float, write>;
+@group(0) @binding(2) var light_tex: texture_storage_3d<r32float, write>;
 
 @compute @workgroup_size(8, 8)
 fn propagate_light(@builtin(global_invocation_id) gid: vec3<u32>) {
